@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+
+# Local config (may contain secrets) — never commit real values
+config.yaml
+config/providers.yaml
+config/resources/
+
+# Secrets — never commit
+*.pem
+*.key
+.env
+.env.*
+*.secret
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

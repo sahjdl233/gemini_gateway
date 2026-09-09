@@ -1,0 +1,38 @@
+# Gemini Gateway 配置示例（复制为 config.yaml 使用）
+# 敏感信息一律通过环境变量占位符注入，禁止写入 Git。
+# 占位符写法：NAME 来自环境变量 FIREBASE_PROJECT_01（TASK-002 起）。
+#
+# TASK-000 阶段只允许 fake Provider；真实 Google Provider 未实现。
+
+server:
+  host: 127.0.0.1
+  port: 8000
+
+scheduler:
+  max_retries: 2
+  cooldown:
+    base_delay: 0.2      # 指数退避基数（秒）
+    factor: 2.0          # 退避倍数
+    max_delay: 10.0      # 退避上限（秒）
+    jitter: 0.1          # 抖动比例
+    degrade_threshold: 3
+
+providers:
+  fake:
+    enabled: true
+    resources:
+      - id: fake-01
+        provider: fake
+        scenario: success          # success | rate_limit | auth_error | timeout | unknown_model
+      - id: fake-02
+        provider: fake
+        scenario: rate_limit
+        retry_after: 1.0           # 模拟上游 Retry-After（秒）
+
+# ---- 以下为占位示意：TASK-002 起启用，当前阶段不要开启 ----
+# firebase:
+#   enabled: false
+#   resources:
+#     - id: firebase-project-01
+#       project_id: FIREBASE_PROJECT_01
+#       api_key: FIREBASE_API_KEY_01
