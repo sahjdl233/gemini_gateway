@@ -1,4 +1,10 @@
-"""FastAPI entry point: builds the runtime from config and mounts the API."""
+"""FastAPI entry point: builds the runtime from config and mounts the API.
+
+TASK-001.5: main.py no longer knows about FakeProvider or FakeResource.
+It reads config, initialises the ProviderRegistry, registers builtin
+providers via bootstrap, and lets the registry create both providers and
+their resources.  main.py stays agnostic to provider-specific types.
+"""
 
 from __future__ import annotations
 
@@ -7,27 +13,23 @@ from typing import Any, Dict, Optional
 
 from fastapi import FastAPI
 
+from app.bootstrap import register_builtin_providers
 from app.routes.chat import router as chat_router
 from app.routes.models import router as models_router
 from config.loader import default_config, load_config
 from core.cooldown import CooldownManager
 from core.model_registry import ModelRegistry
 from core.pool import InMemoryPool
-from core.provider_registry import ProviderRegistry
+from core.provider_registry import ProviderRegistry, UnknownProviderError
 from core.scheduler import Scheduler
-from providers.fake import FakeProvider, FakeResource
 
 logger = logging.getLogger(__name__)
 
 
-# Provider factory map -- add new providers here, never in an if/elif chain.
-_PROVIDER_FACTORIES = {
-    "fake": FakeProvider,
-}
-
-
 def build_runtime(config: Dict[str, Any]) -> Scheduler:
     registry = ProviderRegistry()
+    register_builtin_providers(registry)
+
     pools: Dict[str, Any] = {}
     providers: Dict[str, Any] = {}
     cooldown_cfg = config.get("scheduler", {}).get("cooldown", {})
@@ -36,19 +38,19 @@ def build_runtime(config: Dict[str, Any]) -> Scheduler:
     for provider_id, pcfg in config.get("providers", {}).items():
         if not pcfg.get("enabled", True):
             continue
-        factory = _PROVIDER_FACTORIES.get(provider_id)
-        if factory is None:
-            raise ValueError(
-                f"provider '{provider_id}' is not registered in _PROVIDER_FACTORIES "
+        if not registry.has(provider_id):
+            raise UnknownProviderError(
+                "provider '" + provider_id + "' is not registered "
                 "(no real Google access allowed in this phase)"
             )
-        provider = factory()
-        registry.register(provider_id, lambda: provider)
+        provider = registry.create(provider_id, pcfg)
+        resources = registry.create_resources(
+            provider_id, pcfg.get("resources", [])
+        )
         providers[provider_id] = provider
-        resources = [
-            FakeResource.model_validate(item) for item in pcfg.get("resources", [])
-        ]
-        pool = InMemoryPool(provider=provider_id, resources=resources, cooldown=cooldown)
+        pool = InMemoryPool(
+            provider=provider_id, resources=resources, cooldown=cooldown
+        )
         pools[provider_id] = pool
 
     model_registry = ModelRegistry(
