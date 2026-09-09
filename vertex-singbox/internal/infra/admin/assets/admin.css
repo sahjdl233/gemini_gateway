@@ -1,0 +1,4 @@
+/* admin.css — 样式入口：@import 汇聚 base/components/pages，保持 admin.html 引用不变 */
+@import "base.css";
+@import "components.css";
+@import "pages.css";

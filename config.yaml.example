@@ -2,7 +2,9 @@
 # 敏感信息一律通过环境变量占位符注入，禁止写入 Git。
 # 占位符写法：NAME 来自环境变量 FIREBASE_PROJECT_01（TASK-002 起）。
 #
-# TASK-001 阶段只允许 fake Provider；真实 Google Provider 未实现。
+# TASK-002 已接入第一个真实上游 anonymous_vertex（Anonymous Vertex /
+# Agent Platform studio 逆向协议）；fake 仅用于离线测试。
+# 真实敏感信息（api_key 等）一律通过环境变量占位符注入，禁止写死。
 
 server:
   host: 127.0.0.1
@@ -31,6 +33,21 @@ providers:
         provider: fake
         scenario: rate_limit
         retry_after: 1.0           # 模拟上游 Retry-After（秒）
+
+# TASK-002: Anonymous Vertex（Anonymous Vertex / Agent Platform studio）
+# 这是第一个真实 Google 上游。api_key 可省略（走匿名 key）；如需自定义，
+# 通过环境变量占位符注入，禁止把真实 key 写进配置。
+  anonymous_vertex:
+    enabled: true
+    resources:
+      - id: default
+        # provider: anonymous_vertex   # 缺省自动设为 provider_id
+        # pinned_model: gemini-2.5-flash  # 可选：把该资源固定到某个模型
+        # 代理可选：直接直连
+        # proxy:
+        #   scheme: socks5
+        #   host: PROXY_HOST
+        #   port: PROXY_PORT
 
 # ---- 以下为占位示意：TASK-002 起启用，当前阶段不要开启 ----
 # firebase:

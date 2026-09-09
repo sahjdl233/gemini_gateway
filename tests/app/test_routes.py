@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from fastapi.testclient import TestClient
 
 from app.main import create_app
@@ -112,6 +113,153 @@ def test_all_rate_limited_returns_429():
         },
     )
     assert resp.status_code == 429
+
+
+# ---------------------------------------------------------------------------
+# TASK-002: Anonymous Vertex end-to-end through OpenAPI layer with a mock
+# upstream (no real Google network).  Exercises application wiring:
+# main -> registry -> AnonymousVertexProvider/Resource -> Scheduler -> routes.
+# ---------------------------------------------------------------------------
+def _mock_vertex_client():
+    """httpx-AsyncClient-compatible mock returning the recorded fixture."""
+    from tests.providers.test_anonymous_vertex import MockClient, MockResponse
+
+    fixtures = Path(__file__).resolve().parent.parent / "fixtures" / "anonymous_vertex"
+    with open(fixtures / "stream.txt", encoding="utf-8") as f:
+        raw = f.read().encode()
+    stream = [raw[i:i+20] for i in range(0, len(raw), 20)]
+    return MockClient(responses={"post": MockResponse(200, stream_bytes=stream)})
+
+
+def _make_anon_config():
+    return {
+        "scheduler": {
+            "max_retries": 2,
+            "cooldown": {
+                "base_delay": 0.2,
+                "factor": 2.0,
+                "max_delay": 10.0,
+                "jitter": 0.1,
+            },
+        },
+        "providers": {
+            "anonymous_vertex": {
+                "enabled": True,
+                "resources": [{"id": "default"}],
+            }
+        },
+    }
+
+
+def test_anon_vertex_wiring_builds_pool(monkeypatch):
+    """build_runtime wires anonymous_vertex through the registry (no FakeResource)."""
+    import app.main
+    from providers.anonymous_vertex.provider import AnonymousVertexProvider
+
+    async def _anon_token(resource):
+        return "recaptcha-token"
+
+    def fake_create_provider(self, provider_id):
+        return AnonymousVertexProvider(
+            http_client=_mock_vertex_client(),
+            token_fetcher=_anon_token,
+        )
+
+    from providers.anonymous_vertex.factory import AnonymousVertexProviderFactory
+    monkeypatch.setattr(AnonymousVertexProviderFactory, "create_provider", fake_create_provider)
+
+    scheduler = app.main.build_runtime(_make_anon_config())
+    assert set(scheduler.providers.keys()) == {"anonymous_vertex"}
+    pool = scheduler.pools["anonymous_vertex"]
+    assert len(pool.resources) == 1
+    from providers.anonymous_vertex.resource import AnonymousVertexResource
+    assert isinstance(pool.resources[0], AnonymousVertexResource)
+
+
+def test_anon_vertex_chat_non_stream(monkeypatch):
+    """POST /v1/chat/completions -> Scheduler -> AnonymousVertex(mock) -> OpenAI JSON."""
+    from fastapi.testclient import TestClient
+
+    from app.main import create_app
+    from providers.anonymous_vertex.provider import AnonymousVertexProvider
+
+    async def _anon_token(resource):
+        return "recaptcha-token"
+
+    def fake_create_provider(self, provider_id):
+        return AnonymousVertexProvider(
+            http_client=_mock_vertex_client(),
+            token_fetcher=_anon_token,
+        )
+
+    from providers.anonymous_vertex.factory import AnonymousVertexProviderFactory
+    monkeypatch.setattr(AnonymousVertexProviderFactory, "create_provider", fake_create_provider)
+
+    client = TestClient(create_app(_make_anon_config()))
+    resp = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "gemini-2.5-flash",
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["object"] == "chat.completion"
+    assert "Hello" in body["choices"][0]["message"]["content"]
+
+
+def test_anon_vertex_chat_stream(monkeypatch):
+    """POST /v1/chat/completions?stream=true -> mock upstream -> OpenAI SSE."""
+    from fastapi.testclient import TestClient
+
+    from app.main import create_app
+    from providers.anonymous_vertex.provider import AnonymousVertexProvider
+
+    async def _anon_token(resource):
+        return "recaptcha-token"
+
+    def fake_create_provider(self, provider_id):
+        return AnonymousVertexProvider(
+            http_client=_mock_vertex_client(),
+            token_fetcher=_anon_token,
+        )
+
+    from providers.anonymous_vertex.factory import AnonymousVertexProviderFactory
+    monkeypatch.setattr(AnonymousVertexProviderFactory, "create_provider", fake_create_provider)
+
+    client = TestClient(create_app(_make_anon_config()))
+    with client.stream(
+        "POST",
+        "/v1/chat/completions",
+        json={
+            "model": "gemini-2.5-flash",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": True,
+        },
+    ) as resp:
+        assert resp.status_code == 200
+        lines = [line for line in resp.iter_lines() if line]
+    assert any("Hello" in line for line in lines)
+    assert lines[-1] == "data: [DONE]"
+
+
+def test_anon_vertex_unknown_model_no_pool():
+    """A model not offered by anonymous_vertex => 404 (no fallback)."""
+    from fastapi.testclient import TestClient
+
+    from app.main import create_app
+    # No monkeypatch: real factory builds an AnonymousVertexProvider that never
+    # touches the network because list_models is config-based.
+    client = TestClient(create_app(_make_anon_config()))
+    resp = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "gemini-9.9-ghost",
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    )
+    assert resp.status_code == 404
 
 
 def test_root_health():

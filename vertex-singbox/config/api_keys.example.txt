@@ -1,0 +1,2 @@
+# 格式: name:api_key:description（每行一个，api_key 须以 sk- 开头）
+example:sk-your-key-here:示例密钥

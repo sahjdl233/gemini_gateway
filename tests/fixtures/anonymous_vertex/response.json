@@ -1,0 +1,21 @@
+{
+  "results": [
+    {
+      "errors": [],
+      "data": {
+        "ui": {
+          "streamGenerateContentAnonymous": {
+            "candidates": [
+              {
+                "index": 0,
+                "content": { "role": "model", "parts": [ { "text": "Hello from Anonymous Vertex!" } ] },
+                "finishReason": "STOP"
+              }
+            ],
+            "usageMetadata": { "promptTokenCount": 10, "candidatesTokenCount": 5, "totalTokenCount": 15 }
+          }
+        }
+      }
+    }
+  ]
+}

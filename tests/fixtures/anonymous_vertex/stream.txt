@@ -1,0 +1,3 @@
+{"results":[{"errors":[],"data":{"ui":{"streamGenerateContentAnonymous":{"candidates":[{"index":0,"content":{"role":"model","parts":[{"text":"Hello "}]},"finishReason":"FINISH_REASON_UNSPECIFIED"}]}}}}]}
+{"results":[{"errors":[],"data":{"ui":{"streamGenerateContentAnonymous":{"candidates":[{"index":0,"content":{"role":"model","parts":[{"text":"world!"}]},"finishReason":"FINISH_REASON_UNSPECIFIED"}]}}}}]}
+{"results":[{"errors":[],"data":{"ui":{"streamGenerateContentAnonymous":{"candidates":[{"index":0,"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5,"totalTokenCount":15}}}}}]}

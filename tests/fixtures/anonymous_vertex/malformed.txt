@@ -1,0 +1,1 @@
+{"results":[{"errors":[],"data":{"ui":{"streamGenerateContentAnonymous":{"candidates":[{"index":0,"content":{"role":"model","parts":[{"text":"partial"}],"finishReason":

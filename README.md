@@ -2,7 +2,7 @@
 
 独立于 OmniRoute 的 Gemini 专用 Gateway：对外提供统一的 OpenAI-compatible API，对内通过可插拔 Provider Adapter 接入不同 Gemini 上游。
 
-> 当前阶段（TASK-000）只提供架构与骨架：不接入任何真实 Google 服务，不存储任何 Google 凭据。
+> 当前阶段（TASK-002）已接入第一个真实上游 anonymous_vertex（Anonymous Vertex / Agent Platform studio 逆向协议），同时保留 fake 用于离线测试。不存储任何 Google 凭据。
 
 ## 架构
 
@@ -14,9 +14,12 @@ Gemini Gateway (FastAPI + Scheduler)
         |
         v
 Provider Adapter (Provider 抽象)
+        |            |
+        v            v
+ AnonymousVertex  FakeProvider
         |
         v
-Google 上游 (未来任务实现)
+Anonymous Vertex / Agent Platform studio (batchGraphql)
 ```
 
 核心原则（TASK-000 第 1-27 条）：
@@ -73,10 +76,11 @@ curl -N -X POST http://127.0.0.1:8000/v1/chat/completions \
 第一版不使用数据库，使用 YAML 文件：
 
 - config.yaml —— 运行时配置（可选，缺省使用内置 fake 配置）
-- config/providers.yaml —— 各 Provider 开关与资源（TASK-002 起）
-- config/resources/ —— 资源描述（TASK-002 起）
+- config.yaml.example —— 配置示例（含 anonymous_vertex 用法）
 
-敏感信息一律通过环境变量占位符注入，禁止写入 Git（见 config.yaml.example）。
+敏感信息一律通过环境变量占位符注入，禁止写入 Git。TASK-002 的 anonymous_vertex
+默认走 Google 公开匿名 key；如需自定义 api_key 或代理，请用环境变量占位符，
+禁止把真实 key 写进配置（见 config.yaml.example）。
 
 ## 目录结构
 
@@ -85,7 +89,7 @@ app/          FastAPI 应用与路由
 core/         models / provider / resource / pool / scheduler / errors / health / cooldown
 protocol/     openai / gemini / common（HTTP <-> 内部模型 <-> Provider）
 transport/    http / proxy / streaming（Proxy 独立于 Provider）
-providers/    fake(已实现) / firebase / vertex / express / cli / build / antigravity(接口预占)
+providers/    fake(已实现) / anonymous_vertex(TASK-002 已实现) / firebase / vertex / express / cli / build / antigravity(接口预占)
 config/       YAML/JSON 加载与 env 占位符替换
 tests/        core / protocol / providers / app
 ```
