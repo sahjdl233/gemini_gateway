@@ -2,7 +2,7 @@
 # 敏感信息一律通过环境变量占位符注入，禁止写入 Git。
 # 占位符写法：NAME 来自环境变量 FIREBASE_PROJECT_01（TASK-002 起）。
 #
-# TASK-000 阶段只允许 fake Provider；真实 Google Provider 未实现。
+# TASK-001 阶段只允许 fake Provider；真实 Google Provider 未实现。
 
 server:
   host: 127.0.0.1
@@ -17,13 +17,16 @@ scheduler:
     jitter: 0.1          # 抖动比例
     degrade_threshold: 3
 
+model_registry:
+  refresh_interval: 300   # 模型索引 TTL（秒）；过期的索引会被并发安全地刷新
+
 providers:
   fake:
     enabled: true
     resources:
       - id: fake-01
         provider: fake
-        scenario: success          # success | rate_limit | auth_error | timeout | unknown_model
+        scenario: success          # success | rate_limit | auth_error | authz_error | timeout | server_error | content_filter | unknown_model
       - id: fake-02
         provider: fake
         scenario: rate_limit

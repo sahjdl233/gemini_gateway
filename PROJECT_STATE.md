@@ -1,7 +1,7 @@
 # Gemini Gateway
 
 Current Phase:
-TASK-000
+TASK-001
 
 Completed:
 - Core architecture: models, resources, pools, scheduler, errors, health, cooldown
@@ -30,7 +30,7 @@ Not implemented:
 
  No real Google API requests; no Google credentials stored.
 
-Test results (TASK-000 acceptance):
+Test results (TASK-001 acceptance):
 - 67 tests passed (pytest), covering:
   core (errors / models / resource / cooldown / pool / scheduler),
   protocol (OpenAI mapping + SSE helpers),

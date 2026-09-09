@@ -1,5 +1,4 @@
-"""Scheduler: resource selection, health-aware routing, cooldown, retry,
-fallback.
+"""Scheduler: resource selection, health-aware routing, cooldown, retry, fallback.
 
 TASK-000 rule: the Scheduler NEVER parses raw Google errors. Provider
 adapters translate everything into core.errors.ProviderError types.
@@ -7,6 +6,7 @@ adapters translate everything into core.errors.ProviderError types.
 
 from __future__ import annotations
 
+import logging
 from typing import AsyncGenerator, Dict, List, Optional, Set
 
 from .errors import (
@@ -18,8 +18,11 @@ from .errors import (
 )
 from .health import HealthState
 from .models import ChatChunk, ChatRequest, ChatResponse, ModelInfo
+from .model_registry import ModelRegistry
 from .pool import ResourcePool
 from .provider import Provider
+
+logger = logging.getLogger(__name__)
 
 
 class Scheduler:
@@ -28,41 +31,26 @@ class Scheduler:
         *,
         providers: Dict[str, Provider],
         pools: Dict[str, ResourcePool],
+        model_registry: Optional[ModelRegistry] = None,
         max_retries: int = 2,
     ) -> None:
         self.providers = providers
         self.pools = pools
         self.max_retries = max_retries
-        self._model_index: Dict[str, List[str]] = {}
-        self._model_index_ready = False
+        self._model_registry = model_registry or ModelRegistry(providers=providers)
+
+    @property
+    def model_registry(self) -> ModelRegistry:
+        return self._model_registry
 
     async def rebuild_model_index(self) -> None:
-        index: Dict[str, List[str]] = {}
-        for provider_id, provider in self.providers.items():
-            try:
-                models = await provider.list_models()
-            except ProviderError:
-                continue
-            for model in models:
-                index.setdefault(model.id, []).append(provider_id)
-        self._model_index = index
-        self._model_index_ready = True
-
-    async def _ensure_model_index(self) -> None:
-        if not self._model_index_ready:
-            await self.rebuild_model_index()
+        await self._model_registry.refresh()
 
     async def list_models(self) -> List[ModelInfo]:
-        result: List[ModelInfo] = []
-        for _, provider in self.providers.items():
-            try:
-                result.extend(await provider.list_models())
-            except ProviderError:
-                continue
-        return result
+        return await self._model_registry.list_models()
 
     def _candidate_pools(self, model: str) -> List[ResourcePool]:
-        provider_ids = self._model_index.get(model, [])
+        provider_ids = self._model_registry.snapshot().get(model, [])
         return [self.pools[pid] for pid in provider_ids if pid in self.pools]
 
     def _raise_no_pool(self, model: str) -> None:
@@ -74,7 +62,7 @@ class Scheduler:
     async def _raise_when_nothing_acquired(
         self,
         pools: List[ResourcePool],
-        tried: Set[str],
+        tried: Set,
         errors: List[ProviderError],
     ) -> None:
         if errors:
@@ -84,13 +72,13 @@ class Scheduler:
         )
 
     async def chat_completion(self, request: ChatRequest) -> ChatResponse:
-        await self._ensure_model_index()
+        await self._model_registry._ensure_fresh()
         pools = self._candidate_pools(request.model)
         if not pools:
             self._raise_no_pool(request.model)
 
         errors: List[ProviderError] = []
-        tried: Set[str] = set()
+        tried: Set = set()
 
         for _ in range(self.max_retries + 1):
             acquired_any = False
@@ -99,14 +87,16 @@ class Scheduler:
                 if resource is None:
                     continue
                 acquired_any = True
-                tried.add(resource.id)
+                tried.add(resource.resource_key)
                 provider = self.providers[resource.provider]
+                logger.info('scheduler.acquire provider=%s resource=%s model=%s', resource.provider, str(resource.resource_key), request.model)
                 try:
                     try:
                         response = await provider.complete(request, resource)
                     finally:
                         await pool.release(resource)
                 except ProviderError as exc:
+                    logger.warning('scheduler.error provider=%s resource=%s model=%s error=%s', resource.provider, str(resource.resource_key), request.model, type(exc).__name__)
                     if isinstance(exc, RateLimitError):
                         await pool.record_rate_limit(resource, exc.retry_after)
                     else:
@@ -115,6 +105,7 @@ class Scheduler:
                     if not is_retryable(exc):
                         raise exc
                     continue
+                logger.info('scheduler.success provider=%s resource=%s model=%s', resource.provider, str(resource.resource_key), request.model)
                 await pool.record_success(resource)
                 return response
 
@@ -129,13 +120,14 @@ class Scheduler:
     async def stream_chat(
         self, request: ChatRequest
     ) -> AsyncGenerator[ChatChunk, None]:
-        await self._ensure_model_index()
+        logger.info('scheduler.stream model=%s', request.model)
+        await self._model_registry._ensure_fresh()
         pools = self._candidate_pools(request.model)
         if not pools:
             self._raise_no_pool(request.model)
 
         errors: List[ProviderError] = []
-        tried: Set[str] = set()
+        tried: Set = set()
 
         for _ in range(self.max_retries + 1):
             acquired_any = False
@@ -144,9 +136,10 @@ class Scheduler:
                 if resource is None:
                     continue
                 acquired_any = True
-                tried.add(resource.id)
+                tried.add(resource.resource_key)
                 provider = self.providers[resource.provider]
                 sent_any = False
+                logger.info('scheduler.stream.acquire provider=%s resource=%s model=%s', resource.provider, str(resource.resource_key), request.model)
                 try:
                     try:
                         async for chunk in provider.stream(request, resource):
@@ -155,6 +148,7 @@ class Scheduler:
                     finally:
                         await pool.release(resource)
                 except ProviderError as exc:
+                    logger.warning('scheduler.stream.error provider=%s resource=%s model=%s error=%s', resource.provider, str(resource.resource_key), request.model, type(exc).__name__)
                     if isinstance(exc, RateLimitError):
                         await pool.record_rate_limit(resource, exc.retry_after)
                     else:

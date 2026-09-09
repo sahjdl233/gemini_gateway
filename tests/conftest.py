@@ -65,3 +65,37 @@ def make_chat_request(model: str = "gemini-3.8-flash", message: str = "hi") -> C
     return ChatRequest(
         model=model, messages=[ChatMessage(role="user", content=message)]
     )
+
+
+
+def make_multi_provider_scheduler(
+    clock: FakeClock,
+    provider_specs: List[dict],
+    max_retries: int = 2,
+    refresh_interval: float = 300.0,
+) -> Scheduler:
+    """Build a Scheduler over multiple providers/pools.
+
+    provider_specs: list of
+      {"id": <provider_id>, "resources": [resource_spec...]}
+    """
+    from core.model_registry import ModelRegistry
+
+    providers = {}
+    pools = {}
+    for spec in provider_specs:
+        provider = FakeProvider()
+        resources = make_resources(spec["resources"])
+        for r in resources:
+            r.provider = spec["id"]
+        pool = make_pool(clock, resources)
+        pool.provider = spec["id"]
+        providers[spec["id"]] = provider
+        pools[spec["id"]] = pool
+    registry = ModelRegistry(providers=providers, refresh_interval=refresh_interval)
+    return Scheduler(
+        providers=providers,
+        pools=pools,
+        model_registry=registry,
+        max_retries=max_retries,
+    )

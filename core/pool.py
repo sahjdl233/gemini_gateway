@@ -83,7 +83,7 @@ class InMemoryPool(ResourcePool):
                 continue
             if resource.health in (HealthState.DISABLED, HealthState.COOLDOWN):
                 continue
-            if skip and resource.id in skip:
+            if skip and resource.resource_key in skip:
                 continue
             eligible.append(resource)
         return eligible

@@ -119,4 +119,4 @@ def test_root_health():
     resp = client.get("/")
     assert resp.status_code == 200
     assert resp.json()["service"] == "gemini-gateway"
-    assert resp.json()["phase"] == "TASK-000"
+    assert resp.json()["phase"] == "TASK-001"

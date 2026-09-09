@@ -76,6 +76,7 @@ def default_config() -> Dict[str, Any]:
                 "jitter": 0.1,
             },
         },
+        "model_registry": {"refresh_interval": 300.0},
         "providers": {
             "fake": {
                 "enabled": True,
