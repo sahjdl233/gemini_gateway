@@ -29,9 +29,14 @@ Factory = Callable[[], Provider]
 
 
 class ProviderFactory(Protocol):
-    """Creates a single provider instance from its provider id."""
+    """Creates a single provider instance from its provider id and config.
 
-    def create_provider(self, provider_id: str) -> Provider:
+    The optional config is the provider block from the application
+    configuration (a dict).  Providers that do not need config simply
+    ignore it.
+    """
+
+    def create_provider(self, provider_id: str, config: Any = None) -> Provider:
         ...
 
 
@@ -82,7 +87,7 @@ class ProviderRegistry:
             def __init__(self, f: Factory) -> None:
                 self._f = f
 
-            def create_provider(self, provider_id: str) -> Provider:
+            def create_provider(self, provider_id: str, config: Any = None) -> Provider:
                 return self._f()
 
         class _NoResourceFactory:
@@ -120,10 +125,15 @@ class ProviderRegistry:
 
         Unlike get (which caches), create returns a fresh instance each
         call.  Used at application build time to wire providers into the
-        Scheduler.  Raises UnknownProviderError for unknown ids.
+        Scheduler.  The optional config is forwarded to the registered
+        factory so provider constructors can receive configuration (e.g.
+        a provider's model list).  Raises UnknownProviderError for unknown
+        ids.
         """
         definition = self._require(provider_id)
-        provider = definition.provider_factory.create_provider(provider_id)
+        provider = definition.provider_factory.create_provider(
+            provider_id, config
+        )
         logger.info("provider.created provider=%s", provider_id)
         return provider
 

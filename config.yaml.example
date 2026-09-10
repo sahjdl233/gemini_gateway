@@ -39,6 +39,11 @@ providers:
 # 通过环境变量占位符注入，禁止把真实 key 写进配置。
   anonymous_vertex:
     enabled: true
+    # 模型列表（可选）：覆盖内置文本模型清单。缺省使用 provider 内置清单
+    #（gemini-2.5-flash ... gemini-3.8-flash）。
+    # models:
+    #   - gemini-3.8-flash
+    #   - gemini-3.7-flash
     resources:
       - id: default
         # provider: anonymous_vertex   # 缺省自动设为 provider_id
