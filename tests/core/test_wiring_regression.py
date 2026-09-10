@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from app.bootstrap import register_builtin_providers
 from app.main import build_runtime
 from core.provider_registry import ProviderRegistry
 from providers.anonymous_vertex.provider import AnonymousVertexProvider
 from providers.anonymous_vertex.resource import AnonymousVertexResource
+
+from tests.conftest import make_chat_request
 
 
 def _anon_config(models=None):
@@ -78,3 +82,63 @@ def test_registry_create_resources_builds_anon_resource():
     assert len(resources) == 1
     assert isinstance(resources[0], AnonymousVertexResource)
     assert resources[0].provider == "anonymous_vertex"
+
+
+async def test_anonymous_vertex_full_chain_first_discovery():
+    """TASK-002-FIX-02: gemini-3.8-flash completes the full chain
+
+        Provider -> Model Discovery -> ModelRegistry -> Scheduler -> ResourcePool
+
+    on a *fresh* registry (last_refresh is None). Under the old '0.0'
+    initialisation the first Discovery could be skipped on hosts where
+    time.monotonic() starts below the refresh interval; this test never calls
+    model_registry.refresh() up-front and relies on the first-query Discovery
+    triggered by Scheduler.chat_completion.
+    """
+    scheduler = build_runtime(_anon_config(models=["gemini-3.8-flash"]))
+    assert scheduler.model_registry.last_refresh is None  # never refreshed yet
+
+    provider = scheduler.providers["anonymous_vertex"]
+    fixture = (
+        Path(__file__).parent.parent
+        / "fixtures"
+        / "anonymous_vertex"
+        / "response.json"
+    ).read_bytes()
+
+    class MockResponse:
+        status_code = 200
+        headers = {}
+
+        def __init__(self, body: bytes) -> None:
+            self.content = body
+
+        async def aiter_bytes(self):
+            yield self.content
+
+    class MockClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def post(self, url, content=None, headers=None):
+            self.calls += 1
+            return MockResponse(fixture)
+
+    client = MockClient()
+    provider.set_http_client(client)
+
+    async def _token_fetcher(resource):
+        return "recaptcha-token"
+
+    provider.set_token_fetcher(_token_fetcher)
+
+    resp = await scheduler.chat_completion(
+        make_chat_request(model="gemini-3.8-flash")
+    )
+    assert "Hello from Anonymous Vertex!" in resp.text
+    assert client.calls == 1  # one upstream POST through the full chain
+    assert scheduler.model_registry.last_refresh is not None  # discovery ran
+    # The index now maps gemini-3.8-flash to the anonymous_vertex pool.
+    assert scheduler.model_registry.snapshot()["gemini-3.8-flash"] == [
+        "anonymous_vertex"
+    ]

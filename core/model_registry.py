@@ -31,7 +31,7 @@ class ModelRegistry:
         self._providers = providers
         self._refresh_interval = refresh_interval
         self._index: Dict[str, List[str]] = {}
-        self._last_refresh: float = 0.0
+        self._last_refresh: Optional[float] = None
         self._lock: asyncio.Lock = asyncio.Lock()
         self._refresh_event: asyncio.Event = asyncio.Event()
 
@@ -40,10 +40,15 @@ class ModelRegistry:
         return self._refresh_interval
 
     @property
-    def last_refresh(self) -> float:
+    def last_refresh(self) -> Optional[float]:
         return self._last_refresh
 
     def _is_expired(self) -> bool:
+        # A never-refreshed registry is always stale: force the very first
+        # query to perform Discovery even when time.monotonic() is smaller
+        # than the refresh interval (TASK-002-FIX-02).
+        if self._last_refresh is None:
+            return True
         return (time.monotonic() - self._last_refresh) >= self._refresh_interval
 
     async def refresh(self) -> Dict[str, List[str]]:

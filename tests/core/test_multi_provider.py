@@ -135,7 +135,13 @@ async def test_scenario_d_concurrent_refresh_single_flight(fake_clock):
     # Warm up so the index is built, then force expiry.
     await scheduler.chat_completion(make_chat_request())
     calls_before = provider.list_calls
-    scheduler.model_registry._last_refresh = 0.0
+    # Force expiry with a clearly-past monotonic timestamp (TASK-002-FIX-02:
+    # the 0.0 reset is the fragile pattern this task removes).
+    scheduler.model_registry._last_refresh = (
+        scheduler.model_registry._last_refresh
+        - scheduler.model_registry.refresh_interval
+        - 5.0
+    )
 
     results = await asyncio.gather(
         *[scheduler.chat_completion(make_chat_request()) for _ in range(5)]
