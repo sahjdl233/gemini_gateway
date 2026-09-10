@@ -3,14 +3,22 @@
 Mirrors recaptcha.go: anchor iframe GET -> parse base token -> reload POST -> rresp.
 The token is put into variables.recaptchaToken for every batchGraphql request.
 
-The live fetch hits google.com; tests use a mock transport instead of the network.
+This module exposes:
+  - fetch_recaptcha_token()   the real anchor+reload flow (tests use a mock)
+  - RecaptchaTokenProvider    the abstraction AnonymousVertexProvider depends on
+  - FakeRecaptchaTokenProvider deterministic fake for tests
+
+The Anonymous Vertex request layer depends only on `token_provider.get_token()`.
+No bypass / cracking / bulk fetching is implemented (TASK-002-A section 17).
 """
+
 from __future__ import annotations
 
+import random
 import re
-from typing import Optional
+from typing import Optional, Protocol, runtime_checkable
 
-from transport.http import build_client, fetch_json
+from transport.http import build_client
 from transport.proxy import ProxyConfig, TransportConfig
 
 RECAPTCHA_BASE = "https://www.google.com"
@@ -26,12 +34,34 @@ _VERSION_RE = re.compile(r"releases/([A-Za-z0-9_-]{20,})")
 
 _CHARSET = "abcdefghijklmnopqrstuvwxyz0123456789"
 
-import random
-import string
-
 
 def _random_string(n: int) -> str:
     return "".join(random.choice(_CHARSET) for _ in range(n))
+
+
+@runtime_checkable
+class RecaptchaTokenProvider(Protocol):
+    """Abstraction for producing a fresh reCAPTCHA Enterprise token.
+
+    AnonymousVertexProvider depends on this interface (via token_fetcher),
+    never on the concrete Google flow.  Tests inject FakeRecaptchaTokenProvider.
+    """
+
+    async def get_token(self) -> str:
+        """Return a fresh reCAPTCHA Enterprise token."""
+        ...
+
+
+class FakeRecaptchaTokenProvider:
+    """Deterministic token provider for tests (no network)."""
+
+    def __init__(self, token: str = "recaptcha-token") -> None:
+        self._token = token
+        self.calls = 0
+
+    async def get_token(self) -> str:
+        self.calls += 1
+        return self._token
 
 
 async def fetch_recaptcha_token(
@@ -45,14 +75,11 @@ async def fetch_recaptcha_token(
     proxy: optional proxy config.
     version: explicit release version (defaults to a fallback).
     """
-    import httpx
-
     if client is None:
         cfg = TransportConfig(proxy=proxy, timeout_seconds=15.0)
         client = build_client(cfg)
 
     ver = version or RECAPTCHA_V_FALLBACK
-
     cb = _random_string(10)
     anchor_url = (
         f"{RECAPTCHA_BASE}/recaptcha/enterprise/anchor?ar=1&k={SITE_KEY}"
@@ -97,3 +124,4 @@ async def fetch_recaptcha_token(
     if rm is None:
         raise RuntimeError("recaptcha reload: rresp token not found")
     return rm.group(1)
+

@@ -16,10 +16,21 @@ from providers.anonymous_vertex.resource import AnonymousVertexResource
 
 
 class AnonymousVertexProviderFactory:
-    """Creates a fresh AnonymousVertexProvider instance."""
 
-    def create_provider(self, provider_id: str) -> AnonymousVertexProvider:
-        return AnonymousVertexProvider()
+    """Creates a fresh AnonymousVertexProvider instance.
+
+    The optional config may carry an explicit model list ("models") used
+    to override the static text-model list from the reference source.  If
+    absent, the provider falls back to the built-in TEXT_MODELS list.
+    """
+
+    def create_provider(
+        self, provider_id: str, config: Any = None
+    ) -> AnonymousVertexProvider:
+        models = None
+        if config:
+            models = config.get("models")
+        return AnonymousVertexProvider(models=models)
 
 
 class AnonymousVertexResourceFactory:

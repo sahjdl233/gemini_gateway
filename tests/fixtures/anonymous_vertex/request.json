@@ -1,0 +1,57 @@
+{
+  "requestContext": {
+    "clientVersion": "boq_cloud-boq-clientweb-vertexaistudio_20260630.00_p0",
+    "pagePath": "/agent-platform/studio/multimodal",
+    "pageViewId": 1000000000000000,
+    "trackingId": "d0000000000000000",
+    "backendOverrides": {},
+    "clientSessionId": "00000000-0000-4000-8000-000000000000",
+    "selectedPurview": {},
+    "jurisdiction": "global",
+    "localizationData": {
+      "locale": "zh_CN",
+      "timezone": "Asia/Hong_Kong"
+    }
+  },
+  "querySignature": "2/l8eCsMMY49imcDQ/lwwXyL8cYtTjxZBF2dNqy69LodY=",
+  "operationName": "StreamGenerateContentAnonymous",
+  "variables": {
+    "model": "gemini-2.5-flash",
+    "region": "global",
+    "recaptchaToken": "RECAPTCHA_TOKEN_PLACEHOLDER",
+    "contents": [
+      {
+        "role": "user",
+        "parts": [
+          {
+            "text": "hello"
+          }
+        ]
+      }
+    ],
+    "safetySettings": [
+      {
+        "category": "HARM_CATEGORY_HARASSMENT",
+        "threshold": "BLOCK_NONE"
+      },
+      {
+        "category": "HARM_CATEGORY_HATE_SPEECH",
+        "threshold": "BLOCK_NONE"
+      },
+      {
+        "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+        "threshold": "BLOCK_NONE"
+      },
+      {
+        "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
+        "threshold": "BLOCK_NONE"
+      }
+    ],
+    "generationConfig": {
+      "temperature": 1,
+      "maxOutputTokens": 65535,
+      "topP": 1
+    }
+  }
+}
+

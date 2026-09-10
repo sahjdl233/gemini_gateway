@@ -1,54 +1,49 @@
 """AnonymousVertexProvider — the first real Google upstream adapter.
 
-Implements the Anonymous Vertex / Agent Platform batchGraphql protocol.
-The provider translates Gateway ChatRequest <-> internal models and maps
-upstream errors to Gateway ProviderError types. It is transport-agnostic:
-an httpx.AsyncClient-compatible object is injected for testability (tests
-use a mock transport; production uses the gateway transport layer).
+Implements the Anonymous Vertex / Agent Platform batchGraphql protocol
+through a layered protocol stack:
+
+    AnonymousVertexProvider
+            |
+            v
+    AnonymousVertexClient   (client.py)
+            |
+            v
+    AnonymousVertexProtocol (protocol.py)
+            |
+            v
+    HTTP Transport          (transport.py)
+
+The Provider ONLY orchestrates: it converts the Gateway ChatRequest into
+the internal AnonymousVertexRequest (request.py), asks the AnonymousVertexClient
+to talk to upstream, and converts the returned Gemini frames into Gateway
+chunks (response.py).  It never builds GraphQL payloads or Google headers
+itself (TASK-002-A section 18).
 """
+
 from __future__ import annotations
 
-import json
 import logging
-from typing import Any, AsyncIterator, Dict, List, Optional
+from typing import Any, AsyncIterator, List, Optional
 
-from core.errors import (
-    AuthenticationError,
-    InvalidRequestError,
-    ModelNotFoundError,
-    ProviderError,
-    RateLimitError,
-    UpstreamUnavailableError,
-)
+from core.errors import UpstreamUnavailableError
 from core.health import HealthResult, HealthState
-from core.models import ChatChunk, ChatRequest, ChatResponse, ModelInfo, Usage
+from core.models import ChatChunk, ChatRequest, ChatResponse, ModelInfo
 from core.provider import Provider
 from core.resource import Resource
 
-from providers.anonymous_vertex.protocol import (
-    chat_to_vertex_request,
-    get_model_spec,
+from providers.anonymous_vertex.client import AnonymousVertexClient
+from providers.anonymous_vertex.request import chat_to_vertex_request
+from providers.anonymous_vertex.response import (
     vertex_chunk_to_chat_chunk,
     vertex_response_to_chat_response,
 )
-from providers.anonymous_vertex.request import (
-    build_batch_graphql_url,
-    build_envelope,
-)
-from providers.anonymous_vertex.headers import build_xhr_headers
 from providers.anonymous_vertex.resource import AnonymousVertexResource
 from providers.anonymous_vertex.streaming import (
-    StreamParseError,
     chunk_finish_reason,
-    extract_chunk_from_frame,
-    iter_chunks,
     normalize_chunk,
 )
-from providers.anonymous_vertex.errors import (
-    UpstreamVertexError,
-    classify_upstream_error,
-    parse_upstream_error,
-)
+from providers.anonymous_vertex.transport import HttpxTransport
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +62,7 @@ TEXT_MODELS = [
     "gemini-3.5-flash-lite",
     "gemini-3.6-flash",
     "gemini-3.7-flash",
+    "gemini-3.8-flash",
 ]
 
 
@@ -85,93 +81,47 @@ class AnonymousVertexProvider(Provider):
         self._http = http_client
         self._token_fetcher = token_fetcher
         self._models = list(models) if models else list(TEXT_MODELS)
+        self._client: Optional[AnonymousVertexClient] = None
 
-    # -- lifecycle / config --
+    # -- lifecycle / resource wiring --
+
     def set_http_client(self, client: Any) -> None:
         """Inject an httpx.AsyncClient-compatible object (tests)."""
         self._http = client
+        self._client = None
 
     def set_token_fetcher(self, fetcher) -> None:
         """Inject a recaptcha token fetcher (tests)."""
         self._token_fetcher = fetcher
 
-    async def _ensure_client(self):
-        """Return an HTTP client, building one if needed."""
+    async def _ensure_http(self):
+        """Return the raw HTTP client, building one if needed."""
         if self._http is not None:
             return self._http
-        import httpx
         from transport.http import build_client
         from transport.proxy import TransportConfig
+
         self._http = build_client(TransportConfig(timeout_seconds=180.0))
         return self._http
+
+    async def _ensure_client(self) -> AnonymousVertexClient:
+        """Return (and cache) the protocol client for this provider."""
+        if self._client is None:
+            http = await self._ensure_http()
+            self._client = AnonymousVertexClient(
+                transport=HttpxTransport(http),
+                api_key=self.api_key,
+            )
+        return self._client
 
     async def _get_token(self, resource: Resource) -> str:
         """Fetch a fresh recaptcha token for this request."""
         if self._token_fetcher is not None:
             return await self._token_fetcher(resource)
         from providers.anonymous_vertex.recaptcha import fetch_recaptcha_token
-        client = await self._ensure_client()
-        return await fetch_recaptcha_token(client=client)
 
-    async def _make_request(
-        self,
-        client,
-        model: str,
-        gemini_request: dict,
-        token: str,
-        resource: Resource,
-    ) -> Any:
-        """POST the envelope to batchGraphql and return the response."""
-        url = build_batch_graphql_url(self.api_key)
-        envelope = build_envelope(model, gemini_request, token)
-        headers = build_xhr_headers()
-        body = json.dumps(envelope)
-        resp = await client.post(
-            url,
-            content=body,
-            headers=headers,
-        )
-        return resp
-
-    def _map_http_error(
-        self,
-        status_code: int,
-        body: bytes,
-        retry_after: Optional[float] = None,
-    ) -> ProviderError:
-        """Map a non-200 HTTP response to a Gateway ProviderError.
-
-        When the upstream returns HTTP 429 with a Retry-After header, the
-        header value is carried on the RateLimitError so Core Runtime can
-        honour it exactly (TASK-002 section 13).
-        """
-        parsed = parse_upstream_error(status_code, body)
-        if retry_after is not None and parsed.retry_after is None:
-            parsed.retry_after = retry_after
-        return classify_upstream_error(parsed)
-
-    @staticmethod
-    def _extract_retry_after(resp: Any) -> Optional[float]:
-        """Read the Retry-After response header (seconds), if present.
-
-        httpx responses expose ``headers``; test mocks may omit it.  A
-        missing/empty/invalid value yields None (Core Runtime falls back to
-        exponential backoff).
-        """
-        headers = getattr(resp, "headers", None)
-        if headers is None:
-            return None
-        try:
-            raw = headers.get("Retry-After") or headers.get("retry-after")
-        except (AttributeError, TypeError):
-            return None
-        if raw is None:
-            return None
-        try:
-            value = float(str(raw).strip())
-        except (TypeError, ValueError):
-            return None
-        return value if value > 0 else None
+        http = await self._ensure_http()
+        return await fetch_recaptcha_token(client=http)
 
     # -- Provider interface --
 
@@ -194,34 +144,22 @@ class AnonymousVertexProvider(Provider):
         """Non-streaming completion (collects upstream stream chunks)."""
         client = await self._ensure_client()
         token = await self._get_token(resource)
-        gemini_request = chat_to_vertex_request(request)
-        model = request.model
-        resp = await self._make_request(client, model, gemini_request, token, resource)
+        vertex_request = chat_to_vertex_request(request)
 
-        if resp.status_code != 200:
-            raise self._map_http_error(
-                resp.status_code,
-                resp.content,
-                self._extract_retry_after(resp),
-            )
-
-        # Parse NDJSON stream and collect chunks
         all_candidates: List[dict] = []
-        usage_meta = None
-        model_version = model
+        usage_meta: Optional[dict] = None
+        model_version = request.model
         response_id = ""
-        async for chunk in iter_chunks(resp.aiter_bytes()):
+
+        async for chunk in client.stream_content(vertex_request, token):
             norm = normalize_chunk(chunk)
             if norm is None:
                 continue
-            frames = _flatten(norm)
-            for item in frames:
+            for item in _flatten(norm):
                 if not isinstance(item, dict):
                     continue
-                # extract candidates from this frame
                 if item.get("candidates"):
                     all_candidates.extend(item["candidates"])
-                # capture metadata
                 um = item.get("usageMetadata")
                 if um:
                     usage_meta = um
@@ -229,9 +167,7 @@ class AnonymousVertexProvider(Provider):
                     model_version = item["modelVersion"]
                 if item.get("responseId"):
                     response_id = item["responseId"]
-            # check finish
-            fr = chunk_finish_reason(norm)
-            if fr:
+            if chunk_finish_reason(norm):
                 break
 
         if not all_candidates:
@@ -252,21 +188,13 @@ class AnonymousVertexProvider(Provider):
         """Streaming completion from upstream NDJSON frames."""
         client = await self._ensure_client()
         token = await self._get_token(resource)
-        gemini_request = chat_to_vertex_request(request)
-        model = gemini_request.get("model") or request.model
-        resp = await self._make_request(client, model, gemini_request, token, resource)
+        vertex_request = chat_to_vertex_request(request)
 
-        if resp.status_code != 200:
-            raise self._map_http_error(
-                resp.status_code,
-                resp.content,
-                self._extract_retry_after(resp),
-            )
-
-        usage_meta = None
-        model_version = model
+        usage_meta: Optional[dict] = None
+        model_version = request.model
         response_id = ""
-        async for chunk in iter_chunks(resp.aiter_bytes()):
+
+        async for chunk in client.stream_content(vertex_request, token):
             norm = normalize_chunk(chunk)
             if norm is None:
                 continue
@@ -289,7 +217,6 @@ class AnonymousVertexProvider(Provider):
                 if chat_chunk is not None:
                     yield chat_chunk
             if fr:
-                # emit final finish chunk
                 final = vertex_chunk_to_chat_chunk(
                     [],
                     usage_metadata=usage_meta,
@@ -304,6 +231,7 @@ class AnonymousVertexProvider(Provider):
 
 def trim(model: str) -> str:
     from providers.anonymous_vertex.signature import trim_gemini_path_prefix
+
     return trim_gemini_path_prefix(model)
 
 
@@ -312,5 +240,4 @@ def _flatten(norm: Any) -> List[Any]:
     if isinstance(norm, list):
         return norm
     return [norm]
-
 

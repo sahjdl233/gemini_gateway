@@ -42,6 +42,39 @@ class UpstreamVertexError(Exception):
         super().__init__(message)
 
 
+class AnonymousVertexProtocolError(ProviderError):
+    """Base class for Anonymous Vertex protocol-layer errors.
+
+    Every error raised by the protocol/client layer is recognisable by the
+    upper layers as an AnonymousVertexProtocolError (in addition to its core
+    ProviderError subtype, so the Scheduler keeps working unchanged).
+    """
+
+    default_status = 502
+
+
+class AnonymousVertexAuthError(AuthenticationError, AnonymousVertexProtocolError):
+    """Upstream rejected the request for auth reasons (401 / token failed)."""
+
+
+class AnonymousVertexRateLimitError(RateLimitError, AnonymousVertexProtocolError):
+    """Upstream rate-limited the request (429 / RESOURCE_EXHAUSTED)."""
+
+
+class AnonymousVertexParseError(ProviderError):
+    """Upstream stream/frame could not be parsed (malformed JSON)."""
+
+    default_status = 502
+
+
+class AnonymousVertexConnectionError(NetworkError, AnonymousVertexProtocolError):
+    """Connection-level failure talking to the upstream endpoint."""
+
+
+class AnonymousVertexUnavailableError(UpstreamUnavailableError, AnonymousVertexProtocolError):
+    """Upstream returned a 5xx / service unavailable."""
+
+
 def classify_upstream_error(err: UpstreamVertexError) -> ProviderError:
     """Convert an UpstreamVertexError into a Gateway ProviderError."""
     msg = err.message
@@ -50,30 +83,32 @@ def classify_upstream_error(err: UpstreamVertexError) -> ProviderError:
 
     # kind-based classification (matches Go errors.go)
     if err.kind == "ratelimit" or err.status_code == 429:
-        return RateLimitError(
+        return AnonymousVertexRateLimitError(
             msg,
             provider=provider,
             scope="resource",
             retry_after=retry_after,
         )
     if err.kind == "auth" or err.status_code in (401, 502):
-        return AuthenticationError(msg, provider=provider)
+        return AnonymousVertexAuthError(msg, provider=provider)
     if err.kind == "permission" or err.status_code == 403:
         return AuthorizationError(msg, provider=provider)
     if err.kind == "invalid" or err.status_code == 400:
         return InvalidRequestError(msg, provider=provider)
     if err.kind == "notfound" or err.status_code == 404:
         return ModelNotFoundError(msg, provider=provider)
-    if err.kind in ("unavailable", "network") or err.status_code in (502, 503, 504):
-        return UpstreamUnavailableError(msg, provider=provider)
+    if err.kind == "network":
+        return AnonymousVertexConnectionError(msg, provider=provider)
+    if err.kind in ("unavailable",) or err.status_code in (502, 503, 504):
+        return AnonymousVertexUnavailableError(msg, provider=provider)
     if err.kind == "internal" or err.status_code >= 500:
-        return UpstreamUnavailableError(msg, provider=provider)
+        return AnonymousVertexUnavailableError(msg, provider=provider)
 
     # HTTP status code fallback
     if err.status_code == 429:
-        return RateLimitError(msg, provider=provider, scope="resource", retry_after=retry_after)
+        return AnonymousVertexRateLimitError(msg, provider=provider, scope="resource", retry_after=retry_after)
     if err.status_code == 401:
-        return AuthenticationError(msg, provider=provider)
+        return AnonymousVertexAuthError(msg, provider=provider)
     if err.status_code == 403:
         return AuthorizationError(msg, provider=provider)
     if err.status_code == 400:
@@ -81,9 +116,9 @@ def classify_upstream_error(err: UpstreamVertexError) -> ProviderError:
     if err.status_code == 404:
         return ModelNotFoundError(msg, provider=provider)
     if err.status_code >= 500:
-        return UpstreamUnavailableError(msg, provider=provider)
+        return AnonymousVertexUnavailableError(msg, provider=provider)
 
-    return UpstreamUnavailableError(msg, provider=provider)
+    return AnonymousVertexUnavailableError(msg, provider=provider)
 
 
 def parse_upstream_error(

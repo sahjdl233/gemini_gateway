@@ -266,4 +266,58 @@ gemini-2.5-flash, gemini-2.5-flash-lite, gemini-2.5-pro, gemini-3-flash-preview,
 ## 11. Blocked items (from the stop-condition)
 
 - Transport fingerprint: TLS ClientHello + header ordering cannot be reproduced by plain httpx. This is a real constraint, not a guess. See section 9.
-- reCAPTCHA token live fetch: reproduces the Google flow but is a network call to google.com at request time; testable only via a recorded fixture or mock transport. The live fetch itself is implemented but requires a fingerprint-capable transport to be reliable upstream.
+---
+
+## 12. Protocol Layer Code Layout (TASK-002-A)
+
+The provider is decomposed into a layered protocol stack so the Provider
+never assembles Google GraphQL dictionaries itself:
+
+```text
+AnonymousVertexProvider (provider.py: lifecycle / request orchestration)
+        |
+        v
+AnonymousVertexClient  (client.py: URL / headers / POST / error mapping)
+        |
+        v
+AnonymousVertexProtocol (protocol.py: GraphQL envelope + requestContext)
+        |
+        v
+HTTP Transport         (transport.py: minimal async POST contract)
+```
+
+Module responsibilities:
+
+| Module | Responsibility |
+|--------|----------------|
+| provider.py | Provider lifecycle, resource wiring, ChatRequest orchestration. Never builds Google payloads. |
+| client.py | Owns the wire: endpoint URL, XHR headers, envelope serialization, POST, upstream error classification. |
+| protocol.py | ONLY module that knows the batchGraphql envelope (requestContext / querySignature / operationName / variables). |
+| models.py | Internal AnonymousVertexRequest model + GraphQLPayload dataclasses. |
+| request.py | OpenAI/ChatRequest -> AnonymousVertexRequest conversion (contents, tools, gen config). |
+| response.py | GeminiChunk/candidates -> ChatResponse / ChatChunk conversion. |
+| headers.py | Chrome 150 fingerprint XHR headers (documented source/usage). |
+| streaming.py | Brace-counting JSON object scanner + frame extraction (NDJSON, not SSE). |
+| signature.py | Single source of protocol constants (endpoint, querySignature, operationName, thoughtSignature sentinel). |
+| errors.py | Protocol error hierarchy (AnonymousVertexProtocolError subclasses + core mapping). |
+| recaptcha.py | RecaptchaTokenProvider abstraction + real anchor/reload flow + FakeRecaptchaTokenProvider. |
+| transport.py | HTTPTransport protocol + HttpxTransport adapter. |
+
+### querySignature — final answer
+
+- Fixed constant? **YES** — a hardcoded base64 literal from payload.go.
+- Dynamic computation? **NO** — never recomputed per request.
+- Source? vertex-singbox internal/engine/vertex/payload.go: `const querySignature = "2/l8eCsMMY49imcDQ/lwwXyL8cYtTjxZBF2dNqy69LodY="`.
+
+The name is misleading (it is not an authentication signature); it is a fixed
+frontend protocol constant on the private GraphQL operation. Defined once in
+signature.py as `QUERY_SIGNATURE`.
+
+### Streaming — final answer
+
+- Google raw stream format: raw NDJSON over HTTP chunked transfer; concatenated
+  JSON objects (one per frame), NOT SSE (no `event:`/`data:` lines).
+- Parser: `StreamingObjectScanner` increments brace depth across network chunks;
+  it yields a complete JSON object only when braces balance at depth 0. A single
+  JSON object may span multiple HTTP chunks; the parser never assumes
+  `HTTP chunk == JSON object`.

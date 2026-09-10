@@ -1,0 +1,6 @@
+{"results":[{"errors":[],"data":{"ui":{"streamGenerateContentAnonymous":{"candidates":[{"index":0,"content":{"role":"model","parts":[{"text":"Whitespace."}]},"finishReason":"FINISH_REASON_UNSPECIFIED"}]}}}}]}
+
+
+  
+  {"results":[{"errors":[],"data":{"ui":{"streamGenerateContentAnonymous":{"candidates":[{"index":0,"finishReason":"STOP"}]}}}}]}
+

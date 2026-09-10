@@ -1,0 +1,4 @@
+{"results":[{"errors":[],"data":{"ui":{"streamGenerateContentAnonymous":{"candidates":[{"index":0,"content":{"role":"model","parts":[{"text":"First."}]},"finishReason":"FINISH_REASON_UNSPECIFIED"}]}}}}]}
+{"results":[{"errors":[],"data":{"ui":{"streamGenerateContentAnonymous":{"candidates":[{"index":0,"content":{"role":"model","parts":[{"text":"Second."}]},"finishReason":"FINISH_REASON_UNSPECIFIED"}]}}}}]}
+{"results":[{"errors":[],"data":{"ui":{"streamGenerateContentAnonymous":{"candidates":[{"index":0,"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":5,"candidatesTokenCount":5,"totalTokenCount":10}}}}}]}
+

@@ -8,7 +8,7 @@ demand.
 
 from __future__ import annotations
 
-from typing import List
+from typing import Any, List
 
 from core.resource import Resource
 from core.resource_factory import ResourceFactory
@@ -18,7 +18,7 @@ from providers.fake.provider import FakeProvider, FakeResource
 class FakeProviderFactory:
     """Creates a fresh FakeProvider instance."""
 
-    def create_provider(self, provider_id: str) -> FakeProvider:
+    def create_provider(self, provider_id: str, config: Any = None) -> FakeProvider:
         return FakeProvider()
 
 

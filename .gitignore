@@ -22,3 +22,10 @@ config/resources/
 Thumbs.db
 .idea/
 .vscode/
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Reference source only — not part of the gateway code
+vertex-singbox/

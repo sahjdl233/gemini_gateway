@@ -9,10 +9,10 @@ from __future__ import annotations
 import json
 from typing import Any, AsyncIterator, List, Optional
 
-from core.errors import ProviderError
+from providers.anonymous_vertex.errors import AnonymousVertexParseError
 
 
-class StreamParseError(ProviderError):
+class StreamParseError(AnonymousVertexParseError):
     """Raised when the upstream stream is malformed or ends prematurely."""
 
     default_status = 502

@@ -159,7 +159,7 @@ def test_anon_vertex_wiring_builds_pool(monkeypatch):
     async def _anon_token(resource):
         return "recaptcha-token"
 
-    def fake_create_provider(self, provider_id):
+    def fake_create_provider(self, provider_id, config=None):
         return AnonymousVertexProvider(
             http_client=_mock_vertex_client(),
             token_fetcher=_anon_token,
@@ -186,7 +186,7 @@ def test_anon_vertex_chat_non_stream(monkeypatch):
     async def _anon_token(resource):
         return "recaptcha-token"
 
-    def fake_create_provider(self, provider_id):
+    def fake_create_provider(self, provider_id, config=None):
         return AnonymousVertexProvider(
             http_client=_mock_vertex_client(),
             token_fetcher=_anon_token,
@@ -219,7 +219,7 @@ def test_anon_vertex_chat_stream(monkeypatch):
     async def _anon_token(resource):
         return "recaptcha-token"
 
-    def fake_create_provider(self, provider_id):
+    def fake_create_provider(self, provider_id, config=None):
         return AnonymousVertexProvider(
             http_client=_mock_vertex_client(),
             token_fetcher=_anon_token,

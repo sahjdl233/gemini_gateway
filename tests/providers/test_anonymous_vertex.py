@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 
 import pytest
@@ -20,11 +19,11 @@ from core.models import ChatChunk, ChatMessage, ChatRequest, ChatResponse
 
 from providers.anonymous_vertex.provider import AnonymousVertexProvider
 from providers.anonymous_vertex.resource import AnonymousVertexResource
-from providers.anonymous_vertex.protocol import (
+from providers.anonymous_vertex.request import (
     chat_to_vertex_request,
     get_model_spec,
-    vertex_response_to_chat_response,
 )
+from providers.anonymous_vertex.response import vertex_response_to_chat_response
 from providers.anonymous_vertex.signature import (
     OPERATION_NAME,
     QUERY_SIGNATURE,
@@ -32,7 +31,6 @@ from providers.anonymous_vertex.signature import (
     ensure_base64_sig,
     trim_gemini_path_prefix,
 )
-from providers.anonymous_vertex.request import build_envelope
 from providers.anonymous_vertex.streaming import (
     StreamParseError,
     StreamingObjectScanner,
@@ -44,6 +42,10 @@ from providers.anonymous_vertex.streaming import (
 from providers.anonymous_vertex.errors import (
     classify_upstream_error,
     parse_upstream_error,
+    AnonymousVertexRateLimitError,
+    AnonymousVertexAuthError,
+    AnonymousVertexProtocolError,
+    AnonymousVertexParseError,
 )
 
 FIXTURES = Path(__file__).parent.parent / "fixtures" / "anonymous_vertex"
@@ -66,10 +68,10 @@ def make_request(model="gemini-2.5-flash", content="hello"):
 def test_request_conversion_basic():
     req = make_request()
     vreq = chat_to_vertex_request(req)
-    assert vreq["contents"][0]["role"] == "user"
-    assert vreq["contents"][0]["parts"][0]["text"] == "hello"
-    assert vreq["safetySettings"][0]["threshold"] == "BLOCK_NONE"
-    assert vreq["generationConfig"]["maxOutputTokens"] == 65535
+    assert vreq.contents[0].role == "user"
+    assert vreq.contents[0].parts[0].text == "hello"
+    assert vreq.safety_settings[0]["threshold"] == "BLOCK_NONE"
+    assert vreq.generation_config.max_output_tokens == 65535
 
 
 def test_request_conversion_system_message():
@@ -81,8 +83,8 @@ def test_request_conversion_system_message():
         ],
     )
     vreq = chat_to_vertex_request(req)
-    assert vreq["systemInstruction"]["parts"][0]["text"] == "You are helpful"
-    assert vreq["contents"][0]["role"] == "user"
+    assert vreq.system_instruction.parts[0].text == "You are helpful"
+    assert vreq.contents[0].role == "user"
 
 
 def test_request_conversion_assistant_to_model():
@@ -94,8 +96,8 @@ def test_request_conversion_assistant_to_model():
         ],
     )
     vreq = chat_to_vertex_request(req)
-    assert vreq["contents"][1]["role"] == "model"
-    assert vreq["contents"][1]["parts"][0]["text"] == "hello there"
+    assert vreq.contents[1].role == "model"
+    assert vreq.contents[1].parts[0].text == "hello there"
 
 
 def test_request_conversion_merge_contiguous_user():
@@ -108,8 +110,8 @@ def test_request_conversion_merge_contiguous_user():
     )
     vreq = chat_to_vertex_request(req)
     # merged into one content entry
-    assert len(vreq["contents"]) == 1
-    parts_text = "".join(p["text"] for p in vreq["contents"][0]["parts"])
+    assert len(vreq.contents) == 1
+    parts_text = "".join(p.text for p in vreq.contents[0].parts)
     assert parts_text == "ab"
 
 
@@ -117,14 +119,14 @@ def test_request_conversion_temperature():
     req = make_request()
     req.temperature = 0.7
     vreq = chat_to_vertex_request(req)
-    assert vreq["generationConfig"]["temperature"] == 0.7
+    assert vreq.generation_config.temperature == 0.7
 
 
 def test_request_conversion_max_tokens_clamped():
     req = make_request()
     req.max_tokens = 100000  # above spec max
     vreq = chat_to_vertex_request(req)
-    assert vreq["generationConfig"]["maxOutputTokens"] == 65535
+    assert vreq.generation_config.max_output_tokens == 65535
 
 
 # ---------------------------------------------------------------------------
@@ -157,14 +159,6 @@ def test_ensure_base64_sig_encodes_sentinel():
 def test_trim_gemini_path_prefix():
     assert trim_gemini_path_prefix("models/gemini-2.5-flash") == "gemini-2.5-flash"
     assert trim_gemini_path_prefix("gemini-2.5-flash") == "gemini-2.5-flash"
-
-
-def test_build_envelope_includes_query_signature():
-    env = build_envelope("gemini-2.5-flash", {}, "recaptcha-token")
-    assert env["querySignature"] == QUERY_SIGNATURE
-    assert env["operationName"] == OPERATION_NAME
-    assert env["variables"]["region"] == "global"
-    assert env["variables"]["recaptchaToken"] == "recaptcha-token"
 
 
 # ---------------------------------------------------------------------------
@@ -288,6 +282,8 @@ def test_parse_429_ratelimit():
     assert err.kind == "ratelimit"
     assert err.status_code == 429
     mapped = classify_upstream_error(err)
+    assert isinstance(mapped, AnonymousVertexRateLimitError)
+    assert isinstance(mapped, AnonymousVertexProtocolError)
     assert isinstance(mapped, RateLimitError)
 
 
@@ -298,6 +294,7 @@ def test_parse_400_invalid():
     assert err.kind == "invalid"
     mapped = classify_upstream_error(err)
     assert isinstance(mapped, InvalidRequestError)
+    assert isinstance(mapped, ProviderError)
 
 
 def test_429_with_retry_after_header():
@@ -305,7 +302,7 @@ def test_429_with_retry_after_header():
     from providers.anonymous_vertex.errors import UpstreamVertexError
     err = UpstreamVertexError("rate limited", status_code=429, retry_after=10.0)
     mapped = classify_upstream_error(err)
-    assert isinstance(mapped, RateLimitError)
+    assert isinstance(mapped, AnonymousVertexRateLimitError)
     assert mapped.retry_after == 10.0
 
 
@@ -339,7 +336,7 @@ def test_provider_extracts_retry_after_header():
 
     import asyncio
 
-    with pytest.raises(RateLimitError) as ei:
+    with pytest.raises(AnonymousVertexRateLimitError) as ei:
         asyncio.run(provider.complete(make_request(), make_resource()))
     assert ei.value.retry_after == 7.0
 
@@ -362,7 +359,7 @@ def test_provider_extract_retry_after_missing_header():
 
     import asyncio
 
-    with pytest.raises(RateLimitError) as ei:
+    with pytest.raises(AnonymousVertexRateLimitError) as ei:
         asyncio.run(provider.complete(make_request(), make_resource()))
     assert ei.value.retry_after is None
 
@@ -397,7 +394,7 @@ def test_stream_extracts_retry_after_header():
         async for _ in provider.stream(make_request(), make_resource()):
             pass
 
-    with pytest.raises(RateLimitError) as ei:
+    with pytest.raises(AnonymousVertexRateLimitError) as ei:
         asyncio.run(run())
     assert ei.value.retry_after == 12.0
 
@@ -415,7 +412,7 @@ def test_malformed_stream_raises():
 
     async def run():
         chunks = []
-        with pytest.raises(ProviderError):
+        with pytest.raises(AnonymousVertexParseError):
             async for c in iter_chunks(gen()):
                 chunks.append(c)
         return chunks
@@ -431,11 +428,48 @@ def test_scanner_malformed_json_raises():
         yield b'{"results":[{"data":'
 
     async def run():
-        with pytest.raises(ProviderError):
+        with pytest.raises(AnonymousVertexParseError):
             async for _ in iter_chunks(gen()):
                 pass
 
     asyncio.run(run())
+
+
+# ---------------------------------------------------------------------------
+# Test 8: Protocol error hierarchy
+# ---------------------------------------------------------------------------
+def test_protocol_error_subclasses():
+    from providers.anonymous_vertex.errors import (
+        AnonymousVertexProtocolError,
+        AnonymousVertexAuthError,
+        AnonymousVertexRateLimitError,
+        AnonymousVertexParseError,
+        AnonymousVertexConnectionError,
+        AnonymousVertexUnavailableError,
+    )
+    from core.errors import (
+        AuthenticationError,
+        RateLimitError,
+        NetworkError,
+        UpstreamUnavailableError,
+    )
+
+    # All are ProviderError subclasses
+    for cls in [
+        AnonymousVertexProtocolError,
+        AnonymousVertexAuthError,
+        AnonymousVertexRateLimitError,
+        AnonymousVertexParseError,
+        AnonymousVertexConnectionError,
+        AnonymousVertexUnavailableError,
+    ]:
+        assert issubclass(cls, ProviderError)
+
+    # Cross-hierarchy
+    assert issubclass(AnonymousVertexAuthError, AuthenticationError)
+    assert issubclass(AnonymousVertexRateLimitError, RateLimitError)
+    assert issubclass(AnonymousVertexConnectionError, NetworkError)
+    assert issubclass(AnonymousVertexUnavailableError, UpstreamUnavailableError)
 
 
 # ---------------------------------------------------------------------------
@@ -494,6 +528,7 @@ def test_provider_stream_mock():
     provider = AnonymousVertexProvider(http_client=client, token_fetcher=_token_fetcher)
 
     import asyncio
+
     async def run():
         chunks = []
         async for c in provider.stream(make_request(), make_resource()):
@@ -512,7 +547,7 @@ def test_provider_429_mock():
     provider = AnonymousVertexProvider(http_client=client, token_fetcher=_token_fetcher)
 
     import asyncio
-    with pytest.raises(RateLimitError):
+    with pytest.raises(AnonymousVertexRateLimitError):
         asyncio.run(provider.complete(make_request(), make_resource()))
 
 
