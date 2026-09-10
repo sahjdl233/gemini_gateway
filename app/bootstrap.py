@@ -6,6 +6,9 @@ builtin provider.
 
 TASK-002: anonymous_vertex (Anonymous Vertex / Agent Platform batchGraphql)
 is now registered as the first real Google upstream.
+
+TASK-004: firebase (Firebase AI Logic firebasevertexai) is registered as a
+Gateway-native provider. One Firebase Project = one Resource.
 """
 
 from __future__ import annotations
@@ -16,6 +19,10 @@ from providers.anonymous_vertex.factory import (
     AnonymousVertexResourceFactory,
 )
 from providers.fake.factory import FakeProviderFactory, FakeResourceFactory
+from providers.firebase.factory import (
+    FirebaseProviderFactory,
+    FirebaseResourceFactory,
+)
 
 
 def register_builtin_providers(registry: ProviderRegistry) -> None:
@@ -37,6 +44,13 @@ def register_builtin_providers(registry: ProviderRegistry) -> None:
             provider_id="anonymous_vertex",
             provider_factory=AnonymousVertexProviderFactory(),
             resource_factory=AnonymousVertexResourceFactory(),
+        )
+    )
+    registry.register_definition(
+        ProviderDefinition(
+            provider_id="firebase",
+            provider_factory=FirebaseProviderFactory(),
+            resource_factory=FirebaseResourceFactory(),
         )
     )
 

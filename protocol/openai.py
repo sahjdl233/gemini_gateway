@@ -49,6 +49,13 @@ def parse_openai_chat_request(payload: Dict[str, Any]) -> ChatRequest:
         temperature=payload.get("temperature"),
         max_tokens=payload.get("max_tokens"),
         tools=payload.get("tools"),
+        # TASK-004 (Firebase): pass through OpenAI fields that the
+        # FirebasePayloadBuilder maps into Gemini generationConfig / toolConfig.
+        max_completion_tokens=payload.get("max_completion_tokens"),
+        top_p=payload.get("top_p"),
+        stop=payload.get("stop"),
+        tool_choice=payload.get("tool_choice"),
+        reasoning_effort=payload.get("reasoning_effort"),
     )
 
 
@@ -57,7 +64,7 @@ def to_openai_chat_response(response: ChatResponse) -> Dict[str, Any]:
     usage = None
     if response.usage:
         usage = response.usage.model_dump()
-    return {
+    data = {
         "id": response.id,
         "object": "chat.completion",
         "created": response.created,
@@ -74,6 +81,9 @@ def to_openai_chat_response(response: ChatResponse) -> Dict[str, Any]:
         ],
         "usage": usage,
     }
+    if response.tool_calls:
+        data["choices"][0]["message"]["tool_calls"] = response.tool_calls
+    return data
 
 
 def to_openai_chunk_sse(chunk: ChatChunk) -> str:

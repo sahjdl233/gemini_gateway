@@ -54,10 +54,25 @@ providers:
         #   host: PROXY_HOST
         #   port: PROXY_PORT
 
-# ---- 以下为占位示意：TASK-002 起启用，当前阶段不要开启 ----
-# firebase:
-#   enabled: false
-#   resources:
-#     - id: firebase-project-01
-#       project_id: FIREBASE_PROJECT_01
-#       api_key: FIREBASE_API_KEY_01
+# ---- TASK-004: Firebase AI Logic（firebasevertexai）----
+# 一个 Firebase Project = 一个 Resource。凭证（api_key / app_id / debug_token）
+# 一律通过环境变量占位符注入，禁止写死；真实凭证不得提交到 Git。
+  firebase:
+    enabled: true
+    # 模型列表（配置快照，非上游探测）：覆盖默认清单（gemini-3.8-flash /
+    # gemini-3.7-flash）。模型是否真实可用以 Firebase 项目配额 + 上游 404 为准。
+    # models:
+    #   - gemini-3.8-flash
+    #   - gemini-3.7-flash
+    resources:
+      - id: firebase-project-01
+        project_id: FIREBASE_PROJECT_01
+        api_key: ${FIREBASE_01_API_KEY}
+        app_id: ${FIREBASE_01_APP_ID}
+        debug_token: ${FIREBASE_01_DEBUG_TOKEN}
+        # proxy: socks5://user:pass@host:port   # 可选；缺省直连
+      - id: firebase-project-02
+        project_id: FIREBASE_PROJECT_02
+        api_key: ${FIREBASE_02_API_KEY}
+        app_id: ${FIREBASE_02_APP_ID}
+        debug_token: ${FIREBASE_02_DEBUG_TOKEN}
