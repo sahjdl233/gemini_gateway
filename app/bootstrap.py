@@ -23,14 +23,17 @@ from providers.firebase.factory import (
     FirebaseProviderFactory,
     FirebaseResourceFactory,
 )
+from providers.gemini_cli.factory import (
+    GeminiCliProviderFactory,
+    GeminiCliResourceFactory,
+)
 
 
 def register_builtin_providers(registry: ProviderRegistry) -> None:
     """Register every provider that ships with the application.
 
     fake (offline testing) and anonymous_vertex (real Google upstream).
-    Other Google providers (Firebase/Vertex/CLI/Build) are NOT registered
-    until their corresponding tasks.
+    TASK-004/008: firebase and gemini_cli are registered as gateway-native.
     """
     registry.register_definition(
         ProviderDefinition(
@@ -51,6 +54,13 @@ def register_builtin_providers(registry: ProviderRegistry) -> None:
             provider_id="firebase",
             provider_factory=FirebaseProviderFactory(),
             resource_factory=FirebaseResourceFactory(),
+        )
+    )
+    registry.register_definition(
+        ProviderDefinition(
+            provider_id="gemini_cli",
+            provider_factory=GeminiCliProviderFactory(),
+            resource_factory=GeminiCliResourceFactory(),
         )
     )
 

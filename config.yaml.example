@@ -76,3 +76,22 @@ providers:
         api_key: ${FIREBASE_02_API_KEY}
         app_id: ${FIREBASE_02_APP_ID}
         debug_token: ${FIREBASE_02_DEBUG_TOKEN}
+
+# TASK-008: Gemini CLI (Google Code Assist) Provider
+# 协议：cloudcode-pa.googleapis.com/v1internal（OAuth Bearer）。
+# 每个资源 = 一个 Google OAuth 账号（凭证经浏览器一次性 onboarding 后落盘，
+# 引导脚本见 docs/TASK-008-IMPLEMENTATION.md）。
+# 敏感凭证一律通过环境变量占位符注入，禁止写死。
+  gemini_cli:
+    enabled: true
+    # 模型列表（配置快照）：覆盖默认清单（gemini-2.5-flash / gemini-2.5-pro）
+    # models:
+    #   - gemini-2.5-flash
+    resources:
+      - id: cli-account-01
+        # 首次 onboarding 后写入 resource 的字段（令牌/项目由脚本生成）：
+        refresh_token: ${GEMINI_CLI_01_REFRESH_TOKEN}
+        client_id: ${GEMINI_CLI_01_CLIENT_ID}
+        client_secret: ${GEMINI_CLI_01_CLIENT_SECRET}
+        project_id: ${GEMINI_CLI_01_PROJECT_ID}
+        # proxy: socks5://user:pass@host:port   # 可选；缺省直连
