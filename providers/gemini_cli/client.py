@@ -66,9 +66,11 @@ class GeminiCliClient:
         payload: dict,
         *,
         streaming: bool = False,
+        operation: str = "generateContent",
     ) -> Any:
-        """POST to generateContent (or streamGenerateContent).
+        """POST to the given operation on the Code Assist internal API.
 
+        Default operation is "generateContent".
         On 401 the token is force-refreshed and the call is retried once.
         """
         for attempt in range(2):
@@ -76,7 +78,7 @@ class GeminiCliClient:
                 resource, force=(attempt > 0)
             )
             headers = self._build_headers(resource, token)
-            url = self._build_url(base_url, "generateContent", streaming=streaming)
+            url = self._build_url(base_url, operation, streaming=streaming)
             try:
                 resp = await self._http.post(url, headers=headers, json=payload)
             except Exception as exc:  # noqa: BLE001

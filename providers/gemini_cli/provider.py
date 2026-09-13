@@ -85,12 +85,18 @@ class GeminiCliProvider(Provider):
                     scheme=sp.scheme or "socks5",
                     host=sp.hostname,
                     port=sp.port,
-                    username=sp.username,
-                    password=sp.password,
                 )
             except Exception:  # noqa: BLE001
                 proxy_cfg = None
         return build_client(TransportConfig(proxy=proxy_cfg, timeout_seconds=180.0))
+
+    async def _ensure_project(self, resource: GeminiCliResource) -> None:
+        """Ensure resource has a project_id, running loadCodeAssist/onboard if needed."""
+        if resource.project_id:
+            return
+        client = await self._client_for(resource)
+        from providers.gemini_cli.onboard import discover_project
+        resource.project_id = await discover_project(client, resource)
 
     # -- Provider interface -------------------------------------------------
 
@@ -118,9 +124,10 @@ class GeminiCliProvider(Provider):
         resource: Resource,
     ) -> ChatResponse:
         res = _require_resource(resource)
+        await self._ensure_project(res)
         if not res.project_id:
             raise GeminiCliProtocolError(
-                "gemini_cli: resource has no project_id (onboarding required)",
+                "gemini_cli: onboarding failed to produce project_id",
                 provider="gemini_cli",
                 resource_id=res.id,
             )
@@ -137,9 +144,10 @@ class GeminiCliProvider(Provider):
         resource: Resource,
     ) -> AsyncIterator[ChatChunk]:
         res = _require_resource(resource)
+        await self._ensure_project(res)
         if not res.project_id:
             raise GeminiCliProtocolError(
-                "gemini_cli: resource has no project_id (onboarding required)",
+                "gemini_cli: onboarding failed to produce project_id",
                 provider="gemini_cli",
                 resource_id=res.id,
             )

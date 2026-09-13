@@ -268,3 +268,136 @@ def test_root_health():
     assert resp.status_code == 200
     assert resp.json()["service"] == "gemini-gateway"
     assert resp.json()["phase"] == "TASK-001"
+
+
+
+# ---------------------------------------------------------------------------
+# TASK-009: gemini_cli provider through gateway (full wiring test)
+# ---------------------------------------------------------------------------
+
+
+def _gemini_cli_config():
+    """Config using gemini_cli provider (HTTP client injected via _build_http)."""
+    return {
+        "scheduler": {
+            "max_retries": 2,
+            "cooldown": {
+                "base_delay": 0.2,
+                "factor": 2.0,
+                "max_delay": 10.0,
+                "jitter": 0.1,
+            },
+        },
+        "providers": {
+            "gemini_cli": {
+                "enabled": True,
+                "resources": [
+                    {
+                        "id": "cli-account-01",
+                        "provider": "gemini_cli",
+                        "refresh_token": "test-refresh-token",
+                        "client_id": "test-client-id",
+                        "client_secret": "test-client-secret",
+                        "project_id": "gen-lang-client-123",
+                    }
+                ],
+                "models": ["gemini-2.5-flash"],
+            }
+        },
+    }
+
+
+def test_gemini_cli_non_stream_gateway():
+    """gemini_cli complete -> OpenAI-compatible ChatResponse через gateway."""
+    from unittest.mock import patch
+    from app.main import create_app
+    from providers.gemini_cli.provider import GeminiCliProvider
+    from tests.providers._gemini_cli_fakes import FakeHttp
+    import json
+
+    http = FakeHttp()
+    http.responses.append(http.token_ok("token-1", 3600))
+    http.responses.append(
+        http.ok(
+            {
+                "response": {
+                    "candidates": [
+                        {
+                            "content": {"role": "model", "parts": [{"text": "Hello from Gemini"}]},
+                            "finishReason": "STOP",
+                        }
+                    ],
+                    "usageMetadata": {
+                        "promptTokenCount": 5,
+                        "candidatesTokenCount": 3,
+                        "totalTokenCount": 8,
+                    },
+                },
+                "traceId": "t1",
+            }
+        )
+    )
+
+    with patch.object(GeminiCliProvider, "_build_http", return_value=http):
+        client = TestClient(create_app(_gemini_cli_config()))
+        resp = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "gemini-2.5-flash",
+                "messages": [{"role": "user", "content": "Hi"}],
+            },
+        )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["object"] == "chat.completion"
+    assert body["choices"][0]["message"]["content"] == "Hello from Gemini"
+    assert body["choices"][0]["finish_reason"] == "stop"
+    assert body["usage"]["prompt_tokens"] == 5
+    assert body["usage"]["completion_tokens"] == 3
+
+
+def test_gemini_cli_stream_gateway():
+    """gemini_cli stream -> OpenAI SSE chunks via gateway."""
+    from unittest.mock import patch
+    from app.main import create_app
+    from providers.gemini_cli.provider import GeminiCliProvider
+    from tests.providers._gemini_cli_fakes import FakeHttp, FakeResponse
+    import json
+
+    http = FakeHttp()
+    http.responses.append(http.token_ok("token-1", 3600))
+    http.stream_responses.append(
+        FakeResponse(
+            200,
+            sse_chunks=[
+                'data: {"response": {"candidates": [{"content": {"parts": [{"text": "Hi"}]}}]}, "traceId": "t1"}\n\n'.encode(),
+                'data: {"response": {"candidates": [{"content": {"parts": [{"text": " there"}]}, "finishReason": "STOP"}], "usageMetadata": {"promptTokenCount": 5, "candidatesTokenCount": 3, "totalTokenCount": 8}}, "traceId": "t1"}\n\n'.encode(),
+            ],
+        )
+    )
+
+    with patch.object(GeminiCliProvider, "_build_http", return_value=http):
+        client = TestClient(create_app(_gemini_cli_config()))
+        with client.stream(
+            "POST",
+            "/v1/chat/completions",
+            json={
+                "model": "gemini-2.5-flash",
+                "messages": [{"role": "user", "content": "Hi"}],
+                "stream": True,
+            },
+        ) as resp:
+            assert resp.status_code == 200
+            lines = [line for line in resp.iter_lines() if line]
+
+    assert lines[0].startswith("data: {")
+    assert lines[-1] == "data: [DONE]"
+    texts = []
+    for line in lines[:-1]:
+        if line.startswith("data: "):
+            payload = json.loads(line[6:])
+            if payload.get("choices"):
+                delta = payload["choices"][0].get("delta", {})
+                if "content" in delta and delta["content"]:
+                    texts.append(delta["content"])
+    assert "".join(texts) == "Hi there"

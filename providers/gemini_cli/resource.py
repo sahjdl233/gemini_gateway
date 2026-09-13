@@ -40,7 +40,7 @@ class GeminiCliResource(Resource):
     proxy: Optional[str] = None
 
     # Onboarding knobs.
-    ide_type: str = "ANTIGRAVITY"
+    ide_type: str = "GCLI"
     platform: str = "PLATFORM_UNSPECIFIED"
     plugin_type: str = "GEMINI"
 

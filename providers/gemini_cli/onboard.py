@@ -1,5 +1,4 @@
 """Code Assist project discovery & onboarding (TASK-007 §6, §7).
-
 Flow:
   1. POST /v1internal:loadCodeAssist  {metadata:{ideType}}
       - existing account  -> read cloudaicompanionProject + tier directly
@@ -7,7 +6,6 @@ Flow:
   2. POST /v1internal:onboardUser  {tierId, metadata}
       - long-running operation (LRO): poll until done (max 5 x 2s = 10s)
       - done=true -> response.cloudaicompanionProject.id
-
 Interactive browser OAuth is intentionally NOT here (one-shot setup script).
 Runtime onboarding re-uses the resource's stored OAuth token.
 """
@@ -17,7 +15,9 @@ import asyncio
 import logging
 from typing import Any, Dict, Optional, Tuple
 
+from providers.gemini_cli.client import GeminiCliClient, DEFAULT_BASE_URL
 from providers.gemini_cli.errors import GeminiCliProtocolError
+from providers.gemini_cli.resource import GeminiCliResource
 
 logger = logging.getLogger(__name__)
 
@@ -114,9 +114,117 @@ def inspect_operation(
     """Extract the operation path from a full operation-name URL (best effort)."""
     if not operation_name:
         return None
-    # gcli2api polls with the raw operation name on the v1internal endpoint
     if operation_name.startswith("http"):
         from urllib.parse import urlsplit
 
         return urlsplit(operation_name).path.lstrip("/")
     return operation_name
+
+
+async def load_code_assist(
+    client: GeminiCliClient,
+    resource: GeminiCliResource,
+) -> Dict[str, Any]:
+    """POST /v1internal:loadCodeAssist with ide metadata.
+    Returns parsed response dict from parse_load_code_assist.
+    """
+    payload = {"metadata": metadata_for(resource)}
+    resp = await client.post(
+        resource,
+        DEFAULT_BASE_URL,
+        payload,
+        operation="loadCodeAssist",
+    )
+    return parse_load_code_assist(resp.json())
+
+
+async def onboard_user(
+    client: GeminiCliClient,
+    resource: GeminiCliResource,
+    tier_id: str,
+) -> str:
+    """POST /v1internal:onboardUser with tierId and metadata.
+    Starts LRO, polls until done, returns cloudaicompanionProject.id.
+    """
+    payload = {"tierId": tier_id, "metadata": metadata_for(resource)}
+    resp = await client.post(
+        resource,
+        DEFAULT_BASE_URL,
+        payload,
+        operation="onboardUser",
+    )
+    data = resp.json()
+    operation_name = data.get("name")
+    if not operation_name:
+        raise GeminiCliProtocolError(
+            "onboardUser: no operation name returned",
+            provider="gemini_cli",
+            resource_id=resource.id,
+        )
+    op_path = inspect_operation(operation_name)
+    return await poll_operation(client, resource, op_path)
+
+
+async def poll_operation(
+    client: GeminiCliClient,
+    resource: GeminiCliResource,
+    operation_path: str,
+    *,
+    max_attempts: int = 5,
+    interval_seconds: float = 2.0,
+) -> str:
+    """Poll LRO operation until done (max 5 x 2s = 10s).
+    Returns cloudaicompanionProject.id on success.
+    """
+    for _attempt in range(max_attempts):
+        resp = await client.post(
+            resource,
+            DEFAULT_BASE_URL,
+            {},
+            operation=operation_path,
+        )
+        data = resp.json()
+        done, project_id = parse_operation(data)
+        if done:
+            if project_id:
+                return project_id
+            raise GeminiCliProtocolError(
+                "LRO completed but no cloudaicompanionProject.id",
+                provider="gemini_cli",
+                resource_id=resource.id,
+            )
+        await asyncio.sleep(interval_seconds)
+
+    raise GeminiCliProtocolError(
+        f"LRO polling timeout after {max_attempts * interval_seconds}s",
+        provider="gemini_cli",
+        resource_id=resource.id,
+    )
+
+
+async def discover_project(
+    client: GeminiCliClient,
+    resource: GeminiCliResource,
+) -> str:
+    """Full project discovery flow.
+    1. loadCodeAssist -> if project_id exists, return it
+    2. If needs_onboarding -> onboardUser -> poll -> return project_id
+    Raises GeminiCliProtocolError on any failure.
+    """
+    result = await load_code_assist(client, resource)
+    project_id = result.get("project_id")
+    if project_id:
+        resource.tier = result.get("tier", "unknown")
+        return project_id
+
+    tier_id = result.get("default_tier_id")
+    if not tier_id:
+        raise GeminiCliProtocolError(
+            "loadCodeAssist: needs onboarding but no default_tier_id",
+            provider="gemini_cli",
+            resource_id=resource.id,
+        )
+
+    project_id = await onboard_user(client, resource, tier_id)
+    resource.tier = result.get("tier", "unknown")
+    return project_id
