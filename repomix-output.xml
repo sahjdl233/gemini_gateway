@@ -134,6 +134,7 @@ providers/
     __init__.py
   __init__.py
 scripts/
+  _read_range.py
   gen_task005.py
   gen_tests.py
   write_tests.py
@@ -520,17 +521,6 @@ def _is_gemini_2(model: str) -> bool:
         except ValueError:
             return False
     return "2.5" in model
-</file>
-
-<file path=".codex_tmp_readfile.py">
-import io, sys
-path = sys.argv[1]
-start = int(sys.argv[2]) if len(sys.argv) > 2 else 0
-count = int(sys.argv[3]) if len(sys.argv) > 3 else 10**9
-data = open(path, encoding='utf-8').read()
-lines = data.splitlines(True)
-print('TOTAL_LINES', len(lines))
-print(''.join(lines[start:start+count]), end='')
 </file>
 
 <file path="app/routes/__init__.py">
@@ -4972,6 +4962,17 @@ __all__ = ["VertexSessionResource", "VertexProvider"]
 independent package and must never import another provider: they only
 depend on core, protocol and transport.
 """
+</file>
+
+<file path="scripts/_read_range.py">
+import pathlib, sys
+path = sys.argv[1]
+start = int(sys.argv[2]) if len(sys.argv) > 2 else 0
+end = int(sys.argv[3]) if len(sys.argv) > 3 else None
+lines = pathlib.Path(path).read_text(encoding='utf-8').splitlines()
+sl = lines[start:end] if end else lines[start:]
+for i, ln in enumerate(sl, start=start + 1):
+    print(f"{i:4d}| {ln}")
 </file>
 
 <file path="scripts/gen_task005.py">
@@ -9681,6 +9682,17 @@ async def sse_events(lines: AsyncIterator[str]) -> AsyncIterator[Dict[str, objec
         event = parse_sse_line(line)
         if event:
             yield event
+</file>
+
+<file path=".codex_tmp_readfile.py">
+import io, sys
+path = sys.argv[1]
+start = int(sys.argv[2]) if len(sys.argv) > 2 else 0
+count = int(sys.argv[3]) if len(sys.argv) > 3 else 10**9
+data = open(path, encoding='utf-8').read()
+lines = data.splitlines(True)
+print('TOTAL_LINES', len(lines))
+print(''.join(lines[start:start+count]), end='')
 </file>
 
 <file path="projectgemini_gateway_verify_fb.py">
