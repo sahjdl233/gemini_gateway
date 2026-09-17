@@ -141,12 +141,12 @@ async def test_retryable_resource_failure_uses_load_aware_pool_selection(fake_cl
     pool = InMemoryPool(
         provider="fake",
         resources=make_resources([
-            {"id": "r1", "reply_text": "R1-REPLY"},
+            {"id": "r1", "scenario": "timeout"},
             {"id": "r2", "reply_text": "R2-REPLY"},
         ]),
         cooldown=make_cooldown(fake_clock),
     )
-    # r1 is lower loaded, so a plain round-robin would choose r1 first.
+    # Lower load selects r1 first; its timeout must fall back to r2.
     pool.resources[0].in_flight = 0
     pool.resources[1].in_flight = 1
     scheduler = Scheduler(
@@ -155,14 +155,14 @@ async def test_retryable_resource_failure_uses_load_aware_pool_selection(fake_cl
         max_retries=2,
     )
 
-    with pytest.raises(TimeoutError):
-        await scheduler.chat_completion(make_chat_request())
+    response = await scheduler.chat_completion(make_chat_request())
 
-    assert provider.calls == ["r1"]
+    assert response.text == "R2-REPLY"
+    assert provider.calls == ["r1", "r2"]
     assert pool.resources[0].total_failures == 1
-    assert pool.resources[1].total_requests == 0
-    assert pool.resources[1].total_failures == 1
-    assert pool.resources[0].total_requests == 0
+    assert pool.resources[0].total_requests == 1
+    assert pool.resources[1].total_failures == 0
+    assert pool.resources[1].total_requests == 1
 
 
 async def test_success_uses_resource(fake_clock):
