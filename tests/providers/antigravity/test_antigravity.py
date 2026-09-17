@@ -1,10 +1,10 @@
-import json
+﻿import json
 from unittest.mock import MagicMock
 
 import httpx
 
 from providers.antigravity.client import AntigravityClient
-from providers.antigravity.factory import AntigravityFactory
+from providers.antigravity.factory import AntigravityProviderFactory, AntigravityResourceFactory
 from providers.antigravity.model_discovery import ModelDiscovery
 from providers.antigravity.provider import AntigravityProvider
 from providers.antigravity.resource import AntigravityResource
@@ -40,10 +40,12 @@ def test_model_discovery_parses_modelinfo():
     models = discovery.fetch_models()
     assert len(models) == 1
     assert models[0].id == "gemini-test"
-    assert models[0].name == "Test"
+    assert models[0].provider == "antigravity"
+    assert models[0].capabilities == {"stream": False, "tools": True}
 
 
 def test_provider_list_models_returns_geminitest():
+    import asyncio
     res = AntigravityResource(id="a", access_token="tok-1")
 
     def fake_post(url, **kwargs):
@@ -51,13 +53,12 @@ def test_provider_list_models_returns_geminitest():
 
     client = AntigravityClient(res, client=MagicMock(post=fake_post))
     provider = AntigravityProvider(res, client=client)
-    models = provider.list_models()
+    models = asyncio.run(provider.list_models())
     assert [m.id for m in models] == ["gemini-test"]
 
 
 def test_registry_can_create_antigravity_provider():
-    factory = AntigravityFactory()
-    resource = factory.create_resource()
-    provider = factory.create_provider(resource)
+    provider_factory = AntigravityProviderFactory()
+    provider = provider_factory.create_provider("antigravity")
     assert isinstance(provider, AntigravityProvider)
     assert isinstance(provider.resource, AntigravityResource)

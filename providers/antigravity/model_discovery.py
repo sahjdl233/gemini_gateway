@@ -26,14 +26,8 @@ class ModelDiscovery:
             models.append(
                 ModelInfo(
                     id=model_id,
-                    name=str(meta.get("displayName") or meta.get("model") or model_id),
-                    description="",
-                    context_window=0,
-                    temperature=0.0,
-                    top_p=0.0,
-                    top_k=0,
-                    is_chat=False,
-                    is_streaming=False,
+                    provider="antigravity",
+                    capabilities={"stream": False, "tools": True},
                 )
             )
         return models

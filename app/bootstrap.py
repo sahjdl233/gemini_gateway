@@ -14,6 +14,10 @@ Gateway-native provider. One Firebase Project = one Resource.
 from __future__ import annotations
 
 from core.provider_registry import ProviderDefinition, ProviderRegistry
+from providers.antigravity.factory import (
+    AntigravityProviderFactory,
+    AntigravityResourceFactory,
+)
 from providers.anonymous_vertex.factory import (
     AnonymousVertexProviderFactory,
     AnonymousVertexResourceFactory,
@@ -61,6 +65,13 @@ def register_builtin_providers(registry: ProviderRegistry) -> None:
             provider_id="gemini_cli",
             provider_factory=GeminiCliProviderFactory(),
             resource_factory=GeminiCliResourceFactory(),
+        )
+    )
+    registry.register_definition(
+        ProviderDefinition(
+            provider_id="antigravity",
+            provider_factory=AntigravityProviderFactory(),
+            resource_factory=AntigravityResourceFactory(),
         )
     )
 

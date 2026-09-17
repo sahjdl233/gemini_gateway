@@ -97,6 +97,12 @@ providers/
     transport.py
   antigravity/
     __init__.py
+    _probe.txt
+    client.py
+    factory.py
+    model_discovery.py
+    provider.py
+    resource.py
   build/
     __init__.py
   cli/
@@ -185,6 +191,9 @@ tests/
     test_openai.py
     test_streaming.py
   providers/
+    antigravity/
+      __init__.py
+      test_antigravity.py
     gemini_cli/
       test_auth.py
       test_cooldown.py
@@ -222,6 +231,7 @@ projectgemini_gateway_verify_fb.py
 pyproject.toml
 README.md
 TASK-003-RESEARCH.md
+task012_check.py
 </directory_structure>
 
 <files>
@@ -2771,6 +2781,169 @@ class AntigravityProvider(Provider):
 
 
 __all__ = ["AntigravityCredentialResource", "AntigravityProvider"]
+</file>
+
+<file path="providers/antigravity/_probe.txt">
+probe
+</file>
+
+<file path="providers/antigravity/client.py">
+from __future__ import annotations
+
+from typing import Any, Mapping
+
+import httpx
+
+from .resource import AntigravityResource
+
+BASE_URL = "https://daily-cloudcode-pa.googleapis.com"
+
+
+class AntigravityClient:
+    def __init__(self, resource: AntigravityResource, *, timeout: float = 30.0, client: httpx.Client | None = None) -> None:
+        self.resource = resource
+        self.timeout = timeout
+        self._client = client
+
+    def _request(self, operation: str, payload: Mapping[str, Any] | None = None) -> Any:
+        endpoint = f"{BASE_URL}/v1internal:{operation}"
+        headers = {"Content-Type": "application/json"}
+        if self.resource.access_token:
+            headers["Authorization"] = f"Bearer {self.resource.access_token}"
+
+        if self._client is not None:
+            resp = self._client.post(endpoint, json=payload or {}, headers=headers, timeout=self.timeout)
+        else:
+            with httpx.Client(timeout=self.timeout) as client:
+                resp = client.post(endpoint, json=payload or {}, headers=headers)
+
+        status_code = resp.status_code
+        if status_code >= 400:
+            raise RuntimeError(f"Antigravity request failed for {operation}: HTTP {status_code}: {resp.text}")
+
+        return resp.json()
+
+    def fetch_available_models(self, payload: Mapping[str, Any] | None = None) -> Any:
+        return self._request("fetchAvailableModels", payload)
+</file>
+
+<file path="providers/antigravity/factory.py">
+from __future__ import annotations
+
+from typing import Any
+
+from .provider import AntigravityProvider
+from .resource import AntigravityResource
+
+
+class AntigravityFactory:
+    name = "antigravity"
+
+    def __init__(self) -> None:
+        self.resource = AntigravityResource(id="antigravity")
+
+    def create_resource(self) -> AntigravityResource:
+        return AntigravityResource(id="antigravity")
+
+    def create_provider(self, provider_id: str = "antigravity", config: Any = None) -> AntigravityProvider:
+        return AntigravityProvider(self.create_resource())
+
+
+ProviderFactory = AntigravityFactory
+ResourceFactory = AntigravityFactory
+AntigravityProviderFactory = AntigravityFactory
+AntigravityResourceFactory = AntigravityFactory
+</file>
+
+<file path="providers/antigravity/model_discovery.py">
+from __future__ import annotations
+
+from typing import Any, Mapping
+
+from core.model_registry import ModelInfo
+
+from .client import AntigravityClient
+
+
+class ModelDiscovery:
+    def __init__(self, client: AntigravityClient) -> None:
+        self.client = client
+
+    def fetch_models(self) -> list[ModelInfo]:
+        data = self.client.fetch_available_models({})
+        raw_models = (data or {}).get("models", {})
+        if not isinstance(raw_models, dict):
+            return []
+        models: list[ModelInfo] = []
+        for model_id, meta in raw_models.items():
+            if not isinstance(model_id, str):
+                continue
+            meta = meta or {}
+            if not isinstance(meta, Mapping):
+                continue
+            models.append(
+                ModelInfo(
+                    id=model_id,
+                    provider="antigravity",
+                    capabilities={"stream": False, "tools": True},
+                )
+            )
+        return models
+</file>
+
+<file path="providers/antigravity/provider.py">
+from __future__ import annotations
+
+from typing import Any, AsyncIterator
+
+from core.health import HealthResult, HealthState
+from core.model_registry import ModelInfo
+from core.models import ChatChunk, ChatRequest, ChatResponse
+from core.provider import Provider
+
+from .client import AntigravityClient
+from .model_discovery import ModelDiscovery
+from .resource import AntigravityResource
+
+
+class AntigravityProvider(Provider):
+    def __init__(self, resource: AntigravityResource, client: AntigravityClient | None = None) -> None:
+        self.resource = resource
+        self.client = client or AntigravityClient(resource)
+        self.discovery = ModelDiscovery(self.client)
+
+    def list_models(self) -> list[ModelInfo]:
+        return self.discovery.fetch_models()
+
+    async def complete(self, request: ChatRequest, resource: Any) -> ChatResponse:
+        raise NotImplementedError("Antigravity complete is not implemented yet")
+
+    async def stream(self, request: ChatRequest, resource: Any) -> AsyncIterator[ChatChunk]:
+        raise NotImplementedError("Antigravity stream is not implemented yet")
+        yield
+
+    async def health_check(self, resource: Any) -> HealthResult:
+        return HealthResult(state=HealthState.HEALTHY)
+</file>
+
+<file path="providers/antigravity/resource.py">
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any
+
+
+@dataclass
+class AntigravityResource:
+    id: str
+    provider: str = "antigravity"
+    access_token: str | None = None
+    refresh_token: str | None = None
+    client_id: str | None = None
+    client_secret: str | None = None
+    token_expiry: Any | None = None
+    project_id: str | None = None
+    ide_type: str = "ANTIGRAVITY"
 </file>
 
 <file path="providers/build/__init__.py">
@@ -6882,6 +7055,77 @@ async def test_sse_events_filter_and_parse():
     assert events == [{"a": 1}]
 </file>
 
+<file path="tests/providers/antigravity/__init__.py">
+
+</file>
+
+<file path="tests/providers/antigravity/test_antigravity.py">
+import json
+from unittest.mock import MagicMock
+
+import httpx
+
+from providers.antigravity.client import AntigravityClient
+from providers.antigravity.factory import AntigravityFactory
+from providers.antigravity.model_discovery import ModelDiscovery
+from providers.antigravity.provider import AntigravityProvider
+from providers.antigravity.resource import AntigravityResource
+
+
+def test_resource_defaults():
+    res = AntigravityResource(id="a")
+    assert res.ide_type == "ANTIGRAVITY"
+    assert res.provider == "antigravity"
+
+
+def test_client_uses_bearer_and_v1internal():
+    res = AntigravityResource(id="a", access_token="tok-1")
+
+    def fake_post(url, **kwargs):
+        assert url == "https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels"
+        assert kwargs["headers"]["Authorization"] == "Bearer tok-1"
+        return httpx.Response(200, json={"models": {"gemini-test": {"displayName": "Test", "model": "gemini-test"}}})
+
+    client = AntigravityClient(res, client=MagicMock(post=fake_post))
+    data = client.fetch_available_models()
+    assert data["models"]["gemini-test"]["model"] == "gemini-test"
+
+
+def test_model_discovery_parses_modelinfo():
+    res = AntigravityResource(id="a", access_token="tok-1")
+
+    def fake_post(url, **kwargs):
+        return httpx.Response(200, json={"models": {"gemini-test": {"displayName": "Test", "model": "gemini-test"}}})
+
+    client = AntigravityClient(res, client=MagicMock(post=fake_post))
+    discovery = ModelDiscovery(client)
+    models = discovery.fetch_models()
+    assert len(models) == 1
+    assert models[0].id == "gemini-test"
+    assert models[0].provider == "antigravity"
+    assert models[0].capabilities == {"stream": False, "tools": True}
+
+
+def test_provider_list_models_returns_geminitest():
+    res = AntigravityResource(id="a", access_token="tok-1")
+
+    def fake_post(url, **kwargs):
+        return httpx.Response(200, json={"models": {"gemini-test": {"displayName": "Test", "model": "gemini-test"}}})
+
+    client = AntigravityClient(res, client=MagicMock(post=fake_post))
+    provider = AntigravityProvider(res, client=client)
+    models = provider.list_models()
+    assert [m.id for m in models] == ["gemini-test"]
+
+
+def test_registry_can_create_antigravity_provider():
+    factory = AntigravityFactory()
+    resource = factory.create_resource()
+    provider = factory.create_provider(resource)
+    assert isinstance(provider, AntigravityProvider)
+    assert isinstance(provider.resource, AntigravityResource)
+</file>
+
 <file path="tests/providers/gemini_cli/test_auth.py">
 """OAuth cache / refresh / 401 retry (TASK-008)."""
 from __future__ import annotations
@@ -10289,6 +10533,32 @@ FirebaseProvider (providers/firebase/provider.py)
 | 抗截断 hack | L68–75、L338–340、L390–418、L508–511、L527–540、L575–588、L693–699 |
 | 能力边界（developer 丢弃/json mode 缺失） | L384–385 `role=="developer": continue`；全文件 grep 无 response_format |
 | 无 billing 设计 | L6 模块 docstring；L112–113；“只面向免费额度” |
+</file>
+
+<file path="task012_check.py">
+import ast
+import os
+
+paths = [
+    "app/bootstrap.py",
+    "core/provider_registry.py",
+    "core/resource_factory.py",
+    "providers/gemini_cli/factory.py",
+]
+paths.extend([os.path.join(dp, f) for dp, _, fs in os.walk("providers/antigravity") for f in fs])
+paths.extend([os.path.join(dp, f) for dp, _, fs in os.walk("tests/providers/antigravity") for f in fs])
+for p in paths:
+    if not os.path.exists(p):
+        print(f"--- MISSING {p}")
+        continue
+    print(f"--- {p}")
+    try:
+        tree = ast.parse(open(p, encoding="utf-8", errors="replace").read())
+        for node in tree.body:
+            if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                print(f"{node.lineno}: {'class' if isinstance(node, ast.ClassDef) else 'def'} {node.name}")
+    except Exception as e:
+        print("AST_ERROR", e)
 </file>
 
 <file path="config/loader.py">
@@ -16493,6 +16763,10 @@ Gateway-native provider. One Firebase Project = one Resource.
 from __future__ import annotations
 
 from core.provider_registry import ProviderDefinition, ProviderRegistry
+from providers.antigravity.factory import (
+    AntigravityProviderFactory,
+    AntigravityResourceFactory,
+)
 from providers.anonymous_vertex.factory import (
     AnonymousVertexProviderFactory,
     AnonymousVertexResourceFactory,
@@ -16540,6 +16814,13 @@ def register_builtin_providers(registry: ProviderRegistry) -> None:
             provider_id="gemini_cli",
             provider_factory=GeminiCliProviderFactory(),
             resource_factory=GeminiCliResourceFactory(),
+        )
+    )
+    registry.register_definition(
+        ProviderDefinition(
+            provider_id="antigravity",
+            provider_factory=AntigravityProviderFactory(),
+            resource_factory=AntigravityResourceFactory(),
         )
     )
 </file>

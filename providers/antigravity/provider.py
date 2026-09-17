@@ -1,8 +1,10 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, AsyncIterator
 
+from core.health import HealthResult, HealthState
 from core.model_registry import ModelInfo
+from core.models import ChatChunk, ChatRequest, ChatResponse
 from core.provider import Provider
 
 from .client import AntigravityClient
@@ -16,11 +18,15 @@ class AntigravityProvider(Provider):
         self.client = client or AntigravityClient(resource)
         self.discovery = ModelDiscovery(self.client)
 
-    def list_models(self) -> list[ModelInfo]:
+    async def list_models(self) -> list[ModelInfo]:
         return self.discovery.fetch_models()
 
-    def generateContent(self, *args: Any, **kwargs: Any) -> Any:
-        raise NotImplementedError("Antigravity generateContent is not implemented yet")
+    async def complete(self, request: ChatRequest, resource: Any) -> ChatResponse:
+        raise NotImplementedError("Antigravity complete is not implemented yet")
 
-    def streamGenerateContent(self, *args: Any, **kwargs: Any) -> Any:
-        raise NotImplementedError("Antigravity streamGenerateContent is not implemented yet")
+    async def stream(self, request: ChatRequest, resource: Any) -> AsyncIterator[ChatChunk]:
+        raise NotImplementedError("Antigravity stream is not implemented yet")
+        yield
+
+    async def health_check(self, resource: Any) -> HealthResult:
+        return HealthResult(state=HealthState.HEALTHY)
