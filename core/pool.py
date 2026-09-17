@@ -54,7 +54,7 @@ class ResourcePool(ABC):
 
 
 class InMemoryPool(ResourcePool):
-    """Thread-safe in-memory pool with health/cooldown-aware, round-robin
+    """Thread-safe in-memory pool with health/cooldown-aware, low-load
     selection.  Base implementation for TASK-000 and the FakeProvider."""
 
     def __init__(
@@ -88,6 +88,21 @@ class InMemoryPool(ResourcePool):
             eligible.append(resource)
         return eligible
 
+    def _select_min_in_flight(self, eligible: List[Resource]) -> Resource:
+        """Select the least-loaded eligible resource.
+
+        The cursor advances after every acquisition, so it only acts as a
+        deterministic tie-breaker when multiple resources share the minimum
+        in_flight value.
+        """
+        start = self._cursor % len(eligible)
+        min_in_flight = min(res.in_flight for res in eligible)
+        for offset in range(len(eligible)):
+            resource = eligible[(start + offset) % len(eligible)]
+            if resource.in_flight == min_in_flight:
+                return resource
+        return eligible[start]
+
     async def has_available(self, *, skip: Optional[Set[str]] = None) -> bool:
         async with self._lock:
             return bool(self._eligible(skip))
@@ -97,10 +112,8 @@ class InMemoryPool(ResourcePool):
             eligible = self._eligible(skip)
             if not eligible:
                 return None
-            if len(self._resources):
-                self._cursor = (self._cursor + 1) % len(self._resources)
-            index = self._cursor % len(eligible)
-            resource = eligible[index]
+            resource = self._select_min_in_flight(eligible)
+            self._cursor = (self._resources.index(resource) + 1) % len(self._resources)
             resource.in_flight += 1
             return resource
 
