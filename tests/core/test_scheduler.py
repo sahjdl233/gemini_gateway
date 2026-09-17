@@ -165,6 +165,95 @@ async def test_retryable_resource_failure_uses_load_aware_pool_selection(fake_cl
     assert pool.resources[1].total_requests == 1
 
 
+async def test_success_records_before_releases(fake_clock):
+    """Outcome must be recorded before release for successful completions."""
+    provider = CountingProvider()
+    pool = InMemoryPool(
+        provider="fake",
+        resources=make_resources([{"id": "r1", "reply_text": "R1-REPLY"}]),
+        cooldown=make_cooldown(fake_clock),
+    )
+    _force_first(pool)
+    scheduler = Scheduler(
+        providers={"fake": provider},
+        pools={"fake": pool},
+        max_retries=2,
+    )
+    response = await scheduler.chat_completion(make_chat_request())
+    assert response.text == "R1-REPLY"
+    assert pool.resources[0].total_requests == 1
+    assert pool.resources[0].total_failures == 0
+
+
+async def test_failure_records_before_releases(fake_clock):
+    """ProviderError outcome must be recorded before release."""
+    provider = CountingProvider()
+    pool = InMemoryPool(
+        provider="fake",
+        resources=make_resources([{"id": "r1", "scenario": "timeout"}]),
+        cooldown=make_cooldown(fake_clock),
+    )
+    _force_first(pool)
+    scheduler = Scheduler(
+        providers={"fake": provider},
+        pools={"fake": pool},
+        max_retries=2,
+    )
+    with pytest.raises(TimeoutError):
+        await scheduler.chat_completion(make_chat_request())
+    assert pool.resources[0].total_failures == 1
+    assert pool.resources[0].total_requests == 1
+
+
+async def test_rate_limit_sets_cooldown_before_release(fake_clock):
+    """429 must put resource in COOLDOWN before release."""
+    provider = CountingProvider()
+    pool = InMemoryPool(
+        provider="fake",
+        resources=make_resources([
+            {"id": "r1", "scenario": "rate_limit", "retry_after": 5.0},
+            {"id": "r2", "reply_text": "R2-REPLY"},
+        ]),
+        cooldown=make_cooldown(fake_clock),
+    )
+    _force_first(pool)
+    scheduler = Scheduler(
+        providers={"fake": provider},
+        pools={"fake": pool},
+        max_retries=2,
+    )
+    response = await scheduler.chat_completion(make_chat_request())
+    assert response.text == "R2-REPLY"
+    r1 = pool.resources[0]
+    assert r1.health.name == "COOLDOWN"
+    assert r1.cooldown_until is not None
+
+
+async def test_stream_records_failure_before_release_then_falls_back(fake_clock):
+    """Stream retryable error before first chunk: record, release, fallback."""
+    provider = CountingProvider()
+    pool = InMemoryPool(
+        provider="fake",
+        resources=make_resources([
+            {"id": "r1", "scenario": "timeout"},
+            {"id": "r2", "reply_text": "R2-STREAM"},
+        ]),
+        cooldown=make_cooldown(fake_clock),
+    )
+    _force_first(pool)
+    scheduler = Scheduler(
+        providers={"fake": provider},
+        pools={"fake": pool},
+        max_retries=2,
+    )
+    chunks = [chunk async for chunk in scheduler.stream_chat(make_chat_request())]
+    assert len(chunks) == 1
+    assert chunks[0].content == "R2-STREAM"
+    assert provider.calls == ["r1", "r2"]
+    assert pool.resources[0].total_failures == 1
+    assert pool.resources[0].total_requests == 1
+
+
 async def test_success_uses_resource(fake_clock):
     pool = InMemoryPool(
         provider="fake",
