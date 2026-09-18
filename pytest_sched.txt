@@ -1,0 +1,66 @@
+============================= test session starts =============================
+platform win32 -- Python 3.14.4, pytest-9.1.1, pluggy-1.6.0
+rootdir: F:\project\gemini_gateway
+configfile: pyproject.toml
+plugins: asyncio-1.4.0
+asyncio: mode=Mode.AUTO, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 21 items
+
+tests\core\test_scheduler.py ..FF...FF.FF........F                       [100%]
+
+================================== FAILURES ===================================
+___________ test_non_retryable_error_does_not_consume_retry_budget ____________
+tests\core\test_scheduler.py:114: in test_non_retryable_error_does_not_consume_retry_budget
+    with pytest.raises(AuthenticationError):
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E   Failed: DID NOT RAISE AuthenticationError
+_________ test_stream_retryable_failure_before_first_chunk_falls_back _________
+tests\core\test_scheduler.py:140: in test_stream_retryable_failure_before_first_chunk_falls_back
+    assert len(chunks) == 1
+E   AssertionError: assert 2 == 1
+E    +  where 2 = len([ChatChunk(id='chatcmpl-fake-r3', model='gemini-3.8-flash', text='R3-STREAM ', tool_calls=None, finish_reason=None, us...lls=None, finish_reason='stop', usage=Usage(prompt_tokens=1, completion_tokens=1, total_tokens=2), created=1789695913)])
+________________ test_rate_limit_sets_cooldown_before_release _________________
+tests\core\test_scheduler.py:234: in test_rate_limit_sets_cooldown_before_release
+    assert r1.health.name == "COOLDOWN"
+E   AssertionError: assert 'HEALTHY' == 'COOLDOWN'
+E     
+E     - COOLDOWN
+E     + HEALTHY
+_________ test_stream_records_failure_before_release_then_falls_back __________
+tests\core\test_scheduler.py:256: in test_stream_records_failure_before_release_then_falls_back
+    assert len(chunks) == 1
+E   AssertionError: assert 2 == 1
+E    +  where 2 = len([ChatChunk(id='chatcmpl-fake-r2', model='gemini-3.8-flash', text='R2-STREAM ', tool_calls=None, finish_reason=None, us...lls=None, finish_reason='stop', usage=Usage(prompt_tokens=1, completion_tokens=1, total_tokens=2), created=1789695913)])
+_____________________ test_rate_limit_falls_back_to_next ______________________
+tests\core\test_scheduler.py:291: in test_rate_limit_falls_back_to_next
+    assert pool.resources[0].health.name == "COOLDOWN"
+E   AssertionError: assert 'HEALTHY' == 'COOLDOWN'
+E     
+E     - COOLDOWN
+E     + HEALTHY
+__________________ test_cooldown_resource_not_selected_again __________________
+tests\core\test_scheduler.py:310: in test_cooldown_resource_not_selected_again
+    assert pool.resources[0].total_requests == before  # still cooling down
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E   AssertionError: assert 1 == 0
+E    +  where 1 = FakeResource(id='r1', provider='fake', enabled=True, health=<HealthState.COOLDOWN: 'COOLDOWN'>, cooldown_until=datetim...y_after=5.0, reply_text='Hello from FakeProvider!', model_ids=None, resource_key=ResourceKey(provider='fake', id='r1')).total_requests
+------------------------------ Captured log call ------------------------------
+WARNING  core.scheduler:scheduler.py:96 scheduler.error provider=fake resource=fake:r1 model=gemini-3.8-flash error=RateLimitError
+_________________________ test_stream_partial_failure _________________________
+tests\core\test_scheduler.py:444: in test_stream_partial_failure
+    async for chunk in scheduler.stream_chat(make_chat_request()):
+core\scheduler.py:145: in stream_chat
+    async for chunk in provider.stream(request, resource):
+tests\core\test_scheduler.py:53: in stream
+    yield ChatChunk(id="chatcmpl-fake-r1", provider="fake", model="fake-1", content="R1-STREAM")
+          ^^^^^^^^^
+E   NameError: name 'ChatChunk' is not defined
+=========================== short test summary info ===========================
+FAILED tests/core/test_scheduler.py::test_non_retryable_error_does_not_consume_retry_budget
+FAILED tests/core/test_scheduler.py::test_stream_retryable_failure_before_first_chunk_falls_back
+FAILED tests/core/test_scheduler.py::test_rate_limit_sets_cooldown_before_release
+FAILED tests/core/test_scheduler.py::test_stream_records_failure_before_release_then_falls_back
+FAILED tests/core/test_scheduler.py::test_rate_limit_falls_back_to_next - Ass...
+FAILED tests/core/test_scheduler.py::test_cooldown_resource_not_selected_again
+FAILED tests/core/test_scheduler.py::test_stream_partial_failure - NameError:...
+======================== 7 failed, 14 passed in 0.59s =========================

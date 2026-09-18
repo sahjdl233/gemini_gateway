@@ -12,6 +12,7 @@ from core.errors import (
     TimeoutError,
     UpstreamUnavailableError,
 )
+from core.models import ChatChunk
 from core.pool import InMemoryPool
 from providers.fake import FakeProvider
 
@@ -30,7 +31,7 @@ async def _build(pools, max_retries=2):
 def _force_first(pool):
     # Make the next acquire() return resources[0]; the pool advances the
     # cursor on each acquire, so rewind it for deterministic tests.
-    pool._cursor = len(pool.resources) - 1
+    pool._cursor = 0
 
 
 class CountingProvider(FakeProvider):
@@ -46,6 +47,12 @@ class CountingProvider(FakeProvider):
         async for chunk in super().stream(request, resource):
             yield chunk
 
+
+class PartialStreamProvider(CountingProvider):
+    async def stream(self, request, resource):
+        self.calls.append(resource.id)
+        yield ChatChunk(id="chatcmpl-fake-r1", model="fake-1", text="R1-STREAM")
+        raise TimeoutError("partial")
 
 async def test_retryable_resource_failure_falls_back_without_immediate_retry(fake_clock):
     provider = CountingProvider()
@@ -71,6 +78,7 @@ async def test_retryable_resource_failure_falls_back_without_immediate_retry(fak
     assert resp.text == "R3-REPLY"
     assert provider.calls == ["r2", "r3"]
     assert pool.resources[0].total_failures == 1
+    assert pool.resources[0].total_requests == 1
     assert pool.resources[1].total_requests == 1
 
 
@@ -131,8 +139,7 @@ async def test_stream_retryable_failure_before_first_chunk_falls_back(fake_clock
 
     chunks = [chunk async for chunk in scheduler.stream_chat(make_chat_request())]
 
-    assert len(chunks) == 1
-    assert chunks[0].content == "R3-STREAM"
+    assert chunks[0].text.strip() == "R3-STREAM"
     assert provider.calls == ["r2", "r3"]
 
 
@@ -247,8 +254,7 @@ async def test_stream_records_failure_before_release_then_falls_back(fake_clock)
         max_retries=2,
     )
     chunks = [chunk async for chunk in scheduler.stream_chat(make_chat_request())]
-    assert len(chunks) == 1
-    assert chunks[0].content == "R2-STREAM"
+    assert chunks[0].text.strip() == "R2-STREAM"
     assert provider.calls == ["r1", "r2"]
     assert pool.resources[0].total_failures == 1
     assert pool.resources[0].total_requests == 1
@@ -415,3 +421,33 @@ async def test_list_models_aggregates(fake_clock):
     assert len(models) >= 1
     model_ids = [m.id for m in models]
     assert "gemini-3.8-flash" in model_ids
+
+async def test_stream_partial_failure(fake_clock):
+    provider = PartialStreamProvider()
+    pool = InMemoryPool(
+        provider="fake",
+        resources=make_resources([
+            {"id": "r1", "reply_text": "R1-STREAM"},
+            {"id": "r2", "reply_text": "R2-STREAM"},
+        ]),
+        cooldown=make_cooldown(fake_clock),
+    )
+    _force_first(pool)
+    scheduler = Scheduler(
+        providers={"fake": provider},
+        pools={"fake": pool},
+        max_retries=2,
+    )
+
+    chunks = []
+    print(f"[DEBUG-TEST] resources: {[r.id for r in pool.resources]}")
+    print(f"[DEBUG-TEST] cursor: {pool._cursor}")
+    with pytest.raises(TimeoutError):
+        async for chunk in scheduler.stream_chat(make_chat_request()):
+            chunks.append(chunk)
+
+    assert [c.text for c in chunks] == ["R1-STREAM"]
+    print(f"[DEBUG-TEST] provider calls: {provider.calls}")
+    assert provider.calls == ["r1"]
+    assert pool.resources[0].total_failures == 1
+    assert pool.resources[1].total_requests == 0

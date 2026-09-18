@@ -91,11 +91,7 @@ class Scheduler:
                 provider = self.providers[resource.provider]
                 logger.info('scheduler.acquire provider=%s resource=%s model=%s', resource.provider, str(resource.resource_key), request.model)
                 try:
-                    try:
-                        response = await provider.complete(request, resource)
-                    finally:
-                        await pool.record_success(resource)
-                    await pool.release(resource)
+                    response = await provider.complete(request, resource)
                 except ProviderError as exc:
                     logger.warning('scheduler.error provider=%s resource=%s model=%s error=%s', resource.provider, str(resource.resource_key), request.model, type(exc).__name__)
                     try:
@@ -110,6 +106,8 @@ class Scheduler:
                         raise exc
                     continue
                 logger.info('scheduler.success provider=%s resource=%s model=%s', resource.provider, str(resource.resource_key), request.model)
+                await pool.record_success(resource)
+                await pool.release(resource)
                 return response
 
             if not acquired_any:
@@ -120,9 +118,9 @@ class Scheduler:
             raise errors[-1]
         raise UpstreamUnavailableError("no usable resource", provider="gateway")
 
-   async def stream_chat(
-       self, request: ChatRequest
-   ) -> AsyncGenerator[ChatChunk, None]:
+    async def stream_chat(
+        self, request: ChatRequest
+    ) -> AsyncGenerator[ChatChunk, None]:
         logger.info('scheduler.stream model=%s', request.model)
         await self._model_registry._ensure_fresh()
         pools = self._candidate_pools(request.model)
@@ -144,13 +142,9 @@ class Scheduler:
                 sent_any = False
                 logger.info('scheduler.stream.acquire provider=%s resource=%s model=%s', resource.provider, str(resource.resource_key), request.model)
                 try:
-                    try:
-                        async for chunk in provider.stream(request, resource):
-                            sent_any = True
-                            yield chunk
-                    finally:
-                        await pool.record_success(resource)
-                    await pool.release(resource)
+                    async for chunk in provider.stream(request, resource):
+                        sent_any = True
+                        yield chunk
                 except ProviderError as exc:
                     logger.warning('scheduler.stream.error provider=%s resource=%s model=%s error=%s', resource.provider, str(resource.resource_key), request.model, type(exc).__name__)
                     try:
@@ -164,6 +158,8 @@ class Scheduler:
                     if sent_any or not is_retryable(exc):
                         raise exc
                     continue
+                await pool.record_success(resource)
+                await pool.release(resource)
                 return
 
             if not acquired_any:

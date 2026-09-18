@@ -1,0 +1,65 @@
+============================= test session starts =============================
+platform win32 -- Python 3.14.4, pytest-9.1.1, pluggy-1.6.0 -- F:\project\gemini_gateway\.venv\Scripts\python.exe
+cachedir: .pytest_cache
+rootdir: F:\project\gemini_gateway
+configfile: pyproject.toml
+plugins: anyio-4.15.1, asyncio-1.4.0
+asyncio: mode=Mode.AUTO, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collecting ... collected 1 item
+
+tests/core/test_scheduler.py::test_retryable_resource_failure_falls_back_without_immediate_retry FAILED [100%]
+
+================================== FAILURES ===================================
+_____ test_retryable_resource_failure_falls_back_without_immediate_retry ______
+
+fake_clock = <tests.conftest.FakeClock object at 0x0000027E78845550>
+
+    async def test_retryable_resource_failure_falls_back_without_immediate_retry(fake_clock):
+        provider = CountingProvider()
+        pool = InMemoryPool(
+            provider="fake",
+            resources=make_resources([
+                {"id": "r2", "scenario": "server_error"},
+                {"id": "r3", "reply_text": "R3-REPLY"},
+            ]),
+            cooldown=make_cooldown(fake_clock),
+        )
+        # Force the failing resource first even if the successful fallback has
+        # lower in_flight.
+        _force_first(pool)
+        scheduler = Scheduler(
+            providers={"fake": provider},
+            pools={"fake": pool},
+            max_retries=2,
+        )
+    
+        resp = await scheduler.chat_completion(make_chat_request())
+    
+        assert resp.text == "R3-REPLY"
+>       assert provider.calls == ["r3"]
+E       AssertionError: assert ['r2', 'r3'] == ['r3']
+E         
+E         At index 0 diff: 'r2' != 'r3'
+E         Left contains one more item: 'r3'
+E         
+E         Full diff:
+E           [
+E         +     'r2',
+E               'r3',
+E           ]
+
+tests\core\test_scheduler.py:79: AssertionError
+------------------------------ Captured log call ------------------------------
+WARNING  core.scheduler:scheduler.py:96 scheduler.error provider=fake resource=fake:r2 model=gemini-3.8-flash error=UpstreamUnavailableError
+=========================== short test summary info ===========================
+FAILED tests/core/test_scheduler.py::test_retryable_resource_failure_falls_back_without_immediate_retry - AssertionError: assert ['r2', 'r3'] == ['r3']
+  
+  At index 0 diff: 'r2' != 'r3'
+  Left contains one more item: 'r3'
+  
+  Full diff:
+    [
+  +     'r2',
+        'r3',
+    ]
+============================== 1 failed in 0.13s ==============================
