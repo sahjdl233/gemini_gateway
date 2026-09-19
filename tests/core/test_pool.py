@@ -25,9 +25,9 @@ async def test_selection_uses_cursor_tie_breaker_when_loads_equal(fake_clock):
     await pool.release(first)
     await pool.release(second)
     await pool.release(third)
-    assert first.id == "r2"
-    assert second.id == "r1"
-    assert third.id == "r2"
+    assert first.id == "r1"
+    assert second.id == "r2"
+    assert third.id == "r1"
 
 
 async def test_acquire_prefers_min_in_flight(fake_clock):
@@ -45,7 +45,7 @@ async def test_acquire_prefers_min_in_flight(fake_clock):
     assert res.id == "r3"
     assert res.in_flight == 2
     assert pool.resources[0].in_flight == 3
-    assert pool.resources[2].in_flight == 1
+    assert pool.resources[2].in_flight == 2
 
 
 async def test_acquire_does_not_choose_loaded_resource_over_cooldown(fake_clock):

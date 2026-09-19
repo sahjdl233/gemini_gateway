@@ -106,8 +106,10 @@ class Scheduler:
                         raise exc
                     continue
                 logger.info('scheduler.success provider=%s resource=%s model=%s', resource.provider, str(resource.resource_key), request.model)
-                await pool.record_success(resource)
-                await pool.release(resource)
+                try:
+                    await pool.record_success(resource)
+                finally:
+                    await pool.release(resource)
                 return response
 
             if not acquired_any:
@@ -158,8 +160,10 @@ class Scheduler:
                     if sent_any or not is_retryable(exc):
                         raise exc
                     continue
-                await pool.record_success(resource)
-                await pool.release(resource)
+                try:
+                    await pool.record_success(resource)
+                finally:
+                    await pool.release(resource)
                 return
 
             if not acquired_any:
