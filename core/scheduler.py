@@ -144,28 +144,32 @@ class Scheduler:
                 sent_any = False
                 logger.info('scheduler.stream.acquire provider=%s resource=%s model=%s', resource.provider, str(resource.resource_key), request.model)
                 try:
-                    async for chunk in provider.stream(request, resource):
-                        sent_any = True
-                        yield chunk
-                except ProviderError as exc:
-                    logger.warning('scheduler.stream.error provider=%s resource=%s model=%s error=%s', resource.provider, str(resource.resource_key), request.model, type(exc).__name__)
                     try:
+                        async for chunk in provider.stream(request, resource):
+                            sent_any = True
+                            yield chunk
+                    except ProviderError as exc:
+                        logger.warning(
+                            'scheduler.stream.error provider=%s resource=%s model=%s error=%s',
+                            resource.provider,
+                            str(resource.resource_key),
+                            request.model,
+                            type(exc).__name__,
+                        )
                         if isinstance(exc, RateLimitError):
                             await pool.record_rate_limit(resource, exc.retry_after)
                         else:
                             await pool.record_failure(resource, exc)
-                    finally:
-                        await pool.release(resource)
-                    errors.append(exc)
-                    if sent_any or not is_retryable(exc):
-                        raise exc
-                    continue
-                try:
+
+                        errors.append(exc)
+                        if sent_any or not is_retryable(exc):
+                            raise exc
+                        continue
+
                     await pool.record_success(resource)
+                    return
                 finally:
                     await pool.release(resource)
-                return
-
             if not acquired_any:
                 await self._raise_when_nothing_acquired(pools, tried, errors)
                 break
