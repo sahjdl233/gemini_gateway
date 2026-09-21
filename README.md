@@ -16,7 +16,7 @@ Gemini Gateway (FastAPI + Scheduler)
 Provider Adapter (Provider 抽象)
         |            |
         v            v
- AnonymousVertex  FakeProvider
+  AnonymousVertex  FakeProvider  GeminiCLI  Firebase  Vertex  Antigravity
         |
         v
 Anonymous Vertex / Agent Platform studio (batchGraphql)
@@ -89,7 +89,7 @@ app/          FastAPI 应用与路由
 core/         models / provider / resource / pool / scheduler / errors / health / cooldown
 protocol/     openai / gemini / common（HTTP <-> 内部模型 <-> Provider）
 transport/    http / proxy / streaming（Proxy 独立于 Provider）
-providers/    fake(已实现) / anonymous_vertex(TASK-002 已实现) / firebase / vertex / express / cli / build / antigravity(接口预占)
+providers/    fake(已实现) / anonymous_vertex(已实现) / firebase(已实现) / vertex(已实现) / gemini_cli(已实现) / antigravity(已实现)
 config/       YAML/JSON 加载与 env 占位符替换
 tests/        core / protocol / providers / app
 ```

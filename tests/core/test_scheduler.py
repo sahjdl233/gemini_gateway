@@ -34,6 +34,23 @@ def _force_first(pool):
     pool._cursor = 0
 
 
+class LifecyclePool(InMemoryPool):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.releases = []
+        self.acquires = []
+
+    async def acquire(self, *, skip=None):
+        resource = await super().acquire(skip=skip)
+        if resource is not None:
+            self.acquires.append(resource.id)
+        return resource
+
+    async def release(self, resource):
+        self.releases.append(resource.id)
+        return await super().release(resource)
+
+
 class CountingProvider(FakeProvider):
     def __init__(self):
         self.calls: list[str] = []
@@ -52,7 +69,58 @@ class PartialStreamProvider(CountingProvider):
     async def stream(self, request, resource):
         self.calls.append(resource.id)
         yield ChatChunk(id="chatcmpl-fake-r1", model="fake-1", text="R1-STREAM")
+        self.stream_started = True
         raise TimeoutError("partial")
+
+
+async def test_stream_resource_lifecycle_success(fake_clock):
+    provider = CountingProvider()
+    pool = LifecyclePool(
+        provider="fake",
+        resources=make_resources([{"id": "r1", "reply_text": "R1"}]),
+        cooldown=make_cooldown(fake_clock),
+    )
+    scheduler = Scheduler(providers={"fake": provider}, pools={"fake": pool})
+
+    chunks = [chunk async for chunk in scheduler.stream_chat(make_chat_request())]
+
+    assert chunks[0].text == "R1 "
+    assert chunks[-1].finish_reason == "stop"
+    assert len(chunks) == 2
+    assert provider.calls == ["r1"]
+    assert pool.acquires == ["r1"]
+    assert pool.releases == ["r1"]
+    assert pool.resources[0].in_flight == 0
+
+
+async def test_stream_resource_lifecycle_failure(fake_clock):
+    provider = PartialStreamProvider()
+    pool = LifecyclePool(
+        provider="fake",
+        resources=make_resources([
+            {"id": "r1", "reply_text": "R1"},
+            {"id": "r2", "reply_text": "R2"},
+        ]),
+        cooldown=make_cooldown(fake_clock),
+    )
+    scheduler = Scheduler(
+        providers={"fake": provider}, pools={"fake": pool}, max_retries=0
+    )
+
+    async def drain():
+        async for _ in scheduler.stream_chat(make_chat_request()):
+            pass
+
+    with pytest.raises(TimeoutError):
+        await drain()
+
+    # The stream had already started before the provider failure; the
+    # scheduler must still return the acquired resource to the pool.
+    assert provider.stream_started is True
+    assert provider.calls[0] == "r1"
+    assert pool.acquires[0] == "r1"
+    assert pool.releases[0] == "r1"
+    assert pool.resources[0].in_flight == 0
 
 async def test_retryable_resource_failure_falls_back_without_immediate_retry(fake_clock):
     provider = CountingProvider()
