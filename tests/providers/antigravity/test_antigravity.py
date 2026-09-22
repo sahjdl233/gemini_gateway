@@ -24,8 +24,8 @@ def test_client_uses_bearer_and_v1internal():
         assert kwargs["headers"]["Authorization"] == "Bearer tok-1"
         return httpx.Response(200, json={"models": {"gemini-test": {"displayName": "Test", "model": "gemini-test"}}})
 
-    client = AntigravityClient(res, client=MagicMock(post=fake_post))
-    data = client.fetch_available_models()
+    client = AntigravityClient(client=MagicMock(post=fake_post))
+    data = client.fetch_available_models(res)
     assert data["models"]["gemini-test"]["model"] == "gemini-test"
 
 
@@ -35,30 +35,23 @@ def test_model_discovery_parses_modelinfo():
     def fake_post(url, **kwargs):
         return httpx.Response(200, json={"models": {"gemini-test": {"displayName": "Test", "model": "gemini-test"}}})
 
-    client = AntigravityClient(res, client=MagicMock(post=fake_post))
+    client = AntigravityClient(client=MagicMock(post=fake_post))
     discovery = ModelDiscovery(client)
-    models = discovery.fetch_models()
+    models = discovery.fetch_models(res)
     assert len(models) == 1
     assert models[0].id == "gemini-test"
     assert models[0].provider == "antigravity"
     assert models[0].capabilities == {"stream": False, "tools": True}
 
+def test_provider_does_not_bind_resource():
+    client = AntigravityClient(client=MagicMock())
+    provider = AntigravityProvider(client=client)
 
-def test_provider_list_models_returns_geminitest():
-    import asyncio
-    res = AntigravityResource(id="a", access_token="tok-1")
-
-    def fake_post(url, **kwargs):
-        return httpx.Response(200, json={"models": {"gemini-test": {"displayName": "Test", "model": "gemini-test"}}})
-
-    client = AntigravityClient(res, client=MagicMock(post=fake_post))
-    provider = AntigravityProvider(res, client=client)
-    models = asyncio.run(provider.list_models())
-    assert [m.id for m in models] == ["gemini-test"]
-
+    assert provider.client is client
+    assert not hasattr(provider, "resource")
 
 def test_registry_can_create_antigravity_provider():
     provider_factory = AntigravityProviderFactory()
     provider = provider_factory.create_provider("antigravity")
     assert isinstance(provider, AntigravityProvider)
-    assert isinstance(provider.resource, AntigravityResource)
+    assert not hasattr(provider, "resource")

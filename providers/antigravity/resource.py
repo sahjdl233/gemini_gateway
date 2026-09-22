@@ -1,13 +1,22 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+"""Antigravity Core Resource contract implementation (TASK-ANTIGRAVITY-001).
+
+Must inherit from core.resource.Resource and keep Antigravity-specific
+credential fields.
+"""
+
 from typing import Any
 
+from core.resource import Resource
 
-@dataclass
-class AntigravityResource:
-    id: str
+
+class AntigravityResource(Resource):
+    """Gateway Resource for the Antigravity provider."""
+
     provider: str = "antigravity"
+
+    # Antigravity-specific credentials (do not remove)
     access_token: str | None = None
     refresh_token: str | None = None
     client_id: str | None = None
@@ -15,3 +24,4 @@ class AntigravityResource:
     token_expiry: Any | None = None
     project_id: str | None = None
     ide_type: str = "ANTIGRAVITY"
+

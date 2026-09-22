@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# __TASK-ANTIGRAVITY-001__: factory wiring lifecycle (debug-marker)
+
 from typing import Any, List
 
 from .provider import AntigravityProvider
@@ -8,7 +10,9 @@ from .resource import AntigravityResource
 
 class AntigravityProviderFactory:
     def create_provider(self, provider_id: str, config: Any = None) -> AntigravityProvider:
-        return AntigravityProvider(AntigravityResource(id=provider_id))
+        # Provider must not bind to any account/resource.
+        # Scheduler will inject selected AntigravityResource into complete()/stream().
+        return AntigravityProvider()
 
 
 class AntigravityResourceFactory:

@@ -5,14 +5,15 @@ from typing import Any, Mapping
 from core.model_registry import ModelInfo
 
 from .client import AntigravityClient
+from .resource import AntigravityResource
 
 
 class ModelDiscovery:
     def __init__(self, client: AntigravityClient) -> None:
         self.client = client
 
-    def fetch_models(self) -> list[ModelInfo]:
-        data = self.client.fetch_available_models({})
+    def fetch_models(self, resource: AntigravityResource) -> list[ModelInfo]:
+        data = self.client.fetch_available_models(resource, {})
         raw_models = (data or {}).get("models", {})
         if not isinstance(raw_models, dict):
             return []

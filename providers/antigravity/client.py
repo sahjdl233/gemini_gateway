@@ -10,16 +10,20 @@ BASE_URL = "https://daily-cloudcode-pa.googleapis.com"
 
 
 class AntigravityClient:
-    def __init__(self, resource: AntigravityResource, *, timeout: float = 30.0, client: httpx.Client | None = None) -> None:
-        self.resource = resource
+    def __init__(self, *, timeout: float = 30.0, client: httpx.Client | None = None) -> None:
         self.timeout = timeout
         self._client = client
 
-    def _request(self, operation: str, payload: Mapping[str, Any] | None = None) -> Any:
+    def _request(
+        self,
+        operation: str,
+        resource: AntigravityResource,
+        payload: Mapping[str, Any] | None = None,
+    ) -> Any:
         endpoint = f"{BASE_URL}/v1internal:{operation}"
         headers = {"Content-Type": "application/json"}
-        if self.resource.access_token:
-            headers["Authorization"] = f"Bearer {self.resource.access_token}"
+        if resource.access_token:
+            headers["Authorization"] = f"Bearer {resource.access_token}"
 
         if self._client is not None:
             resp = self._client.post(endpoint, json=payload or {}, headers=headers, timeout=self.timeout)
@@ -33,5 +37,9 @@ class AntigravityClient:
 
         return resp.json()
 
-    def fetch_available_models(self, payload: Mapping[str, Any] | None = None) -> Any:
-        return self._request("fetchAvailableModels", payload)
+    def fetch_available_models(
+        self,
+        resource: AntigravityResource,
+        payload: Mapping[str, Any] | None = None,
+    ) -> Any:
+        return self._request("fetchAvailableModels", resource, payload)

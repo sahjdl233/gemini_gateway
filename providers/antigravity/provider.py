@@ -13,9 +13,8 @@ from .resource import AntigravityResource
 
 
 class AntigravityProvider(Provider):
-    def __init__(self, resource: AntigravityResource, client: AntigravityClient | None = None) -> None:
-        self.resource = resource
-        self.client = client or AntigravityClient(resource)
+    def __init__(self, client: AntigravityClient | None = None) -> None:
+        self.client = client or AntigravityClient()
         self.discovery = ModelDiscovery(self.client)
 
     async def list_models(self) -> list[ModelInfo]:
