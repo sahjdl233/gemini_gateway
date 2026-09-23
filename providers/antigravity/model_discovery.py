@@ -12,8 +12,12 @@ class ModelDiscovery:
     def __init__(self, client: AntigravityClient) -> None:
         self.client = client
 
-    def fetch_models(self, resource: AntigravityResource) -> list[ModelInfo]:
-        data = self.client.fetch_available_models(resource, {})
+    async def fetch_models(self, resource: AntigravityResource) -> list[ModelInfo]:
+        """Discovery through the provider's shared backend."""
+        data = await self.client.fetch_available_models(resource, {})
+        return self._parse(data)
+
+    def _parse(self, data: Any) -> list[ModelInfo]:
         raw_models = (data or {}).get("models", {})
         if not isinstance(raw_models, dict):
             return []
