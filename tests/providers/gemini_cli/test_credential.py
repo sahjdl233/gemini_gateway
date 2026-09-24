@@ -11,6 +11,7 @@ import pytest
 
 from core.credential import Credential, CredentialStore, CredentialType
 from providers.gemini_cli.auth import GeminiCliAuth, resource_material
+from providers.gemini_cli.auth_adapter import GeminiCliAuthAdapter
 from providers.gemini_cli.provider import GeminiCliProvider
 
 from tests.providers._gemini_cli_fakes import FakeHttp, make_resource
@@ -33,6 +34,14 @@ def make_credential() -> Credential:
             "client_id": "cred-client-id",
             "client_secret": "cred-client-secret",
         },
+    )
+
+
+def make_adapter(store=None, http=None) -> GeminiCliAuthAdapter:
+    """Build an adapter the way the Provider does (AUTH-004)."""
+    return GeminiCliAuthAdapter(
+        http=http if http is not None else FakeHttp(),
+        credential_store=store,
     )
 
 
@@ -59,19 +68,19 @@ def test_default_material_reads_legacy_resource_fields():
 
 
 def test_provider_material_without_credential_uses_legacy_fields():
-    provider = GeminiCliProvider()
+    adapter = make_adapter()
     resource = make_resource(credential_id=None)
-    material = provider._oauth_material(resource)
+    material = adapter.material_for(resource)
     assert material["refresh_token"] == "refresh-token-1"
 
 
 def test_provider_material_with_credential_uses_payload():
     store = CredentialStore()
     store.add(make_credential())
-    provider = GeminiCliProvider(credential_store=store)
+    adapter = make_adapter(store)
     resource = make_resource(credential_id="google-oauth-01")
 
-    material = provider._oauth_material(resource)
+    material = adapter.material_for(resource)
 
     assert material == {
         "refresh_token": "cred-refresh-token",
@@ -83,22 +92,43 @@ def test_provider_material_with_credential_uses_payload():
 def test_provider_material_with_wrong_credential_type_falls_back_to_legacy():
     store = CredentialStore()
     store.add(Credential(id="google-oauth-01", type=CredentialType.API_KEY, payload={}))
-    provider = GeminiCliProvider(credential_store=store)
+    adapter = make_adapter(store)
     resource = make_resource(credential_id="google-oauth-01")
 
-    material = provider._oauth_material(resource)
+    material = adapter.material_for(resource)
 
     assert material["refresh_token"] == "refresh-token-1"
 
 
 def test_provider_material_unknown_credential_id_falls_back_to_legacy():
     store = CredentialStore()
-    provider = GeminiCliProvider(credential_store=store)
+    adapter = make_adapter(store)
     resource = make_resource(credential_id="not-registered")
 
-    material = provider._oauth_material(resource)
+    material = adapter.material_for(resource)
 
     assert material["refresh_token"] == "refresh-token-1"
+
+
+def test_provider_material_explicit_credential_wins_over_store():
+    """Precedence: explicit credential param > credential_id lookup."""
+    store = CredentialStore()
+    store.add(make_credential())
+    adapter = make_adapter(store)
+    resource = make_resource(credential_id="google-oauth-01")
+    explicit = Credential(
+        id="explicit-01",
+        type=CredentialType.OAUTH,
+        payload={
+            "refresh_token": "explicit-refresh",
+            "client_id": "explicit-client-id",
+            "client_secret": "explicit-client-secret",
+        },
+    )
+
+    material = adapter.material_from(explicit, resource)
+
+    assert material["refresh_token"] == "explicit-refresh"
 
 
 def test_set_credential_store_clears_cached_clients():

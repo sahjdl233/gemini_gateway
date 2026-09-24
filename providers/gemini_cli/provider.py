@@ -14,15 +14,14 @@ from __future__ import annotations
 import logging
 from typing import Any, AsyncIterator, Dict, List, Optional
 
-from core.credential import CredentialType
 from core.health import HealthResult, HealthState
 from core.models import ChatChunk, ChatRequest, ChatResponse, ModelInfo
 from core.provider import Provider
 from core.resource import Resource
 
+from providers.gemini_cli.auth_adapter import GeminiCliAuthAdapter
 from providers.gemini_cli.client import GeminiCliClient, DEFAULT_BASE_URL
 from providers.gemini_cli.errors import GeminiCliProtocolError
-from providers.gemini_cli.auth import GeminiCliAuth
 from providers.gemini_cli.payload import build_envelope, get_model_name
 from providers.gemini_cli.resource import GeminiCliResource
 from providers.gemini_cli.response import parse_chunk, parse_response
@@ -54,40 +53,25 @@ class GeminiCliProvider(Provider):
         self._models: List[str] = list(models) if models else list(DEFAULT_MODELS)
         self._http: Optional[Any] = None
         self._clients: Dict[str, GeminiCliClient] = {}
-        # Optional CredentialStore (AUTH-002).  When a resource carries
-        # credential_id, its long-lived OAuth material is resolved from the
-        # referenced Credential instead of the legacy Resource fields.
+        # Per-resource GeminiCliAuthAdapter instances (AUTH-004).  The
+        # adapter owns the OAuth lifecycle and the credential->material
+        # resolution; the Provider itself owns no auth logic.  Cache scope
+        # is resource-scoped: one adapter/token cache per Resource, even
+        # when Resources share a credential_id.
+        self._adapters: Dict[str, GeminiCliAuthAdapter] = {}
         self._credential_store = credential_store
 
     def set_credential_store(self, store: Any) -> None:
         """Attach the application-wide credential store (AUTH-002)."""
         self._credential_store = store
         self._clients.clear()
-
-    def _credential_for(self, resource: GeminiCliResource) -> Optional[Any]:
-        if self._credential_store is None or not resource.credential_id:
-            return None
-        return self._credential_store.get(resource.credential_id)
-
-    def _oauth_material(self, resource: GeminiCliResource) -> Dict[str, str]:
-        """Resolve OAuth material: Credential payload first, legacy fields as
-        compatibility fallback (AUTH-002)."""
-        credential = self._credential_for(resource)
-        if credential is not None and credential.type is CredentialType.OAUTH:
-            payload = credential.payload
-            return {
-                "refresh_token": str(payload.get("refresh_token") or ""),
-                "client_id": str(payload.get("client_id") or ""),
-                "client_secret": str(payload.get("client_secret") or ""),
-            }
-        from providers.gemini_cli.auth import resource_material
-
-        return resource_material(resource)
+        self._adapters.clear()
 
     def set_http_client(self, client: Any) -> None:
         """Inject an httpx.AsyncClient-compatible object (tests)."""
         self._http = client
         self._clients.clear()
+        self._adapters.clear()
 
     async def _client_for(self, resource: GeminiCliResource) -> GeminiCliClient:
         cached = self._clients.get(resource.id)
@@ -96,13 +80,20 @@ class GeminiCliProvider(Provider):
         http = self._http
         if http is None:
             http = self._build_http(resource)
-        auth = GeminiCliAuth(
+        adapter = GeminiCliAuthAdapter(
             http=http,
-            material_resolver=lambda res: self._oauth_material(res),
+            credential_store=self._credential_store,
         )
-        client = GeminiCliClient(http=http, auth=auth)
+        self._adapters[resource.id] = adapter
+        client = GeminiCliClient(http=http, auth=adapter.auth)
         self._clients[resource.id] = client
         return client
+
+    async def _auth_adapter_for(self, resource: GeminiCliResource) -> GeminiCliAuthAdapter:
+        """The per-resource auth adapter owning this resource's OAuth
+        lifecycle (material resolution, refresh, invalidate)."""
+        await self._client_for(resource)
+        return self._adapters[resource.id]
 
     def _build_http(self, resource: GeminiCliResource) -> Any:
         """Build httpx.AsyncClient, optionally using the resource proxy."""

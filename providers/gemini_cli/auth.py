@@ -81,13 +81,25 @@ class GeminiCliAuth:
 
     # -- public API ---------------------------------------------------------
 
+    @property
+    def expires_at(self) -> float:
+        """Epoch seconds when the cached access token expires (0 = none)."""
+        return self._expires_at
+
     async def get_access_token(
         self,
         resource: Any,
         *,
         force: bool = False,
+        material: Optional[dict] = None,
     ) -> str:
-        """Return a valid access token, refreshing it when needed."""
+        """Return a valid access token, refreshing it when needed.
+
+        ``material`` optionally supplies the OAuth material explicitly
+        (AUTH-004: the auth adapter passes the Credential payload here);
+        when omitted the configured material resolver applies, which
+        keeps the legacy Resource-field source working unchanged.
+        """
         async with self._lock:
             if not force and not self._is_expired():
                 return self._access_token  # type: ignore[return-value]
@@ -99,7 +111,7 @@ class GeminiCliAuth:
                     provider="gemini_cli",
                     resource_id=resource.id,
                 )
-            token, expires_in = await self._refresh(resource)
+            token, expires_in = await self._refresh(resource, material)
             self._access_token = token
             self._expires_at = self._now() + float(expires_in)
             self._consecutive_refresh_failures = 0
@@ -124,9 +136,14 @@ class GeminiCliAuth:
 
     # -- internals ----------------------------------------------------------
 
-    async def _refresh(self, resource: Any) -> tuple:
-        """POST refresh_token grant; returns (access_token, expires_in)."""
-        material = self._material_resolver(resource)
+    async def _refresh(self, resource: Any, material: Optional[dict] = None) -> tuple:
+        """POST refresh_token grant; returns (access_token, expires_in).
+
+        ``material`` overrides the resolver-derived OAuth material
+        (explicit Credential payload from the auth adapter); the resolver
+        fallback keeps legacy/credential_id resources working unchanged.
+        """
+        material = material or self._material_resolver(resource)
         if not material["refresh_token"]:
             raise GeminiCliAuthError(
                 "gemini_cli auth: no refresh_token configured",

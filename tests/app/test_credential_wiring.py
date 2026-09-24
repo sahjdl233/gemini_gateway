@@ -51,16 +51,17 @@ def test_build_credential_store_empty_config():
     assert len(store) == 0
 
 
-def test_build_runtime_wires_store_into_providers():
+async def test_build_runtime_wires_store_into_providers():
     config = make_config()
     store = build_credential_store(config)
     scheduler = build_runtime(config, store)
 
     gemini = scheduler.providers["gemini_cli"]
     assert gemini._credential_store is store
-    material = gemini._oauth_material(
-        scheduler.pools["gemini_cli"].resources[0]
-    )
+
+    resource = scheduler.pools["gemini_cli"].resources[0]
+    adapter = await gemini._auth_adapter_for(resource)
+    material = adapter.material_for(resource)
     assert material["refresh_token"] == "rt"
 
     # fake has no credential support and stays untouched
