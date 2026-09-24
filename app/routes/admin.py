@@ -100,6 +100,7 @@ async def admin_page() -> str:
   <form id="resource-form">
     <input type="hidden" name="original_id">
     <label>Resource ID<input name="id" required></label>
+    <label>Credential ID<input name="credential_id" autocomplete="off"></label>
     <label>Access Token<input name="access_token" type="password" autocomplete="new-password"></label>
     <label>Refresh Token<input name="refresh_token" type="password" autocomplete="new-password"></label>
     <label>Client ID<input name="client_id" type="password" autocomplete="off"></label>
@@ -160,7 +161,7 @@ function resetForm() {
 function editResource(id) {
   const resource = rows.find(item => item.id === id); if (!resource) return;
   resetForm(); form.elements.original_id.value = resource.id; form.elements.id.value = resource.id;
-  for (const name of ['project_id', 'ide_type']) form.elements[name].value = resource[name] || '';
+  for (const name of ['project_id', 'ide_type', 'credential_id']) form.elements[name].value = resource[name] || '';
   form.elements.enabled.checked = resource.enabled;
   document.getElementById('form-title').textContent = 'Edit Resource ' + resource.id;
   document.getElementById('cancel-edit').hidden = false;

@@ -23,6 +23,17 @@ logger = logging.getLogger(__name__)
 BASE_URL = "https://daily-cloudcode-pa.googleapis.com"
 
 
+def resource_access_token(resource: AntigravityResource) -> Optional[str]:
+    """Legacy token source: read the bearer token off the Resource.
+
+    AUTH-002 compatibility path.  When a resource carries
+    ``credential_id`` the provider binds a resolver that prefers the
+    Credential payload; this fallback keeps resources without a
+    Credential working unchanged.  No refresh logic lives here.
+    """
+    return resource.access_token
+
+
 class AntigravityClient:
     """Antigravity protocol layer: endpoint shape, headers and payloads.
 
@@ -41,9 +52,14 @@ class AntigravityClient:
         *,
         backend: Optional[ExecutionBackend] = None,
         timeout: float = 30.0,
+        token_resolver: Optional[Any] = None,
     ) -> None:
         self._backend = backend
         self.timeout = timeout
+        # Optional callable (resource) -> access token or None.  Defaults
+        # to the legacy Resource-field source; the provider binds a
+        # Credential-aware resolver (AUTH-002).
+        self._token_resolver = token_resolver or resource_access_token
 
     async def _request(
         self,
@@ -58,8 +74,9 @@ class AntigravityClient:
             )
         endpoint = f"{BASE_URL}/v1internal:{operation}"
         headers = {"Content-Type": "application/json"}
-        if resource.access_token:
-            headers["Authorization"] = f"Bearer {resource.access_token}"
+        token = self._token_resolver(resource)
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
         resp = await self._backend.execute(
             "POST",
             endpoint,
@@ -168,8 +185,9 @@ class AntigravityClient:
             )
         endpoint = f"{BASE_URL}/v1internal:streamGenerateContent?alt=sse"
         headers = {"Content-Type": "application/json"}
-        if resource.access_token:
-            headers["Authorization"] = f"Bearer {resource.access_token}"
+        token = self._token_resolver(resource)
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
         resp = await self._backend.execute_stream(
             "POST",
             endpoint,

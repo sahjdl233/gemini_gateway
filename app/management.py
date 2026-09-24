@@ -21,6 +21,7 @@ from providers.antigravity.resource import AntigravityResource
 
 _EDITABLE_FIELDS = (
     "enabled",
+    "credential_id",
     "access_token",
     "refresh_token",
     "client_id",
@@ -123,6 +124,7 @@ class ResourceManager:
             "id": resource.id,
             "provider": resource.provider,
             "enabled": resource.enabled,
+            "credential_id": resource.credential_id,
             "health": health,
             "cooldown_until": cooldown,
             "in_flight": resource.in_flight,

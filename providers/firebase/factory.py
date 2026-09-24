@@ -7,7 +7,7 @@ demand. One Firebase Project = one FirebaseResource.
 """
 from __future__ import annotations
 
-from typing import Any, List
+from typing import Any, List, Optional
 
 from providers.firebase.provider import FirebaseProvider
 from providers.firebase.resource import FirebaseResource
@@ -19,7 +19,15 @@ class FirebaseProviderFactory:
     The optional config may carry an explicit model list ("models") used
     to override the default snapshot. If absent, the provider falls back
     to DEFAULT_MODELS (config-driven; TASK-003: no firebase2api table copy).
+
+    The optional ``credential_store`` (AUTH-002) lets the provider resolve
+    project credentials from Credential objects referenced by
+    ``resource.credential_id``; resources without a credential_id keep
+    using their legacy fields.
     """
+
+    def __init__(self, credential_store: Optional[Any] = None) -> None:
+        self._credential_store = credential_store
 
     def create_provider(
         self, provider_id: str, config: Any = None
@@ -27,7 +35,10 @@ class FirebaseProviderFactory:
         models = None
         if config and isinstance(config, dict):
             models = config.get("models")
-        return FirebaseProvider(models=models)
+        return FirebaseProvider(
+            models=models,
+            credential_store=self._credential_store,
+        )
 
 
 class FirebaseResourceFactory:

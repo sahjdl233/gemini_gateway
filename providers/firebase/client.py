@@ -37,29 +37,50 @@ GEN_URL = "https://firebasevertexai.googleapis.com/v1beta"
 GOOG_API_CLIENT = "gl-js/@firebase/ai/2.15.0 fire/2.15.0"
 
 
+def resource_material(resource: FirebaseResource) -> Dict[str, str]:
+    """Legacy material source: read project credentials off the Resource.
+
+    AUTH-002 compatibility path.  When a resource carries ``credential_id``
+    the provider binds a resolver that prefers the Credential payload; this
+    fallback keeps resources without a Credential working unchanged.
+    """
+    return {
+        "project_id": resource.project_id,
+        "app_id": resource.app_id,
+        "api_key": resource.api_key,
+        "debug_token": resource.debug_token,
+    }
+
+
 class FirebaseClient:
     """Thin HTTP client for Firebase AI Logic."""
 
-    def __init__(self, http: Any, auth: FirebaseAuth) -> None:
+    def __init__(
+        self,
+        http: Any,
+        auth: FirebaseAuth,
+        *,
+        material_resolver: Optional[Any] = None,
+    ) -> None:
         self._http = http
         self._auth = auth
+        # Optional callable (resource) -> {project_id, app_id, api_key,
+        # debug_token}.  Defaults to the legacy Resource-field source; the
+        # provider binds a Credential-aware resolver (AUTH-002).
+        self._material_resolver = material_resolver or resource_material
 
-    def _build_url(
-        self, resource: FirebaseResource, model: str, streaming: bool
-    ) -> str:
-        base = f"{GEN_URL}/projects/{resource.project_id}/models/{model}"
+    def _build_url(self, project_id: str, model: str, streaming: bool) -> str:
+        base = f"{GEN_URL}/projects/{project_id}/models/{model}"
         if streaming:
             return f"{base}:streamGenerateContent?alt=sse"
         return f"{base}:generateContent"
 
-    def _build_headers(
-        self, resource: FirebaseResource, jwt: str
-    ) -> Dict[str, str]:
+    def _build_headers(self, material: Dict[str, str], jwt: str) -> Dict[str, str]:
         return {
             "Content-Type": "application/json",
             "x-goog-api-client": GOOG_API_CLIENT,
-            "x-goog-api-key": resource.api_key,
-            "X-Firebase-Appid": resource.app_id,
+            "x-goog-api-key": material["api_key"],
+            "X-Firebase-Appid": material["app_id"],
             "X-Firebase-AppCheck": jwt,
         }
 
@@ -71,15 +92,16 @@ class FirebaseClient:
     ) -> Any:
         """Non-streaming POST; retry once on 401 with forced JWT refresh."""
         for attempt in (0, 1):
+            material = self._material_resolver(resource)
             jwt = await self._auth.get_jwt(
-                resource.project_id,
-                resource.app_id,
-                resource.api_key,
-                resource.debug_token,
+                material["project_id"],
+                material["app_id"],
+                material["api_key"],
+                material["debug_token"],
                 force=(attempt == 1),
             )
-            headers = self._build_headers(resource, jwt)
-            url = self._build_url(resource, model, streaming=False)
+            headers = self._build_headers(material, jwt)
+            url = self._build_url(material["project_id"], model, streaming=False)
             try:
                 resp = await self._http.post(url, headers=headers, json=payload)
             except Exception as exc:
@@ -116,15 +138,16 @@ class FirebaseClient:
         All other non-2xx responses are classified into ProviderError.
         """
         for attempt in (0, 1):
+            material = self._material_resolver(resource)
             jwt = await self._auth.get_jwt(
-                resource.project_id,
-                resource.app_id,
-                resource.api_key,
-                resource.debug_token,
+                material["project_id"],
+                material["app_id"],
+                material["api_key"],
+                material["debug_token"],
                 force=(attempt == 1),
             )
-            headers = self._build_headers(resource, jwt)
-            url = self._build_url(resource, model, streaming=True)
+            headers = self._build_headers(material, jwt)
+            url = self._build_url(material["project_id"], model, streaming=True)
             try:
                 async with self._http.stream(
                     "POST", url, headers=headers, json=payload

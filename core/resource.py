@@ -64,6 +64,12 @@ class Resource(BaseModel):
     provider: str
     enabled: bool = True
 
+    # Reference to the Credential owning this resource's long-lived
+    # authentication material (AUTH-002).  None means the resource needs
+    # no credential (fake, anonymous_vertex) or still carries material on
+    # legacy provider-specific fields (compatibility path).
+    credential_id: Optional[str] = None
+
     health: HealthState = HealthState.HEALTHY
     cooldown_until: Optional[datetime] = None
 

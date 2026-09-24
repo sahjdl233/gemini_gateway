@@ -22,6 +22,24 @@ scheduler:
 model_registry:
   refresh_interval: 300   # 模型索引 TTL（秒）；过期的索引会被并发安全地刷新
 
+# ---- AUTH-002: 可选的 Credential 定义（第一版骨架）----
+# Credential 是长期认证材料的第一等所有者，Resource 通过 credential_id 引用它。
+# type 表示材料的生命周期/处理类别（none | api_key | oauth），不是 Provider 名。
+# 当前仍为明文持久化（现状）；加密在 AUTH-007 引入。
+# credentials:
+#   - id: google-oauth-01
+#     type: oauth
+#     payload:
+#       refresh_token: ${GEMINI_CLI_01_REFRESH_TOKEN}
+#       client_id: ${GEMINI_CLI_01_CLIENT_ID}
+#       client_secret: ${GEMINI_CLI_01_CLIENT_SECRET}
+#   - id: firebase-01
+#     type: api_key
+#     payload:
+#       api_key: ${FIREBASE_01_API_KEY}
+#       app_id: ${FIREBASE_01_APP_ID}
+#       debug_token: ${FIREBASE_01_DEBUG_TOKEN}
+
 providers:
   fake:
     enabled: true
@@ -89,6 +107,9 @@ providers:
     #   - gemini-2.5-flash
     resources:
       - id: cli-account-01
+        # 可选：引用上方 credentials 定义的凭据（AUTH-002）；未设置时
+        # 继续使用下方 legacy 字段（兼容路径）。
+        # credential_id: google-oauth-01
         # 首次 onboarding 后写入 resource 的字段（令牌/项目由脚本生成）：
         refresh_token: ${GEMINI_CLI_01_REFRESH_TOKEN}
         client_id: ${GEMINI_CLI_01_CLIENT_ID}

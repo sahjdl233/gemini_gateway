@@ -22,6 +22,7 @@ from app.routes.admin import router as admin_router
 from app.management import ResourceManager
 from config.loader import default_config, load_config
 from core.cooldown import CooldownManager
+from core.credential import Credential, CredentialStore
 from core.model_registry import ModelRegistry
 from core.pool import InMemoryPool
 from core.provider_registry import ProviderRegistry, UnknownProviderError
@@ -30,9 +31,29 @@ from core.scheduler import Scheduler
 logger = logging.getLogger(__name__)
 
 
-def build_runtime(config: Dict[str, Any]) -> Scheduler:
+def build_credential_store(config: Dict[str, Any]) -> CredentialStore:
+    """Build the application-wide credential store from config (AUTH-002).
+
+    Optional top-level ``credentials`` list; each entry is
+    ``{id, type, payload}``.  Values may use ``${ENV_VAR}`` placeholders
+    (resolved by the config loader).  Plaintext storage is the current
+    state; encryption arrives with AUTH-007.
+    """
+    store = CredentialStore()
+    for entry in config.get("credentials") or []:
+        store.add(Credential.model_validate(entry))
+    return store
+
+
+def build_runtime(
+    config: Dict[str, Any],
+    credential_store: Optional[CredentialStore] = None,
+) -> Scheduler:
     registry = ProviderRegistry()
     register_builtin_providers(registry)
+
+    if credential_store is None:
+        credential_store = build_credential_store(config)
 
     pools: Dict[str, Any] = {}
     providers: Dict[str, Any] = {}
@@ -48,9 +69,20 @@ def build_runtime(config: Dict[str, Any]) -> Scheduler:
                 "(no real Google access allowed in this phase)"
             )
         provider = registry.create(provider_id, pcfg)
+        set_credential_store = getattr(provider, "set_credential_store", None)
+        if set_credential_store is not None:
+            set_credential_store(credential_store)
         resources = registry.create_resources(
             provider_id, pcfg.get("resources", [])
         )
+        for resource in resources:
+            if resource.credential_id and resource.credential_id not in credential_store:
+                logger.warning(
+                    "credential.unresolved provider=%s resource=%s credential_id=%s",
+                    provider_id,
+                    resource.id,
+                    resource.credential_id,
+                )
         providers[provider_id] = provider
         pool = InMemoryPool(
             provider=provider_id, resources=resources, cooldown=cooldown
@@ -95,7 +127,8 @@ def create_app(
         cfg = load_config(path) if path.exists() else default_config()
     else:
         cfg = config
-    scheduler = build_runtime(cfg)
+    credential_store = build_credential_store(cfg)
+    scheduler = build_runtime(cfg, credential_store)
     resource_manager = ResourceManager(scheduler, cfg, config_path)
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -115,6 +148,7 @@ def create_app(
     app.state.scheduler = scheduler
     app.state.config = cfg
     app.state.resource_manager = resource_manager
+    app.state.credential_store = credential_store
     app.include_router(models_router)
     app.include_router(chat_router)
     app.include_router(admin_router)

@@ -20,6 +20,7 @@ import logging
 from typing import Any, AsyncIterator, Dict, List, Optional
 from urllib.parse import urlsplit
 
+from core.credential import CredentialType
 from core.health import HealthResult, HealthState
 from core.models import ChatChunk, ChatRequest, ChatResponse, ModelInfo
 from core.provider import Provider
@@ -47,10 +48,15 @@ class FirebaseProvider(Provider):
         *,
         models: Optional[List[str]] = None,
         http_client: Optional[Any] = None,
+        credential_store: Optional[Any] = None,
     ) -> None:
         self._models = list(models) if models else list(DEFAULT_MODELS)
         self._http = http_client
         self._clients: Dict[str, FirebaseClient] = {}
+        # Optional CredentialStore (AUTH-002).  When a resource carries
+        # credential_id, its api_key/app_id/debug_token material is resolved
+        # from the referenced Credential instead of the legacy fields.
+        self._credential_store = credential_store
 
     # -- lifecycle / resource wiring --
 
@@ -58,6 +64,41 @@ class FirebaseProvider(Provider):
         """Inject an httpx.AsyncClient-compatible object (tests)."""
         self._http = client
         self._clients.clear()
+
+    def set_credential_store(self, store: Any) -> None:
+        """Attach the application-wide credential store (AUTH-002)."""
+        self._credential_store = store
+        self._clients.clear()
+
+    def _credential_for(self, resource: FirebaseResource) -> Optional[Any]:
+        if self._credential_store is None or not resource.credential_id:
+            return None
+        return self._credential_store.get(resource.credential_id)
+
+    def _firebase_material(self, resource: FirebaseResource) -> Dict[str, str]:
+        """Resolve project credentials: Credential payload first, legacy
+        fields as compatibility fallback (AUTH-002).
+
+        ``project_id`` is Resource identity (one Firebase Project = one
+        Resource); the Credential payload's project_id only fills the gap
+        when the Resource itself has none.
+        """
+        credential = self._credential_for(resource)
+        if credential is not None and credential.type is CredentialType.API_KEY:
+            payload = credential.payload
+            return {
+                "project_id": (
+                    resource.project_id or str(payload.get("project_id") or "")
+                ),
+                "app_id": str(payload.get("app_id") or resource.app_id or ""),
+                "api_key": str(payload.get("api_key") or resource.api_key or ""),
+                "debug_token": str(
+                    payload.get("debug_token") or resource.debug_token or ""
+                ),
+            }
+        from providers.firebase.client import resource_material
+
+        return resource_material(resource)
 
     async def _client_for(self, resource: FirebaseResource) -> FirebaseClient:
         """Return (and cache) the client + auth bound to one resource."""
@@ -68,7 +109,11 @@ class FirebaseProvider(Provider):
         if http is None:
             http = self._build_http(resource)
         auth = FirebaseAuth(client=http)
-        client = FirebaseClient(http=http, auth=auth)
+        client = FirebaseClient(
+            http=http,
+            auth=auth,
+            material_resolver=lambda res: self._firebase_material(res),
+        )
         self._clients[resource.id] = client
         return client
 

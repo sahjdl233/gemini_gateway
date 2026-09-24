@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from execution.http import (
     DEFAULT_MAX_CONNECTIONS,
@@ -19,12 +19,23 @@ class AntigravityProviderFactory:
     HttpExecutionBackend, which owns one persistent AsyncClient shared by
     every AntigravityResource. Resource level stays lightweight scheduling
     metadata and never owns transport (TASK-ARCH-003).
+
+    The optional ``credential_store`` (AUTH-002) lets the provider resolve
+    the bearer token from Credential objects referenced by
+    ``resource.credential_id``; resources without a credential_id keep
+    using their legacy access_token field.
     """
+
+    def __init__(self, credential_store: Optional[Any] = None) -> None:
+        self._credential_store = credential_store
 
     def create_provider(self, provider_id: str, config: Any = None) -> AntigravityProvider:
         # Provider must not bind to any account/resource: the Scheduler
         # injects the selected AntigravityResource into complete()/stream().
-        return AntigravityProvider(**_backend_kwargs(config))
+        return AntigravityProvider(
+            credential_store=self._credential_store,
+            **_backend_kwargs(config),
+        )
 
 
 def _backend_kwargs(config: Any) -> Dict[str, Any]:

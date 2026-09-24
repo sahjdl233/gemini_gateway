@@ -5,6 +5,7 @@ import logging
 from codecs import getincrementaldecoder
 from typing import Any, AsyncIterator, Callable, Mapping, Optional, Sequence
 
+from core.credential import CredentialType
 from core.errors import ProtocolError, ProviderError
 from core.health import HealthResult, HealthState
 from core.model_registry import ModelInfo
@@ -16,7 +17,7 @@ from execution.http import HttpExecutionBackend
 from protocol.common import new_id
 from transport.proxy import ProxyConfig
 
-from .client import AntigravityClient
+from .client import AntigravityClient, resource_access_token
 from .model_discovery import ModelDiscovery
 from .resource import AntigravityResource
 
@@ -75,6 +76,7 @@ class AntigravityProvider(Provider):
         base_headers: Optional[Mapping[str, str]] = None,
         max_connections: int = 20,
         max_keepalive_connections: int = 8,
+        credential_store: Optional[Any] = None,
     ) -> None:
         self.backend = backend or HttpExecutionBackend(
             timeout_seconds=timeout_seconds,
@@ -83,13 +85,40 @@ class AntigravityProvider(Provider):
             max_connections=max_connections,
             max_keepalive_connections=max_keepalive_connections,
         )
-        self.client = client or AntigravityClient(backend=self.backend)
+        # Optional CredentialStore (AUTH-002).  When a resource carries
+        # credential_id, its bearer token is resolved from the referenced
+        # Credential; resources without one keep using their access_token
+        # field.  No OAuth refresh lives here (CURRENT: bearer token only).
+        self._credential_store = credential_store
+        self.client = client or AntigravityClient(
+            backend=self.backend,
+            token_resolver=self._access_token_for,
+        )
         self.discovery = ModelDiscovery(self.client)
         # A controlled, read-only resource view supplied by the application
         # lifecycle. The provider does not own, create, or persist resources
         # from this source.
         self._discovery_resource_source: Optional[DiscoveryResourceSource] = None
         self._last_resource: Optional[AntigravityResource] = None
+
+    def set_credential_store(self, store: Any) -> None:
+        """Attach the application-wide credential store (AUTH-002)."""
+        self._credential_store = store
+
+    def _credential_for(self, resource: AntigravityResource) -> Optional[Any]:
+        if self._credential_store is None or not resource.credential_id:
+            return None
+        return self._credential_store.get(resource.credential_id)
+
+    def _access_token_for(self, resource: AntigravityResource) -> Optional[str]:
+        """Resolve the bearer token: Credential payload first, legacy
+        access_token field as compatibility fallback (AUTH-002)."""
+        credential = self._credential_for(resource)
+        if credential is not None and credential.type is CredentialType.OAUTH:
+            token = credential.payload.get("access_token")
+            if token:
+                return str(token)
+        return resource_access_token(resource)
 
     def set_discovery_resource_source(
         self, source: DiscoveryResourceSource

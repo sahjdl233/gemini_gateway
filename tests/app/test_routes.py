@@ -91,7 +91,11 @@ def test_app_shutdown_closes_provider_backends(monkeypatch):
     class Scheduler:
         providers = {"fake": provider}
 
-    monkeypatch.setattr("app.main.build_runtime", lambda config: Scheduler())
+    # build_runtime now also receives the application credential store
+    # (AUTH-002); the stub ignores both arguments.
+    monkeypatch.setattr(
+        "app.main.build_runtime", lambda config, credential_store=None: Scheduler()
+    )
     with TestClient(create_app({})) as client:
         assert client.get("/").status_code == 200
     assert provider.closed is True

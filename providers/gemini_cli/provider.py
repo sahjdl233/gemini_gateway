@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 from typing import Any, AsyncIterator, Dict, List, Optional
 
+from core.credential import CredentialType
 from core.health import HealthResult, HealthState
 from core.models import ChatChunk, ChatRequest, ChatResponse, ModelInfo
 from core.provider import Provider
@@ -48,10 +49,40 @@ class GeminiCliProvider(Provider):
         self,
         *,
         models: Optional[List[str]] = None,
+        credential_store: Optional[Any] = None,
     ) -> None:
         self._models: List[str] = list(models) if models else list(DEFAULT_MODELS)
         self._http: Optional[Any] = None
         self._clients: Dict[str, GeminiCliClient] = {}
+        # Optional CredentialStore (AUTH-002).  When a resource carries
+        # credential_id, its long-lived OAuth material is resolved from the
+        # referenced Credential instead of the legacy Resource fields.
+        self._credential_store = credential_store
+
+    def set_credential_store(self, store: Any) -> None:
+        """Attach the application-wide credential store (AUTH-002)."""
+        self._credential_store = store
+        self._clients.clear()
+
+    def _credential_for(self, resource: GeminiCliResource) -> Optional[Any]:
+        if self._credential_store is None or not resource.credential_id:
+            return None
+        return self._credential_store.get(resource.credential_id)
+
+    def _oauth_material(self, resource: GeminiCliResource) -> Dict[str, str]:
+        """Resolve OAuth material: Credential payload first, legacy fields as
+        compatibility fallback (AUTH-002)."""
+        credential = self._credential_for(resource)
+        if credential is not None and credential.type is CredentialType.OAUTH:
+            payload = credential.payload
+            return {
+                "refresh_token": str(payload.get("refresh_token") or ""),
+                "client_id": str(payload.get("client_id") or ""),
+                "client_secret": str(payload.get("client_secret") or ""),
+            }
+        from providers.gemini_cli.auth import resource_material
+
+        return resource_material(resource)
 
     def set_http_client(self, client: Any) -> None:
         """Inject an httpx.AsyncClient-compatible object (tests)."""
@@ -65,7 +96,10 @@ class GeminiCliProvider(Provider):
         http = self._http
         if http is None:
             http = self._build_http(resource)
-        auth = GeminiCliAuth(http=http)
+        auth = GeminiCliAuth(
+            http=http,
+            material_resolver=lambda res: self._oauth_material(res),
+        )
         client = GeminiCliClient(http=http, auth=auth)
         self._clients[resource.id] = client
         return client

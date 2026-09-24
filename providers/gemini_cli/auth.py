@@ -27,6 +27,20 @@ PRE_REFRESH_SECONDS = 180  # refresh 3 minutes before expiry (TASK-007:5)
 MAX_REFRESH_ATTEMPTS = 3  # hard cap; no infinite refresh
 
 
+def resource_material(resource: Any) -> dict:
+    """Legacy material source: read OAuth fields straight off the Resource.
+
+    AUTH-002 compatibility path.  When a resource carries ``credential_id``
+    the provider binds a resolver that prefers the Credential payload; this
+    fallback keeps resources without a Credential working unchanged.
+    """
+    return {
+        "refresh_token": getattr(resource, "refresh_token", "") or "",
+        "client_id": getattr(resource, "client_id", "") or "",
+        "client_secret": getattr(resource, "client_secret", "") or "",
+    }
+
+
 class GeminiCliAuth:
     """Manages one OAuth access token (single account/resource)."""
 
@@ -36,6 +50,7 @@ class GeminiCliAuth:
         *,
         token_url: str = DEFAULT_TOKEN_URL,
         clock: Optional[Any] = None,
+        material_resolver: Optional[Any] = None,
     ) -> None:
         self._http = http
         self._token_url = token_url
@@ -44,6 +59,10 @@ class GeminiCliAuth:
         self._access_token: Optional[str] = None
         self._expires_at: float = 0.0
         self._consecutive_refresh_failures = 0
+        # Optional callable (resource) -> {refresh_token, client_id,
+        # client_secret}.  Defaults to the legacy Resource-field source;
+        # the provider binds a Credential-aware resolver (AUTH-002).
+        self._material_resolver = material_resolver or resource_material
 
     # -- token expiry -------------------------------------------------------
 
@@ -94,10 +113,11 @@ class GeminiCliAuth:
 
     def as_dict(self, resource: Any) -> dict:
         """Credential snapshot (client_id/secret/tokens) for onboarding use."""
+        material = self._material_resolver(resource)
         return {
-            "client_id": resource.client_id,
-            "client_secret": resource.client_secret,
-            "refresh_token": resource.refresh_token,
+            "client_id": material["client_id"],
+            "client_secret": material["client_secret"],
+            "refresh_token": material["refresh_token"],
             "token": resource.access_token or self._access_token or "",
             "token_uri": self._token_url,
         }
@@ -106,13 +126,14 @@ class GeminiCliAuth:
 
     async def _refresh(self, resource: Any) -> tuple:
         """POST refresh_token grant; returns (access_token, expires_in)."""
-        if not resource.refresh_token:
+        material = self._material_resolver(resource)
+        if not material["refresh_token"]:
             raise GeminiCliAuthError(
                 "gemini_cli auth: no refresh_token configured",
                 provider="gemini_cli",
                 resource_id=resource.id,
             )
-        if not resource.client_id or not resource.client_secret:
+        if not material["client_id"] or not material["client_secret"]:
             raise GeminiCliAuthError(
                 "gemini_cli auth: client_id/client_secret not configured",
                 provider="gemini_cli",
@@ -123,9 +144,9 @@ class GeminiCliAuth:
                 self._token_url,
                 headers={"Content-Type": "application/x-www-form-urlencoded"},
                 data={
-                    "client_id": resource.client_id,
-                    "client_secret": resource.client_secret,
-                    "refresh_token": resource.refresh_token,
+                    "client_id": material["client_id"],
+                    "client_secret": material["client_secret"],
+                    "refresh_token": material["refresh_token"],
                     "grant_type": "refresh_token",
                 },
             )
