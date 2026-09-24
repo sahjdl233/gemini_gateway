@@ -5,7 +5,16 @@ from typing import Any, Mapping, Optional
 import logging
 
 from execution.base import ExecutionBackend
-from core.errors import RateLimitError
+from core.errors import (
+    AuthenticationError,
+    AuthorizationError,
+    InvalidRequestError,
+    ModelNotFoundError,
+    NetworkError,
+    ProtocolError,
+    RateLimitError,
+    UpstreamUnavailableError,
+)
 
 from .resource import AntigravityResource
 
@@ -60,17 +69,77 @@ class AntigravityClient:
         )
         status_code = resp.status_code
         if status_code >= 400:
-            if status_code == 429:
-                raise RateLimitError(
-                    "Antigravity upstream rate-limited (429)",
-                    provider="antigravity",
-                )
-            raise RuntimeError(
-                "Antigravity upstream error HTTP %s: %s",
+            self._raise_http_error(
                 status_code,
-                resp.text[:512],
+                str(getattr(resp, "text", ""))[:512],
+                resource,
+                getattr(resp, "headers", None),
             )
-        return resp.json()
+        try:
+            data = resp.json()
+        except (TypeError, ValueError) as exc:
+            raise ProtocolError(
+                "Antigravity upstream returned malformed JSON",
+                provider="antigravity",
+                resource_id=resource.id,
+            ) from exc
+        if not isinstance(data, dict):
+            raise ProtocolError(
+                "Antigravity upstream returned a non-object JSON response",
+                provider="antigravity",
+                resource_id=resource.id,
+            )
+        return data
+
+    @staticmethod
+    async def _stream_error_text(resp: Any, limit: int = 512) -> str:
+        """Read a bounded error body and always release the response."""
+        parts: list[str] = []
+        size = 0
+        try:
+            async for chunk in resp.aiter_text():
+                text = str(chunk)
+                if size >= limit:
+                    break
+                parts.append(text[: limit - size])
+                size += len(parts[-1])
+        finally:
+            await resp.aclose()
+        return "".join(parts)
+
+    @staticmethod
+    def _raise_http_error(
+        status_code: int,
+        body: str,
+        resource: AntigravityResource,
+        headers: Any = None,
+    ) -> None:
+        error_types = {
+            400: InvalidRequestError,
+            401: AuthenticationError,
+            403: AuthorizationError,
+            404: ModelNotFoundError,
+            429: RateLimitError,
+            500: UpstreamUnavailableError,
+            502: NetworkError,
+            503: UpstreamUnavailableError,
+        }
+        error_type = error_types.get(status_code, UpstreamUnavailableError)
+        retry_after = None
+        if status_code == 429 and headers is not None:
+            raw_retry_after = headers.get("retry-after")
+            if raw_retry_after is not None:
+                try:
+                    retry_after = float(raw_retry_after)
+                except (TypeError, ValueError):
+                    retry_after = None
+        raise error_type(
+            "Antigravity upstream error HTTP %s: %s"
+            % (status_code, body or "<empty response body>"),
+            provider="antigravity",
+            resource_id=resource.id,
+            retry_after=retry_after,
+        )
 
     async def fetch_available_models(
         self,
@@ -110,14 +179,11 @@ class AntigravityClient:
         )
         status_code = resp.status_code
         if status_code >= 400:
-            if status_code == 429:
-                raise RateLimitError(
-                    "Antigravity upstream rate-limited (429)",
-                    provider="antigravity",
-                )
-            raise RuntimeError(
-                "Antigravity upstream error HTTP %s: %s",
+            body = await self._stream_error_text(resp)
+            self._raise_http_error(
                 status_code,
-                resp.text[:512],
+                body,
+                resource,
+                getattr(resp, "headers", None),
             )
         return resp

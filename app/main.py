@@ -8,8 +8,9 @@ their resources.  main.py stays agnostic to provider-specific types.
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, AsyncIterator, Dict, Optional
 
 from fastapi import FastAPI
 
@@ -51,6 +52,14 @@ def build_runtime(config: Dict[str, Any]) -> Scheduler:
         pool = InMemoryPool(
             provider=provider_id, resources=resources, cooldown=cooldown
         )
+        # Providers may opt into a controlled, read-only resource view for
+        # discovery. Antigravity uses this to discover models on a cold start;
+        # the provider still does not own or create Resource objects.
+        set_discovery_source = getattr(
+            provider, "set_discovery_resource_source", None
+        )
+        if set_discovery_source is not None:
+            set_discovery_source(lambda pool=pool: tuple(pool.resources))
         pools[provider_id] = pool
 
     model_registry = ModelRegistry(
@@ -76,7 +85,21 @@ def build_runtime(config: Dict[str, Any]) -> Scheduler:
 def create_app(config: Optional[Dict[str, Any]] = None) -> FastAPI:
     cfg = config if config is not None else default_config()
     scheduler = build_runtime(cfg)
-    app = FastAPI(title="Gemini Gateway", version="0.1.0")
+    @asynccontextmanager
+    async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        try:
+            yield
+        finally:
+            for provider in scheduler.providers.values():
+                close = getattr(provider, "close", None)
+                if close is not None:
+                    await close()
+
+    app = FastAPI(
+        title="Gemini Gateway",
+        version="0.1.0",
+        lifespan=lifespan,
+    )
     app.state.scheduler = scheduler
     app.state.config = cfg
     app.include_router(models_router)

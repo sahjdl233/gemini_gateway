@@ -14,7 +14,10 @@ class ModelDiscovery:
 
     async def fetch_models(self, resource: AntigravityResource) -> list[ModelInfo]:
         """Discovery through the provider's shared backend."""
-        data = await self.client.fetch_available_models(resource, {})
+        payload: dict[str, Any] = {}
+        if resource.project_id:
+            payload["project"] = resource.project_id
+        data = await self.client.fetch_available_models(resource, payload)
         return self._parse(data)
 
     def _parse(self, data: Any) -> list[ModelInfo]:

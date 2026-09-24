@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 from pathlib import Path
+
+import httpx
 from fastapi.testclient import TestClient
 
 from app.main import create_app
+from providers.antigravity.factory import AntigravityProviderFactory
+from providers.antigravity.provider import AntigravityProvider
 
 
 def make_app_config():
@@ -61,6 +65,123 @@ def test_chat_completion_non_stream():
     assert body["object"] == "chat.completion"
     assert body["choices"][0]["message"]["content"]
     assert body["choices"][0]["finish_reason"] == "stop"
+
+
+def _antigravity_config(*resources):
+    return {
+        "providers": {
+            "antigravity": {
+                "enabled": True,
+                "resources": list(resources),
+            }
+        }
+    }
+
+
+def test_app_shutdown_closes_provider_backends(monkeypatch):
+    class Provider:
+        def __init__(self):
+            self.closed = False
+
+        async def close(self):
+            self.closed = True
+
+    provider = Provider()
+
+    class Scheduler:
+        providers = {"fake": provider}
+
+    monkeypatch.setattr("app.main.build_runtime", lambda config: Scheduler())
+    with TestClient(create_app({})) as client:
+        assert client.get("/").status_code == 200
+    assert provider.closed is True
+
+
+def test_cold_start_models_and_chat_use_antigravity_resource(monkeypatch):
+    class Backend:
+        def __init__(self):
+            self.calls = []
+
+        async def execute(self, method, url, **kwargs):
+            self.calls.append((method, url, kwargs))
+            if url.endswith(":fetchAvailableModels"):
+                return httpx.Response(
+                    200,
+                    json={"models": {"gemini-cold": {"model": "gemini-cold"}}},
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "response": {
+                        "candidates": [
+                            {
+                                "content": {"parts": [{"text": "cold-ok"}]},
+                                "finishReason": "STOP",
+                            }
+                        ]
+                    }
+                },
+            )
+
+        async def close(self):
+            pass
+
+    backend = Backend()
+
+    def create_provider(factory, provider_id, config=None):
+        return AntigravityProvider(backend=backend)
+
+    monkeypatch.setattr(
+        AntigravityProviderFactory, "create_provider", create_provider
+    )
+    config = _antigravity_config(
+        {
+            "id": "a",
+            "enabled": False,
+            "access_token": "tok-disabled",
+        },
+        {
+            "id": "b",
+            "enabled": True,
+            "access_token": "tok-b",
+            "project_id": "project-b",
+        },
+    )
+    client = TestClient(create_app(config))
+
+    models = client.get("/v1/models")
+    assert models.status_code == 200
+    assert models.json()["data"] == [
+        {
+            "id": "gemini-cold",
+            "object": "model",
+            "created": 0,
+            "owned_by": "antigravity",
+        }
+    ]
+    assert backend.calls[0][2]["headers"]["Authorization"] == "Bearer tok-b"
+    assert backend.calls[0][2]["json"] == {"project": "project-b"}
+
+    # A separate app has a separate Provider + ModelRegistry.  Posting chat
+    # without first calling /v1/models proves the first request can perform
+    # discovery and then enter the normal Scheduler -> Resource -> Provider
+    # path without a chat prewarm.
+    chat_client = TestClient(create_app(config))
+    chat = chat_client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "gemini-cold",
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    )
+    assert chat.status_code == 200
+    assert chat.json()["choices"][0]["message"]["content"] == "cold-ok"
+    assert backend.calls[-2][1].endswith(":fetchAvailableModels")
+    assert backend.calls[-2][2]["headers"]["Authorization"] == "Bearer tok-b"
+    assert backend.calls[-2][2]["json"] == {"project": "project-b"}
+    assert backend.calls[-1][1].endswith(":generateContent")
+    assert backend.calls[-1][2]["headers"]["Authorization"] == "Bearer tok-b"
+    assert backend.calls[-1][2]["json"]["project"] == "project-b"
 
 
 def test_chat_completion_stream():
