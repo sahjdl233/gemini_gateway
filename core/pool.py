@@ -74,6 +74,24 @@ class InMemoryPool(ResourcePool):
     def resources(self) -> List[Resource]:
         return list(self._resources)
 
+    async def add_resource(self, resource: Resource) -> None:
+        """Add a resource to this existing pool at runtime.
+
+        This is intentionally a small concrete-pool management seam; resource
+        selection and scheduling semantics remain unchanged.
+        """
+        async with self._lock:
+            if any(existing.resource_key == resource.resource_key for existing in self._resources):
+                raise ValueError(f"resource already exists: {resource.id}")
+            self._resources.append(resource)
+
+    async def remove_resource(self, resource: Resource) -> None:
+        """Remove an idle resource from this pool at runtime."""
+        async with self._lock:
+            if resource.in_flight:
+                raise ValueError(f"resource is in flight: {resource.id}")
+            self._resources.remove(resource)
+
     def _eligible(self, skip: Optional[Set[str]] = None) -> List[Resource]:
         eligible: List[Resource] = []
         for resource in self._resources:

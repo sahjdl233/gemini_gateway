@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 import logging
+from pathlib import Path
 from typing import Any, AsyncIterator, Dict, Optional
 
 from fastapi import FastAPI
@@ -17,6 +18,8 @@ from fastapi import FastAPI
 from app.bootstrap import register_builtin_providers
 from app.routes.chat import router as chat_router
 from app.routes.models import router as models_router
+from app.routes.admin import router as admin_router
+from app.management import ResourceManager
 from config.loader import default_config, load_config
 from core.cooldown import CooldownManager
 from core.model_registry import ModelRegistry
@@ -82,9 +85,18 @@ def build_runtime(config: Dict[str, Any]) -> Scheduler:
     return scheduler
 
 
-def create_app(config: Optional[Dict[str, Any]] = None) -> FastAPI:
-    cfg = config if config is not None else default_config()
+def create_app(
+    config: Optional[Dict[str, Any]] = None,
+    *,
+    config_path: Path | str = Path("config.yaml"),
+) -> FastAPI:
+    if config is None:
+        path = Path(config_path)
+        cfg = load_config(path) if path.exists() else default_config()
+    else:
+        cfg = config
     scheduler = build_runtime(cfg)
+    resource_manager = ResourceManager(scheduler, cfg, config_path)
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         try:
@@ -102,8 +114,10 @@ def create_app(config: Optional[Dict[str, Any]] = None) -> FastAPI:
     )
     app.state.scheduler = scheduler
     app.state.config = cfg
+    app.state.resource_manager = resource_manager
     app.include_router(models_router)
     app.include_router(chat_router)
+    app.include_router(admin_router)
 
     @app.get("/", include_in_schema=False)
     async def root():
