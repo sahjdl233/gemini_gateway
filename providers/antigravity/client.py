@@ -2,9 +2,14 @@ from __future__ import annotations
 
 from typing import Any, Mapping, Optional
 
+import logging
+
 from execution.base import ExecutionBackend
+from core.errors import RateLimitError
 
 from .resource import AntigravityResource
+
+logger = logging.getLogger(__name__)
 
 BASE_URL = "https://daily-cloudcode-pa.googleapis.com"
 
@@ -42,12 +47,10 @@ class AntigravityClient:
                 "AntigravityClient needs a provider-owned ExecutionBackend; "
                 "the per-request httpx.Client path has been removed."
             )
-
         endpoint = f"{BASE_URL}/v1internal:{operation}"
         headers = {"Content-Type": "application/json"}
         if resource.access_token:
             headers["Authorization"] = f"Bearer {resource.access_token}"
-
         resp = await self._backend.execute(
             "POST",
             endpoint,
@@ -55,26 +58,66 @@ class AntigravityClient:
             headers=headers,
             timeout=self.timeout,
         )
-
         status_code = resp.status_code
         if status_code >= 400:
+            if status_code == 429:
+                raise RateLimitError(
+                    "Antigravity upstream rate-limited (429)",
+                    provider="antigravity",
+                )
             raise RuntimeError(
-                f"Antigravity request failed for {operation}: HTTP {status_code}: {resp.text}"
+                "Antigravity upstream error HTTP %s: %s",
+                status_code,
+                resp.text[:512],
             )
-
         return resp.json()
-
-    async def request(
-        self,
-        operation: str,
-        resource: AntigravityResource,
-        payload: Mapping[str, Any] | None = None,
-    ) -> Any:
-        return await self._request(operation, resource, payload)
 
     async def fetch_available_models(
         self,
         resource: AntigravityResource,
         payload: Mapping[str, Any] | None = None,
     ) -> Any:
-        return await self._request("fetchAvailableModels", resource, payload)
+        return await self._request(
+            "fetchAvailableModels", resource, payload
+        )
+
+    async def generate_content(
+        self,
+        resource: AntigravityResource,
+        payload: Mapping[str, Any],
+    ) -> Any:
+        return await self._request("generateContent", resource, payload)
+
+    async def stream_generate_content(
+        self,
+        resource: AntigravityResource,
+        payload: Mapping[str, Any],
+    ) -> Any:
+        if self._backend is None:
+            raise RuntimeError(
+                "AntigravityClient needs a provider-owned ExecutionBackend"
+            )
+        endpoint = f"{BASE_URL}/v1internal:streamGenerateContent?alt=sse"
+        headers = {"Content-Type": "application/json"}
+        if resource.access_token:
+            headers["Authorization"] = f"Bearer {resource.access_token}"
+        resp = await self._backend.execute_stream(
+            "POST",
+            endpoint,
+            json=payload or {},
+            headers=headers,
+            timeout=self.timeout,
+        )
+        status_code = resp.status_code
+        if status_code >= 400:
+            if status_code == 429:
+                raise RateLimitError(
+                    "Antigravity upstream rate-limited (429)",
+                    provider="antigravity",
+                )
+            raise RuntimeError(
+                "Antigravity upstream error HTTP %s: %s",
+                status_code,
+                resp.text[:512],
+            )
+        return resp

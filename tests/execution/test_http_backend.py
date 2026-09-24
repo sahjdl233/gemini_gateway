@@ -193,3 +193,93 @@ async def test_per_request_timeout_merges_onto_base_timeout():
     # ...while the shared pool phase keeps the backend-wide base budget.
     assert request_timeout.pool == 30.0
     assert client.requests[0]["kwargs"]["headers"] is None
+
+
+class _StreamingResponse:
+    def __init__(self, chunks, fail_after=None):
+        self.status_code = 200
+        self._chunks = iter(chunks)
+        self._fail_after = fail_after
+
+    def read(self):
+        raise AssertionError("streaming response must not be fully read")
+
+    async def aiter_bytes(self):
+        for index, chunk in enumerate(self._chunks):
+            if self._fail_after is not None and index >= self._fail_after:
+                raise RuntimeError("consumer failed")
+            yield chunk
+
+
+class _StreamContext:
+    def __init__(self, response):
+        self.response = response
+        self.exits = []
+
+    async def __aenter__(self):
+        return self.response
+
+    async def __aexit__(self, exc_type, exc, tb):
+        self.exits.append((exc_type, exc))
+
+
+class _StreamingClient:
+    def __init__(self, chunks, fail_after=None):
+        self.context = _StreamContext(_StreamingResponse(chunks, fail_after))
+        self.calls = []
+        self.aclose_calls = 0
+
+    def stream(self, method, url, **kwargs):
+        self.calls.append((method, url, kwargs))
+        return self.context
+
+    async def aclose(self):
+        self.aclose_calls += 1
+
+
+async def test_execute_stream_yields_sse_chunks_without_buffering_response():
+    client = _StreamingClient([
+        b"data: chunk1\n\n",
+        b"data: chunk2\n\n",
+        b"data: [DONE]\n\n",
+    ])
+    backend = HttpExecutionBackend(client=client, owned=True)
+
+    response = await backend.execute_stream(
+        "POST",
+        "https://upstream.test/v1internal:streamGenerateContent?alt=sse",
+        json={"request": {}},
+        headers={"Authorization": "Bearer resource-token"},
+    )
+
+    received = [chunk async for chunk in response.aiter_bytes()]
+
+    assert received == [
+        b"data: chunk1\n\n",
+        b"data: chunk2\n\n",
+        b"data: [DONE]\n\n",
+    ]
+    assert client.context.exits == [(None, None)]
+    assert client.calls[0][0] == "POST"
+    assert client.calls[0][2]["headers"] == {
+        "Authorization": "Bearer resource-token",
+    }
+
+
+async def test_execute_stream_closes_response_on_consumer_error_only():
+    client = _StreamingClient(
+        [b"data: first\n\n", b"data: second\n\n"],
+        fail_after=1,
+    )
+    backend = HttpExecutionBackend(client=client, owned=True)
+    response = await backend.execute_stream(
+        "POST", "https://upstream.test/stream"
+    )
+
+    with pytest.raises(RuntimeError, match="consumer failed"):
+        async for _ in response.aiter_bytes():
+            pass
+
+    assert len(client.context.exits) == 1
+    assert client.context.exits[0][0] is RuntimeError
+    assert client.aclose_calls == 0

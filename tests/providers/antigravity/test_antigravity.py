@@ -8,6 +8,7 @@ from providers.antigravity.factory import AntigravityProviderFactory, Antigravit
 from providers.antigravity.model_discovery import ModelDiscovery
 from providers.antigravity.provider import AntigravityProvider
 from providers.antigravity.resource import AntigravityResource
+from core.models import ChatMessage, ChatRequest
 
 MODEL_RESPONSE = {"models": {"gemini-test": {"displayName": "Test", "model": "gemini-test"}}}
 
@@ -31,6 +32,45 @@ def test_resource_defaults():
     res = AntigravityResource(id="a")
     assert res.ide_type == "ANTIGRAVITY"
     assert res.provider == "antigravity"
+
+
+def test_function_tool_is_mapped_to_cloud_code_declarations():
+    provider = AntigravityProvider(backend=RecordingBackend())
+    request = ChatRequest(
+        model="gemini-test",
+        messages=[ChatMessage(role="user", content="weather")],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Get weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                    },
+                },
+            }
+        ],
+    )
+    resource = AntigravityResource(id="a", project_id="project-a")
+
+    payload = provider._build_payload(request, resource)
+
+    assert payload["request"]["tools"] == [
+        {
+            "functionDeclarations": [
+                {
+                    "name": "get_weather",
+                    "description": "Get weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                    },
+                }
+            ]
+        }
+    ]
 
 
 async def test_client_uses_bearer_and_v1internal():

@@ -31,7 +31,7 @@ Transport ownership semantics (deliberate):
 
 from __future__ import annotations
 
-from typing import Any, Dict, Mapping, Optional, Protocol
+from typing import Any, AsyncIterator, Dict, Mapping, Optional, Protocol
 
 import httpx
 
@@ -72,6 +72,18 @@ class HttpxClient(Protocol):
     """Subset of ``httpx.AsyncClient`` this backend relies on."""
 
     def request(
+        self,
+        method: str,
+        url: str,
+        *,
+        json: Optional[Mapping[str, Any]] = None,
+        content: Optional[bytes] = None,
+        headers: Optional[Mapping[str, str]] = None,
+        params: Optional[Mapping[str, Any]] = None,
+        timeout: Any = ...,
+    ) -> Any:
+        ...
+    def stream(
         self,
         method: str,
         url: str,
@@ -246,6 +258,41 @@ class HttpExecutionBackend:
             timeout=effective_timeout,
         )
 
+    async def execute_stream(
+        self,
+        method: str,
+        url: str,
+        *,
+        json: Optional[Mapping[str, Any]] = None,
+        data: Optional[bytes] = None,
+        headers: Optional[Mapping[str, str]] = None,
+        params: Optional[Mapping[str, Any]] = None,
+        timeout: Optional[float] = None,
+    ) -> Any:
+        if timeout is None:
+            effective_timeout: Any = Ellipsis
+        else:
+            base_timeout = getattr(self._client, "timeout", None)
+            if base_timeout is None:
+                effective_timeout = httpx.Timeout(timeout)
+            else:
+                effective_timeout = httpx.Timeout(
+                    timeout,
+                    connect=base_timeout.connect,
+                    pool=base_timeout.pool,
+                )
+        stream_context = self._client.stream(
+            method,
+            url,
+            json=dict(json) if json is not None else None,
+            content=data,
+            headers=dict(headers) if headers else None,
+            params=dict(params) if params is not None else None,
+            timeout=effective_timeout,
+        )
+        resp = await stream_context.__aenter__()
+        return StreamResponse(resp, stream_context)
+
     async def close(self) -> None:
         """Shut down the shared client. Idempotent for repeated calls."""
         if not self._owns_client or self._client is None:
@@ -276,3 +323,52 @@ class HttpExecutionBackend:
             f"closed={self._closed}, "
             f"owns_client={self._owns_client})"
         )
+
+class StreamResponse:
+    """Live HTTP response wrapper that preserves the response context.
+
+    The context is entered by ``execute_stream`` and exited exactly once,
+    including when the consumer raises while iterating the body.  The shared
+    ``AsyncClient`` itself is never closed here.
+    """
+
+    def __init__(self, response: Any, context: Any):
+        self._response = response
+        self._context = context
+        self._closed = False
+        self.status_code = response.status_code
+
+    async def aiter_bytes(self) -> AsyncIterator[bytes]:
+        try:
+            async for chunk in self._response.aiter_bytes():
+                yield chunk
+        except BaseException as exc:
+            await self.aclose(exc)
+            raise
+        else:
+            await self.aclose()
+
+    async def aiter_text(self) -> AsyncIterator[str]:
+        try:
+            async for chunk in self._response.aiter_text():
+                yield chunk
+        except BaseException as exc:
+            await self.aclose(exc)
+            raise
+        else:
+            await self.aclose()
+
+    async def aclose(self, exc: Optional[BaseException] = None) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if exc is None:
+            await self._context.__aexit__(None, None, None)
+        else:
+            await self._context.__aexit__(type(exc), exc, exc.__traceback__)
+
+    async def __aenter__(self) -> "StreamResponse":
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        await self.aclose(exc)
