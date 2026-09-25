@@ -195,17 +195,17 @@ class AntigravityAuth:
         token, expires_in, rotated = await self._exchange(
             resource, refresh_token, material
         )
+        if rotated and self._rotation_listener is not None:
+            # Persist FIRST (AUTH-014-FIX-01): a listener failure must
+            # leave NO new runtime state behind — the next call re-runs
+            # the refresh instead of reusing an uncommitted token.  Only
+            # the refresh_token is durable — never the access token or
+            # expiry.
+            self._rotation_listener(resource, rotated)
         self._access_token = token
         self._expires_at = self._now() + expires_in
         if rotated:
-            # Runtime rotation cache first (immediate reuse), then the
-            # listener persists it durably.  Listener exceptions
-            # propagate: refresh success + persistence failure fails
-            # loudly (AUTH-014).  Only the refresh_token is durable —
-            # never the access token or expiry.
             self._rotated_refresh_token = rotated
-            if self._rotation_listener is not None:
-                self._rotation_listener(resource, rotated)
         self._consecutive_refresh_failures = 0
         logger.debug("antigravity.auth refreshed resource=%s", resource.id)
         return token

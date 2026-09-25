@@ -587,3 +587,89 @@ async def test_gemini_rotated_token_survives_adapter_rebuild():
 
     (refresh_call,) = restarted_http.post_calls
     assert refresh_call["data"]["refresh_token"] == "rotated-rt"
+
+
+# -- AUTH-014-FIX-01: persist-before-commit ordering ---------------------------------
+
+
+class FlakyCredentialStore(CredentialStore):
+    """Repository whose update_payload can be toggled to fail."""
+
+    def __init__(self):
+        super().__init__()
+        self.fail = False
+
+    def update_payload(self, credential_id, payload):
+        if self.fail:
+            raise RuntimeError("repository unavailable")
+        return super().update_payload(credential_id, payload)
+
+
+async def test_gemini_rotation_failure_leaves_no_runtime_state():
+    """Rotated token + repository failure: the exception propagates and
+    NO runtime state is committed (no access token, no rotated cache)."""
+    http = FakeHttp()
+    http.responses.append(http.ok(rotated_response("token-A", "rotated-rt")))
+    store = FlakyCredentialStore()
+    store.fail = True
+    store.add(oauth_credential())
+    adapter = make_adapter(store, clock=FakeClock(), http=http)
+    cred = oauth_credential()
+    resource = credentialless_resource()
+
+    with pytest.raises(RuntimeError, match="repository unavailable"):
+        await adapter.get_runtime_credentials(cred, resource)
+
+    assert adapter.auth._access_token is None
+    assert adapter.auth._expires_at == 0.0
+    assert adapter.auth._rotated_refresh_token is None
+
+
+async def test_gemini_repair_then_refresh_reexecutes():
+    """After the repository is repaired, the next call re-runs the whole
+    refresh (no reuse of the failed attempt's uncommitted runtime token)."""
+    http = FakeHttp()
+    http.responses.append(http.ok(rotated_response("token-A", "rotated-rt")))
+    store = FlakyCredentialStore()
+    store.fail = True
+    store.add(oauth_credential())
+    adapter = make_adapter(store, clock=FakeClock(), http=http)
+    cred = oauth_credential()
+    resource = credentialless_resource()
+
+    with pytest.raises(RuntimeError):
+        await adapter.get_runtime_credentials(cred, resource)
+
+    http.responses.append(http.ok(rotated_response("token-B", "")))
+    store.fail = False
+    runtime = await adapter.get_runtime_credentials(cred, resource)
+
+    assert runtime.headers == {"Authorization": "Bearer token-B"}
+    assert adapter.auth._access_token == "token-B"  # fresh, from re-executed refresh
+    assert adapter.auth._rotated_refresh_token is None  # second response: no rotation
+    assert len(http.post_calls) == 2  # refresh ran twice (no state reuse)
+
+
+async def test_gemini_normal_rotation_commits_runtime_after_persistence():
+    """Normal rotation: repository write succeeds first, then the runtime
+    state (token + rotated cache) is committed and the NEXT refresh uses
+    the rotated refresh token."""
+    clock = FakeClock()
+    http = FakeHttp()
+    http.responses.append(http.ok(rotated_response("token-A", "rotated-rt")))
+    http.responses.append(http.ok(rotated_response("token-B", "")))
+    store = CredentialStore()
+    store.add(oauth_credential())
+    adapter = make_adapter(store, clock=clock, http=http)
+    cred = oauth_credential()
+    resource = credentialless_resource()
+
+    await adapter.get_runtime_credentials(cred, resource)
+    assert adapter.auth._access_token == "token-A"
+    assert adapter.auth._rotated_refresh_token == "rotated-rt"
+
+    # jump past the 180s pre-refresh window (expiry 4600) to force refresh
+    clock.value = 4600 - PRE_REFRESH_SECONDS
+    await adapter.get_runtime_credentials(cred, resource)
+    (first_call, second_call) = http.post_calls
+    assert second_call["data"]["refresh_token"] == "rotated-rt"

@@ -719,3 +719,97 @@ def test_provider_builds_one_adapter_per_resource():
 def test_adapter_auth_uses_clock_and_exposes_impl():
     adapter = make_adapter(clock=FakeClock())
     assert isinstance(adapter.auth, AntigravityAuth)
+
+
+# -- AUTH-014-FIX-01: persist-before-commit ordering ---------------------------------
+
+
+class FlakyAntigravityStore(CredentialStore):
+    """Repository whose update_payload can be toggled to fail."""
+
+    def __init__(self):
+        super().__init__()
+        self.fail = False
+
+    def update_payload(self, credential_id, payload):
+        if self.fail:
+            raise RuntimeError("repository unavailable")
+        return super().update_payload(credential_id, payload)
+
+
+async def test_antigravity_rotation_failure_leaves_no_runtime_state():
+    """Rotated token + repository failure: the exception propagates and
+    NO runtime state is committed (no access token, no rotated cache)."""
+    http = FakeHttp()
+    http.responses.append(
+        http.token_ok("token-A", refresh_token="rotated-refresh-token")
+    )
+    store = FlakyAntigravityStore()
+    store.fail = True
+    store.add(oauth_credential())
+    adapter = make_adapter(store, clock=FakeClock(), http=http)
+    cred = oauth_credential()
+    resource = credentialless_resource()
+
+    with pytest.raises(RuntimeError, match="repository unavailable"):
+        await adapter.get_runtime_credentials(cred, resource)
+
+    assert adapter.auth._access_token is None
+    assert adapter.auth._expires_at is None
+    assert adapter.auth._rotated_refresh_token is None
+
+
+async def test_antigravity_repair_then_refresh_reexecutes():
+    """After the repository is repaired, the next call re-runs the whole
+    refresh (no reuse of the failed attempt's uncommitted runtime token)."""
+    http = FakeHttp()
+    http.responses.append(
+        http.token_ok("token-A", refresh_token="rotated-refresh-token")
+    )
+    store = FlakyAntigravityStore()
+    store.fail = True
+    store.add(oauth_credential())
+    adapter = make_adapter(store, clock=FakeClock(), http=http)
+    cred = oauth_credential()
+    resource = credentialless_resource()
+
+    with pytest.raises(RuntimeError):
+        await adapter.get_runtime_credentials(cred, resource)
+
+    http.responses.append(http.token_ok("token-B"))
+    store.fail = False
+    token = await adapter.auth.get_access_token(resource, force=True)
+
+    assert token == "token-B"  # fresh token from a re-executed refresh
+    assert adapter.auth._access_token == "token-B"
+    assert adapter.auth._rotated_refresh_token is None  # second response: no rotation
+    assert len(http.post_calls) == 2  # refresh ran twice (no state reuse)
+
+
+async def test_antigravity_normal_rotation_commits_runtime_after_persistence():
+    """Normal rotation: repository write succeeds first, then the runtime
+    state (token + rotated cache) is committed and the NEXT refresh uses
+    the rotated refresh token."""
+    clock = FakeClock()
+    http = FakeHttp()
+    http.responses.append(
+        http.token_ok("token-A", refresh_token="rotated-refresh-token")
+    )
+    http.responses.append(
+        http.token_ok("token-B", refresh_token="rotated-refresh-token")
+    )
+    store = CredentialStore()
+    store.add(oauth_credential())
+    adapter = make_adapter(store, clock=clock, http=http)
+    cred = oauth_credential()
+    resource = credentialless_resource()
+
+    await adapter.get_runtime_credentials(cred, resource)
+    assert adapter.auth._access_token == "token-A"
+    assert adapter.auth._rotated_refresh_token == "rotated-refresh-token"
+
+    # jump past the antigravity pre-refresh window to force refresh
+    clock.value = 4600 - PRE_REFRESH_SECONDS
+    await adapter.get_runtime_credentials(cred, resource)
+    (first_call, second_call) = http.post_calls
+    assert second_call["data"]["refresh_token"] == "rotated-refresh-token"
