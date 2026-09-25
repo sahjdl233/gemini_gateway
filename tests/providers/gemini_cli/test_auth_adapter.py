@@ -469,3 +469,121 @@ async def test_dangling_credential_id_surfaces_as_401_through_client():
     assert isinstance(exc_info.value, AuthenticationError)
     assert "deleted-credential" in str(exc_info.value)
     assert http.post_calls == []  # no token endpoint call attempted
+
+
+# -- AUTH-014: refresh token rotation persistence ---------------------------------
+
+
+def rotated_response(token: str, rotated: str) -> dict:
+    return {
+        "access_token": token,
+        "expires_in": 3600,
+        "refresh_token": rotated,
+    }
+
+
+async def test_gemini_rotation_persists_to_credential():
+    """A rotated refresh_token in the refresh response is persisted into
+    the bound Credential (only refresh_token changes; client_id/secret
+    preserved; no access token/expiry added)."""
+    http = FakeHttp()
+    http.responses.append(http.ok(rotated_response("token-A", "rotated-rt")))
+    http.responses.append(http.ok(rotated_response("token-B", "")))
+    store = CredentialStore()
+    credential = store.add(oauth_credential())
+    adapter = make_adapter(store, clock=FakeClock(), http=http)
+    cred = oauth_credential()
+    resource = credentialless_resource()
+
+    await adapter.get_runtime_credentials(cred, resource)
+    await adapter.refresh(cred, resource)
+
+    first_call, second_call = http.post_calls
+    assert first_call["data"]["refresh_token"] == "cred-refresh-token"
+    assert second_call["data"]["refresh_token"] == "rotated-rt"
+    assert credential.payload["refresh_token"] == "rotated-rt"
+    assert credential.payload["client_id"] == "cred-client-id"
+    assert credential.payload["client_secret"] == "cred-client-secret"
+    assert "access_token" not in credential.payload
+    assert "expires_at" not in credential.payload
+    # legacy Resource fields are never written back
+    assert resource.refresh_token == ""
+
+
+async def test_gemini_no_rotation_keeps_credential_unchanged():
+    http = FakeHttp()
+    http.responses.append(http.ok(rotated_response("token-A", "")))
+    store = CredentialStore()
+    credential = store.add(oauth_credential())
+    adapter = make_adapter(store, clock=FakeClock(), http=http)
+    cred = oauth_credential()
+    resource = credentialless_resource()
+
+    await adapter.get_runtime_credentials(cred, resource)
+
+    assert credential.payload["refresh_token"] == "cred-refresh-token"
+
+
+async def test_gemini_rotation_persistence_failure_fails_loudly():
+    http = FakeHttp()
+    http.responses.append(http.ok(rotated_response("token-A", "rotated-rt")))
+
+    class FailingStore(CredentialStore):
+        def update_payload(self, credential_id, payload):
+            raise RuntimeError("repository unavailable")
+
+    store = FailingStore()
+    store.add(oauth_credential())
+    adapter = make_adapter(store, clock=FakeClock(), http=http)
+    cred = oauth_credential()
+    resource = credentialless_resource()
+
+    with pytest.raises(RuntimeError, match="repository unavailable"):
+        await adapter.get_runtime_credentials(cred, resource)
+
+
+async def test_gemini_rotation_without_binding_stays_runtime_only():
+    """credential_id=None: rotation stays runtime-only, no repository
+    write, legacy behaviour unchanged (resolver path, no explicit
+    credential)."""
+    http = FakeHttp()
+    http.responses.append(http.ok(rotated_response("token-A", "rotated-rt")))
+    http.responses.append(http.ok(rotated_response("token-B", "")))
+    store = CredentialStore()
+    credential = store.add(oauth_credential())  # exists but not referenced
+    adapter = make_adapter(store, clock=FakeClock(), http=http)
+    legacy_resource = make_resource(credential_id=None)
+
+    await adapter.auth.get_access_token(legacy_resource)
+    await adapter.auth.get_access_token(legacy_resource, force=True)
+
+    first_call, second_call = http.post_calls
+    assert first_call["data"]["refresh_token"] == "refresh-token-1"
+    assert second_call["data"]["refresh_token"] == "rotated-rt"
+    # the unreferenced credential was not touched
+    assert credential.payload["refresh_token"] == "cred-refresh-token"
+
+
+async def test_gemini_rotated_token_survives_adapter_rebuild():
+    """Simulated restart: a fresh adapter over the same repository uses
+    the persisted rotated refresh token (re-fetched from the durable
+    source, not the stale in-memory object)."""
+    http = FakeHttp()
+    http.responses.append(http.ok(rotated_response("token-A", "rotated-rt")))
+    store = CredentialStore()
+    store.add(oauth_credential())
+    adapter = make_adapter(store, clock=FakeClock(), http=http)
+    cred = oauth_credential()
+    resource = credentialless_resource()
+
+    await adapter.refresh(cred, resource)
+    assert store.get("google-oauth-01").payload["refresh_token"] == "rotated-rt"
+
+    restarted_http = FakeHttp()
+    restarted_http.responses.append(restarted_http.token_ok("token-C"))
+    restarted = make_adapter(store, clock=FakeClock(), http=restarted_http)
+    fresh_cred = store.require("google-oauth-01")
+    await restarted.refresh(fresh_cred, resource)
+
+    (refresh_call,) = restarted_http.post_calls
+    assert refresh_call["data"]["refresh_token"] == "rotated-rt"

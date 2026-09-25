@@ -18,11 +18,11 @@ PROTOCOL AUDIT (read-only baseline before this module existed):
 * refresh response: ``access_token`` (required), ``expires_in``
   (relative seconds; defaulted when absent), optional ``refresh_token``
   rotation, ``token_type``/``scope`` ignored.
-* refresh token rotation: never observed in current code (no refresh
-  existed).  Handled opportunistically: a rotated token is kept as
-  RUNTIME state on this instance and used for subsequent refreshes, but
-  is NEVER written back into the Credential payload or any store until
-  AUTH-007/008/009 provide durable persistence.
+* refresh token rotation: handled opportunistically — a rotated token
+  becomes the runtime refresh material immediately, and (AUTH-014) is
+  reported to the adapter's rotation listener for durable persistence
+  into the Credential (listener failures propagate loudly).  Resources
+  without a credential binding keep runtime-only rotation.
 * expiry: ``expires_in`` (relative) -> runtime ``expires_at = now +
   expires_in``.  The legacy ``Resource.token_expiry`` field is declared
   but was never consumed by any code and remains unconsumed (not
@@ -70,12 +70,14 @@ class AntigravityAuth:
         token_url: str = GOOGLE_TOKEN_URL,
         clock: Optional[Any] = None,
         material_resolver: Optional[Any] = None,
+        rotation_listener: Optional[Any] = None,
     ) -> None:
         self._http = http
         self._token_url = token_url
         self._clock = clock if clock is not None else time
         self._lock = asyncio.Lock()
         self._material_resolver = material_resolver
+        self._rotation_listener = rotation_listener
         # Runtime state — never persisted.
         self._access_token: Optional[str] = None
         # None = no known expiry (statically configured token: valid until
@@ -196,7 +198,14 @@ class AntigravityAuth:
         self._access_token = token
         self._expires_at = self._now() + expires_in
         if rotated:
+            # Runtime rotation cache first (immediate reuse), then the
+            # listener persists it durably.  Listener exceptions
+            # propagate: refresh success + persistence failure fails
+            # loudly (AUTH-014).  Only the refresh_token is durable —
+            # never the access token or expiry.
             self._rotated_refresh_token = rotated
+            if self._rotation_listener is not None:
+                self._rotation_listener(resource, rotated)
         self._consecutive_refresh_failures = 0
         logger.debug("antigravity.auth refreshed resource=%s", resource.id)
         return token

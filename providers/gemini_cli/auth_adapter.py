@@ -25,6 +25,9 @@ Boundaries frozen by AUTH-004:
 * The access token is RUNTIME material only.  The adapter never writes
   it back into the Credential payload or any store; ``invalidate()``
   drops the runtime cache and never touches durable material.
+* Rotated refresh tokens (AUTH-014) are persisted into the bound
+  Credential via the repository (refresh_token only); legacy resources
+  keep runtime-only rotation.
 * Runtime cache scope is RESOURCE-scoped: the Provider builds one
   adapter (and therefore one token cache + lock) per Resource, even when
   two Resources share the same credential_id.  Credential sharing does
@@ -76,13 +79,41 @@ class GeminiCliAuthAdapter(ProviderAuthAdapter):
         self._credential_store = credential_store
         # The adapter owns the OAuth implementation instance; the token
         # cache/lock lives here, scoped to one Resource (the Provider
-        # builds one adapter per resource).
+        # builds one adapter per resource).  Rotated refresh tokens are
+        # persisted into the bound Credential (AUTH-014).
         self._auth = GeminiCliAuth(
             http=http,
             token_url=token_url,
             clock=clock,
             material_resolver=self.material_for,
+            rotation_listener=self._persist_rotation,
         )
+
+    def _persist_rotation(self, resource: Any, new_refresh_token: str) -> None:
+        """Durable refresh-token rotation (AUTH-014).
+
+        Only when the resource is credential-bound: the referenced
+        Credential's payload keeps every durable field and gets ONLY its
+        ``refresh_token`` replaced (never the access token or expiry).
+        Legacy resources (``credential_id=None``) keep runtime-only
+        rotation — no repository write.  Persistence failures propagate:
+        a refresh whose rotated token cannot be durably stored fails
+        loudly.
+        """
+        if self._credential_store is None or not resource.credential_id:
+            return
+        credential = self._credential_store.get(resource.credential_id)
+        if credential is None:
+            raise CredentialUnavailableError(
+                f"credential '{resource.credential_id}' referenced by "
+                f"resource '{resource.id}' is not registered; cannot "
+                "persist the rotated refresh token",
+                provider=self.provider_id,
+                resource_id=resource.id,
+            )
+        payload = dict(credential.payload)
+        payload["refresh_token"] = new_refresh_token
+        self._credential_store.update_payload(resource.credential_id, payload)
 
     @property
     def auth(self) -> GeminiCliAuth:

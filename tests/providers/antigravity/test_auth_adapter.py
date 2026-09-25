@@ -414,9 +414,10 @@ async def test_malformed_token_response_maps_to_credential_refresh_failure():
 # -- 32 refresh token rotation -----------------------------------------------------------------
 
 
-async def test_refresh_token_rotation_is_runtime_only():
-    """A rotated refresh_token from the response is used for subsequent
-    refreshes but NEVER written back into the Credential."""
+async def test_refresh_token_rotation_persists_to_credential():
+    """AUTH-014: a rotated refresh_token is used for subsequent refreshes
+    AND persisted into the bound Credential (only refresh_token changes;
+    client_id/client_secret preserved; no access token/expiry added)."""
     http = FakeHttp()
     http.responses.append(
         http.token_ok("token-A", refresh_token="rotated-refresh-token")
@@ -434,9 +435,99 @@ async def test_refresh_token_rotation_is_runtime_only():
     first_call, second_call = http.post_calls
     assert first_call["data"]["refresh_token"] == "cred-refresh-token"
     assert second_call["data"]["refresh_token"] == "rotated-refresh-token"
-    # durable credential untouched (no accidental persistence)
-    assert credential.payload["refresh_token"] == "cred-refresh-token"
-    assert "rotated-refresh-token" not in str(credential.payload)
+    # durable credential now carries the rotated token
+    assert credential.payload["refresh_token"] == "rotated-refresh-token"
+    # other durable fields preserved; runtime material not persisted
+    assert credential.payload["client_id"] == "cred-client-id"
+    assert credential.payload["client_secret"] == "cred-client-secret"
+    assert "access_token" not in credential.payload
+    assert "expires_at" not in credential.payload
+    assert "token-A" not in str(credential.payload)
+    # legacy Resource fields are never written back
+    assert resource.refresh_token is None
+
+
+async def test_rotated_token_survives_adapter_rebuild():
+    """Simulated restart: a fresh adapter over the same repository reads
+    the persisted rotated refresh token as its durable source (the
+    stale in-memory credential object is NOT used — the store is)."""
+    http = FakeHttp()
+    http.responses.append(
+        http.token_ok("token-A", refresh_token="rotated-refresh-token")
+    )
+    http.responses.append(http.token_ok("token-B"))
+    store = _store_with(oauth_credential())
+    adapter = make_adapter(store, clock=FakeClock(), http=http)
+    cred = oauth_credential()
+    resource = credentialless_resource()
+
+    await adapter.refresh(cred, resource)
+    assert store.get("antigravity-oauth-01").payload["refresh_token"] == (
+        "rotated-refresh-token"
+    )
+
+    # "restart": new adapter over the same store; the caller re-fetches
+    # the credential from the durable source
+    restarted_http = FakeHttp()
+    restarted_http.responses.append(restarted_http.token_ok("token-C"))
+    restarted = make_adapter(store, clock=FakeClock(), http=restarted_http)
+    fresh_cred = store.require("antigravity-oauth-01")
+    await restarted.refresh(fresh_cred, resource)
+
+    (refresh_call,) = restarted_http.post_calls
+    assert refresh_call["data"]["refresh_token"] == "rotated-refresh-token"
+
+
+async def test_rotation_persistence_failure_fails_loudly():
+    """Refresh succeeds but the repository write fails -> the failure
+    propagates (never swallowed)."""
+    http = FakeHttp()
+    http.responses.append(
+        http.token_ok("token-A", refresh_token="rotated-refresh-token")
+    )
+
+    class FailingStore(CredentialStore):
+        def update_payload(self, credential_id, payload):
+            raise RuntimeError("repository unavailable")
+
+    store = FailingStore()
+    store.add(oauth_credential())
+    adapter = make_adapter(store, clock=FakeClock(), http=http)
+    cred = oauth_credential()
+    resource = credentialless_resource()
+
+    with pytest.raises(RuntimeError, match="repository unavailable"):
+        await adapter.get_runtime_credentials(cred, resource)
+
+
+async def test_rotation_without_credential_binding_stays_runtime_only():
+    """credential_id=None: rotation stays runtime-only, no repository
+    write, legacy behaviour unchanged (resolver path, no explicit
+    credential)."""
+    http = FakeHttp()
+    http.responses.append(
+        http.token_ok("token-A", refresh_token="rotated-refresh-token")
+    )
+    http.responses.append(http.token_ok("token-B"))
+    store = _store_with(oauth_credential())  # store exists but unused
+    adapter = make_adapter(store, clock=FakeClock(), http=http)
+    legacy_resource = AntigravityResource(
+        id="legacy",
+        refresh_token="legacy-rt",
+        client_id="legacy-cid",
+        client_secret="legacy-cs",
+    )
+
+    await adapter.auth.get_access_token(legacy_resource)
+    await adapter.auth.get_access_token(legacy_resource, force=True)
+
+    first_call, second_call = http.post_calls
+    assert first_call["data"]["refresh_token"] == "legacy-rt"
+    assert second_call["data"]["refresh_token"] == "rotated-refresh-token"
+    # no repository write happened (the bound credential is untouched)
+    assert store.get("antigravity-oauth-01").payload["refresh_token"] == (
+        "cred-refresh-token"
+    )
 
 
 async def test_no_rotation_in_response_keeps_original_token():

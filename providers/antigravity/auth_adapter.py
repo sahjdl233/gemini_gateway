@@ -33,6 +33,10 @@ Credential mapping (canonical vs compatibility):
 Cache scope: RESOURCE-scoped (one adapter / token cache / lock per
 Resource, even when Resources share a credential_id).
 
+Rotated refresh tokens (AUTH-014) are persisted into the bound
+Credential via the repository (refresh_token only); legacy resources
+keep runtime-only rotation.
+
 Failure mapping (all ProviderErrors from core.errors):
 
 * refresh credential/material problems -> ``CredentialRefreshFailure``
@@ -86,7 +90,11 @@ class AntigravityAuthAdapter(ProviderAuthAdapter):
         clock: Optional[Any] = None,
     ) -> None:
         self._credential_store = credential_store
-        kwargs: dict = {"http": http, "material_resolver": self.material_for}
+        kwargs: dict = {
+            "http": http,
+            "material_resolver": self.material_for,
+            "rotation_listener": self._persist_rotation,
+        }
         if token_url is not None:
             kwargs["token_url"] = token_url
         if clock is not None:
@@ -94,6 +102,32 @@ class AntigravityAuthAdapter(ProviderAuthAdapter):
         # The adapter owns the OAuth implementation instance; the token
         # cache / lock / rotation state live here, scoped to one Resource.
         self._auth = AntigravityAuth(**kwargs)
+
+    def _persist_rotation(self, resource: Any, new_refresh_token: str) -> None:
+        """Durable refresh-token rotation (AUTH-014).
+
+        Only when the resource is credential-bound: the referenced
+        Credential's payload keeps every durable field and gets ONLY its
+        ``refresh_token`` replaced (never the access token or expiry).
+        Legacy resources (``credential_id=None``) keep runtime-only
+        rotation — no repository write.  Persistence failures propagate:
+        a refresh whose rotated token cannot be durably stored fails
+        loudly.
+        """
+        if self._credential_store is None or not resource.credential_id:
+            return
+        credential = self._credential_store.get(resource.credential_id)
+        if credential is None:
+            raise CredentialUnavailableError(
+                f"credential '{resource.credential_id}' referenced by "
+                f"resource '{resource.id}' is not registered; cannot "
+                "persist the rotated refresh token",
+                provider=self.provider_id,
+                resource_id=resource.id,
+            )
+        payload = dict(credential.payload)
+        payload["refresh_token"] = new_refresh_token
+        self._credential_store.update_payload(resource.credential_id, payload)
 
     @property
     def auth(self) -> AntigravityAuth:

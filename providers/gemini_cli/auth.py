@@ -51,6 +51,7 @@ class GeminiCliAuth:
         token_url: str = DEFAULT_TOKEN_URL,
         clock: Optional[Any] = None,
         material_resolver: Optional[Any] = None,
+        rotation_listener: Optional[Any] = None,
     ) -> None:
         self._http = http
         self._token_url = token_url
@@ -59,6 +60,15 @@ class GeminiCliAuth:
         self._access_token: Optional[str] = None
         self._expires_at: float = 0.0
         self._consecutive_refresh_failures = 0
+        # Runtime rotation state (AUTH-014): newest refresh token seen in
+        # a refresh response, preferred over the resolved material until
+        # the durable Credential is updated by the rotation listener.
+        self._rotated_refresh_token: Optional[str] = None
+        # Optional callable (resource, new_refresh_token) -> None, invoked
+        # after a successful refresh that returned a rotated token.
+        # Exceptions from the listener propagate: a refresh whose rotated
+        # token cannot be persisted fails loudly (never swallowed).
+        self._rotation_listener = rotation_listener
         # Optional callable (resource) -> {refresh_token, client_id,
         # client_secret}.  Defaults to the legacy Resource-field source;
         # the provider binds a Credential-aware resolver (AUTH-002).
@@ -111,15 +121,29 @@ class GeminiCliAuth:
                     provider="gemini_cli",
                     resource_id=resource.id,
                 )
-            token, expires_in = await self._refresh(resource, material)
+            token, expires_in, rotated = await self._refresh(resource, material)
             self._access_token = token
             self._expires_at = self._now() + float(expires_in)
+            if rotated:
+                # Runtime rotation cache first (immediate reuse), then the
+                # listener persists it durably.  Listener exceptions
+                # propagate: refresh success + persistence failure fails
+                # loudly (AUTH-014).  Only the refresh_token is durable —
+                # never the access token or expiry.
+                self._rotated_refresh_token = rotated
+                if self._rotation_listener is not None:
+                    self._rotation_listener(resource, rotated)
             self._consecutive_refresh_failures = 0
             logger.debug("gemini_cli.auth refreshed resource=%s", resource.id)
             return token
 
     def invalidate(self) -> None:
-        """Drop the cached token (called on 401 before a force refresh)."""
+        """Drop the cached token (called on 401 before a force refresh).
+
+        The rotated refresh token (runtime rotation state) is kept: it is
+        the newest known valid refresh material; dropping it would force
+        use of a possibly-revoked older token.
+        """
         self._access_token = None
         self._expires_at = 0.0
 
@@ -137,14 +161,16 @@ class GeminiCliAuth:
     # -- internals ----------------------------------------------------------
 
     async def _refresh(self, resource: Any, material: Optional[dict] = None) -> tuple:
-        """POST refresh_token grant; returns (access_token, expires_in).
+        """POST refresh_token grant.
 
-        ``material`` overrides the resolver-derived OAuth material
-        (explicit Credential payload from the auth adapter); the resolver
-        fallback keeps legacy/credential_id resources working unchanged.
+        Returns ``(access_token, expires_in, rotated_refresh_token|None)``.
+        A previously rotated token (runtime state) takes precedence over
+        the resolved material's refresh_token.  The response's optional
+        ``refresh_token`` is captured as rotation.
         """
         material = material or self._material_resolver(resource)
-        if not material["refresh_token"]:
+        effective_refresh = self._rotated_refresh_token or material["refresh_token"]
+        if not effective_refresh:
             raise GeminiCliAuthError(
                 "gemini_cli auth: no refresh_token configured",
                 provider="gemini_cli",
@@ -163,7 +189,7 @@ class GeminiCliAuth:
                 data={
                     "client_id": material["client_id"],
                     "client_secret": material["client_secret"],
-                    "refresh_token": material["refresh_token"],
+                    "refresh_token": effective_refresh,
                     "grant_type": "refresh_token",
                 },
             )
@@ -198,4 +224,5 @@ class GeminiCliAuth:
                 provider="gemini_cli",
                 resource_id=resource.id,
             ) from exc
-        return token, expires_in
+        rotated = data.get("refresh_token") or None
+        return token, expires_in, rotated
