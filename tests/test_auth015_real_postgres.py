@@ -15,6 +15,13 @@ The OAuth token ENDPOINT is simulated with the existing fake HTTP doubles
 (no real Google calls); every durable step — repository, encryption,
 SQL, restarts — runs against the real database.
 
+Isolation (AUTH-015-FIX-01): the suite NEVER touches the database named
+in ``GEMINI_GATEWAY_TEST_DATABASE_URL``.  It derives a DEDICATED test
+database (``<dbname>_auth015_e2e``, created automatically when absent)
+and all statements — including ``DROP TABLE``/``TRUNCATE`` — execute
+only there.  The operator-configured database is only used as the
+connection target for creating the test database.
+
 Opt-in: set ``GEMINI_GATEWAY_TEST_DATABASE_URL`` (standard PostgreSQL
 DSN).  Skipped — and reported as such — when no server is available.
 """
@@ -45,17 +52,37 @@ pytestmark = pytest.mark.skipif(
     ),
 )
 
+TEST_DB_SUFFIX = "_auth015_e2e"
+
+# Dedicated test database DSN, derived by the autouse fixture (None until
+# the first test runs; all statements go here, never to REAL_DSN's db).
+E2E_DSN: str | None = None
+
 ADMIN = {"Authorization": "Bearer e2e-admin-token"}
 ENCRYPTION_KEY = base64.b64encode(os.urandom(32)).decode("ascii")
 ENCRYPTION_KEY_BYTES = base64.b64decode(ENCRYPTION_KEY)
 
 
+def _conninfo_params(dsn: str) -> dict:
+    from psycopg.conninfo import conninfo_to_dict
+
+    return conninfo_to_dict(dsn)
+
+
+def _make_dsn(dsn: str, dbname: str) -> str:
+    from psycopg.conninfo import conninfo_to_dict, make_conninfo
+
+    params = conninfo_to_dict(dsn)
+    params["dbname"] = dbname
+    return make_conninfo(**params)
+
+
 def psql(sql: str, params: tuple | None = None) -> list[dict]:
-    """Run one statement directly against the REAL database."""
+    """Run one statement directly against the dedicated E2E database."""
     import psycopg
     from psycopg.rows import dict_row
 
-    with psycopg.connect(REAL_DSN, row_factory=dict_row) as conn:
+    with psycopg.connect(E2E_DSN, row_factory=dict_row) as conn:
         cursor = conn.execute(sql, params)
         try:
             return cursor.fetchall()
@@ -64,23 +91,43 @@ def psql(sql: str, params: tuple | None = None) -> list[dict]:
 
 
 def e2e_env(monkeypatch) -> None:
-    monkeypatch.setenv("GEMINI_GATEWAY_DATABASE_URL", REAL_DSN)
+    monkeypatch.setenv("GEMINI_GATEWAY_DATABASE_URL", E2E_DSN)
     monkeypatch.setenv("GEMINI_GATEWAY_ENCRYPTION_KEY", ENCRYPTION_KEY)
     monkeypatch.setenv("ADMIN_TOKEN", "e2e-admin-token")
 
 
 @pytest.fixture(autouse=True)
-def clean_table():
-    """Isolation: drop the credentials table before every test (each
-    test's app startup recreates the schema — which is itself part of
-    the acceptance)."""
-    if REAL_DSN:
-        psql("DROP TABLE IF EXISTS credentials")
+def isolated_database():
+    """AUTH-015-FIX-01: derive and create the DEDICATED E2E database, then
+    reset its credentials table before every test (schema auto-init by
+    app startup remains part of the acceptance).  The operator's own
+    database is never written to or dropped."""
+    global E2E_DSN
+    if not REAL_DSN:
+        yield
+        return
+    import psycopg
+
+    params = _conninfo_params(REAL_DSN)
+    base_db = params.get("dbname") or params.get("user") or "postgres"
+    test_db = base_db + TEST_DB_SUFFIX
+    # connect to the operator-provided database ONLY to ensure the test
+    # database exists (CREATE DATABASE cannot run inside a transaction)
+    with psycopg.connect(REAL_DSN, autocommit=True) as conn:
+        exists = conn.execute(
+            "SELECT 1 FROM pg_database WHERE datname = %s", (test_db,)
+        ).fetchone()
+        if not exists:
+            conn.execute(f'CREATE DATABASE "{test_db}"')
+    E2E_DSN = _make_dsn(REAL_DSN, test_db)
+
+    # table reset inside the dedicated database only
+    psql("DROP TABLE IF EXISTS credentials")
     yield
 
 
 def make_app(monkeypatch, database_url: str | None = None):
-    monkeypatch.setenv("GEMINI_GATEWAY_DATABASE_URL", database_url or REAL_DSN)
+    monkeypatch.setenv("GEMINI_GATEWAY_DATABASE_URL", database_url or E2E_DSN)
     monkeypatch.setenv("GEMINI_GATEWAY_ENCRYPTION_KEY", ENCRYPTION_KEY)
     monkeypatch.setenv("ADMIN_TOKEN", "e2e-admin-token")
     config = {
@@ -106,7 +153,7 @@ def make_app(monkeypatch, database_url: str | None = None):
 def make_repo() -> PostgreSQLCredentialRepository:
     return PostgreSQLCredentialRepository(
         __import__("core.credential_postgres", fromlist=["psycopg_connection_factory"])
-        .psycopg_connection_factory(REAL_DSN),
+        .psycopg_connection_factory(E2E_DSN),
         encryptor=CredentialEncryptor(ENCRYPTION_KEY_BYTES),
     )
 
@@ -399,7 +446,13 @@ def json_rotate(token: str, rotated: str | None) -> str:
 
 
 def test_full_restart_acceptance_cycle(monkeypatch):
-    """start → create → rotate → (stop) → restart → rebuild → refresh."""
+    """Full restart acceptance: rotate under app instance #1 → drop that
+    app instance (in-process simulated stop: no server-side caching exists)
+    → start a fresh app over the same database → rebuild provider and
+    adapter from the persisted (rotated) credential → refresh again using
+    the rotated token.  The admin API read confirms the rotated payload is
+    redacted in responses while the rotated token lives encrypted in the
+    dedicated test database."""
     from fastapi.testclient import TestClient as TC
 
     async def first_phase():
