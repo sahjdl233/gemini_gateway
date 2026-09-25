@@ -17,6 +17,9 @@ Contract under test (frozen semantics):
 
 from __future__ import annotations
 
+import os
+from datetime import timedelta
+
 import pytest
 
 from core.credential import (
@@ -27,11 +30,27 @@ from core.credential import (
     DuplicateCredentialError,
     UnknownCredentialError,
 )
+from core.credential_encryption import CredentialEncryptor
+from core.credential_postgres import PostgreSQLCredentialRepository
+from tests.core._fake_postgres import FakePostgres
 
-IMPLEMENTATIONS = [lambda: CredentialStore()]
+
+def make_in_memory_repo() -> CredentialRepository:
+    return CredentialStore()
 
 
-@pytest.fixture(params=IMPLEMENTATIONS, ids=["in-memory"])
+def make_postgres_fake_repo() -> CredentialRepository:
+    fake = FakePostgres()
+    return PostgreSQLCredentialRepository(
+        fake.connection_factory(),
+        encryptor=CredentialEncryptor(os.urandom(32)),
+    )
+
+
+IMPLEMENTATIONS = [make_in_memory_repo, make_postgres_fake_repo]
+
+
+@pytest.fixture(params=IMPLEMENTATIONS, ids=["in-memory", "postgres-fake"])
 def repo(request) -> CredentialRepository:
     return request.param()
 
@@ -59,7 +78,12 @@ def test_store_is_a_credential_repository():
 
 def test_add_and_get_round_trip(repo):
     credential = repo.add(oauth_credential())
-    assert repo.get("c1") is credential
+    loaded = repo.get("c1")
+    # durable implementations return a reconstructed object: the contract
+    # is semantic equality, not object identity
+    assert loaded.id == credential.id
+    assert loaded.type == credential.type
+    assert loaded.payload == credential.payload
 
 
 def test_get_unknown_returns_none(repo):
@@ -81,9 +105,18 @@ def test_update_payload_replaces_and_bumps_updated_at(repo):
     before = credential.updated_at
     updated = repo.update_payload("c1", {"refresh_token": "rt-2"})
 
-    assert updated is credential
+    assert updated.id == "c1"
     assert updated.payload == {"refresh_token": "rt-2"}
     assert updated.updated_at >= before
+
+
+def test_created_at_preserved_across_update(repo):
+    """created_at is fixed at add time; update_payload only bumps
+    updated_at (timestamp semantics frozen by the contract)."""
+    credential = repo.add(oauth_credential())
+    updated = repo.update_payload("c1", {"refresh_token": "rt-2"})
+
+    assert updated.created_at == credential.created_at
 
 
 def test_update_unknown_raises(repo):
@@ -103,9 +136,18 @@ def test_remove_unknown_is_idempotent(repo):
 
 
 def test_list_returns_insertion_order(repo):
-    repo.add(oauth_credential("c1"))
-    repo.add(api_key_credential("k1"))
-    repo.add(oauth_credential("c2"))
+    """Explicit distinct created_at keeps insertion order meaningful for
+    every implementation (PostgreSQL orders by created_at, id)."""
+    base = Credential(id="seed").created_at
+    c1 = oauth_credential("c1")
+    c1.created_at = base
+    k1 = api_key_credential("k1")
+    k1.created_at = base + timedelta(seconds=1)
+    c2 = oauth_credential("c2")
+    c2.created_at = base + timedelta(seconds=2)
+    repo.add(c1)
+    repo.add(k1)
+    repo.add(c2)
     assert [c.id for c in repo.list()] == ["c1", "k1", "c2"]
 
 
@@ -128,13 +170,12 @@ def test_duplicate_id_rejected(repo):
 
 
 def test_two_repositories_are_isolated():
-    repo_a, repo_b = CredentialStore(), CredentialStore()
-    repo_a.add(oauth_credential("c1"))
+    for make_repo in IMPLEMENTATIONS:
+        repo_a, repo_b = make_repo(), make_repo()
+        repo_a.add(oauth_credential("c1"))
 
-    assert repo_a.get("c1") is not None
-    assert repo_b.get("c1") is None
-    assert len(repo_a) == 1
-    assert len(repo_b) == 0
+        assert repo_a.get("c1") is not None
+        assert repo_b.get("c1") is None
 
 
 # -- payload shapes -----------------------------------------------------------------

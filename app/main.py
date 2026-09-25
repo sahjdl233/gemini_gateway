@@ -22,7 +22,12 @@ from app.routes.admin import router as admin_router
 from app.management import ResourceManager
 from config.loader import default_config, load_config
 from core.cooldown import CooldownManager
-from core.credential import Credential, CredentialStore
+from core.credential import (
+    Credential,
+    CredentialRepository,
+    CredentialStore,
+    DuplicateCredentialError,
+)
 from core.model_registry import ModelRegistry
 from core.pool import InMemoryPool
 from core.provider_registry import ProviderRegistry, UnknownProviderError
@@ -31,23 +36,67 @@ from core.scheduler import Scheduler
 logger = logging.getLogger(__name__)
 
 
-def build_credential_store(config: Dict[str, Any]) -> CredentialStore:
-    """Build the application-wide credential store from config (AUTH-002).
+def build_credential_store(config: Dict[str, Any]) -> CredentialRepository:
+    """Build the credential repository from config (AUTH-002/AUTH-009).
 
-    Optional top-level ``credentials`` list; each entry is
-    ``{id, type, payload}``.  Values may use ``${ENV_VAR}`` placeholders
-    (resolved by the config loader).  Plaintext storage is the current
-    state; encryption arrives with AUTH-007.
+    Default (and default-when-unconfigured) backend is the in-memory
+    ``CredentialStore``.  Explicitly selecting
+    ``credential_repository.backend: postgres`` builds the durable
+    repository: the database URL comes from
+    ``GEMINI_GATEWAY_DATABASE_URL``, the payload encryption key from
+    ``GEMINI_GATEWAY_ENCRYPTION_KEY`` (AUTH-007), and ANY failure —
+    missing configuration, unreachable database, schema error —
+    propagates as a startup failure.  A silent fallback to an empty
+    in-memory store is deliberately not implemented: infrastructure
+    failure must not masquerade as credential-not-found.
     """
-    store = CredentialStore()
+    repo_cfg = config.get("credential_repository") or {}
+    backend = str(repo_cfg.get("backend", "memory")).lower()
+    if backend == "memory":
+        store = CredentialStore()
+        for entry in config.get("credentials") or []:
+            store.add(Credential.model_validate(entry))
+        return store
+    if backend == "postgres":
+        return _build_postgres_credential_repository(config)
+    raise ValueError(f"unknown credential repository backend: {backend!r}")
+
+
+def _build_postgres_credential_repository(
+    config: Dict[str, Any],
+) -> CredentialRepository:
+    import os
+
+    from core.credential_encryption import CredentialEncryptor
+    from core.credential_postgres import (
+        PostgreSQLCredentialRepository,
+        psycopg_connection_factory,
+    )
+
+    dsn = os.environ.get("GEMINI_GATEWAY_DATABASE_URL")
+    if not dsn:
+        raise RuntimeError(
+            "credential_repository.backend=postgres requires the "
+            "GEMINI_GATEWAY_DATABASE_URL environment variable"
+        )
+    encryptor = CredentialEncryptor.from_environment()
+    repository = PostgreSQLCredentialRepository(
+        psycopg_connection_factory(dsn), encryptor=encryptor
+    )
+    repository.initialize()
+
     for entry in config.get("credentials") or []:
-        store.add(Credential.model_validate(entry))
-    return store
+        credential = Credential.model_validate(entry)
+        try:
+            repository.add(credential)
+        except DuplicateCredentialError:
+            logger.info("credential.already_persisted id=%s", credential.id)
+    return repository
 
 
 def build_runtime(
     config: Dict[str, Any],
-    credential_store: Optional[CredentialStore] = None,
+    credential_store: Optional[CredentialRepository] = None,
 ) -> Scheduler:
     registry = ProviderRegistry()
     register_builtin_providers(registry)

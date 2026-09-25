@@ -22,6 +22,17 @@ scheduler:
 model_registry:
   refresh_interval: 300   # 模型索引 TTL（秒）；过期的索引会被并发安全地刷新
 
+# ---- AUTH-009: Credential 持久化后端（可选）----
+# 缺省为 memory（进程内 CredentialStore，AUTH-002/008）。显式选择 postgres
+# 启用加密落库（AUTH-007 envelope + AAD 绑定 id/type）：
+#   - 连接串来自环境变量 GEMINI_GATEWAY_DATABASE_URL（标准 PostgreSQL DSN，
+#     Supabase 直连或 session pooler 均可，属部署配置）
+#   - 加密主密钥来自 GEMINI_GATEWAY_DATABASE_URL 之外的独立环境变量
+#     GEMINI_GATEWAY_ENCRYPTION_KEY（AUTH-007）
+#   - 数据库不可达 / 配置缺失 → 启动失败（绝不静默回退到空内存库）
+# credential_repository:
+#   backend: postgres
+
 # ---- AUTH-002: 可选的 Credential 定义（第一版骨架）----
 # Credential 是长期认证材料的第一等所有者，Resource 通过 credential_id 引用它。
 # type 表示材料的生命周期/处理类别（none | api_key | oauth），不是 Provider 名。
