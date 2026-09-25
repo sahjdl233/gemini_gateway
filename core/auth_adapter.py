@@ -235,3 +235,46 @@ class ProviderAuthAdapter(ABC):
                 provider=getattr(self, "provider_id", "unknown"),
                 resource_id=resource.id if resource is not None else None,
             )
+
+
+def require_bound_credential(
+    credential_id: str,
+    resource: Resource,
+    *,
+    store: Optional[Any],
+    expected_type: CredentialType,
+    provider_id: str,
+) -> Credential:
+    """Strict reference resolution for ``Resource.credential_id`` (AUTH-013).
+
+    Once a Resource references a Credential, that reference is binding:
+    the credential must exist in ``store`` and carry ``expected_type``.
+    Any violation raises :class:`CredentialUnavailableError` — adapters
+    must NEVER silently fall back to legacy Resource fields while a
+    ``credential_id`` is set (a deleted credential would otherwise
+    resurrect the old secrets).  ``credential_id=None`` never reaches
+    this helper: callers keep their legacy compatibility path for it.
+    """
+    if store is None:
+        raise CredentialUnavailableError(
+            f"resource '{resource.id}' references credential "
+            f"'{credential_id}' but no credential repository is attached",
+            provider=provider_id,
+            resource_id=resource.id,
+        )
+    credential = store.get(credential_id)
+    if credential is None:
+        raise CredentialUnavailableError(
+            f"credential '{credential_id}' referenced by resource "
+            f"'{resource.id}' is not registered",
+            provider=provider_id,
+            resource_id=resource.id,
+        )
+    if credential.type is not expected_type:
+        raise CredentialUnavailableError(
+            f"credential '{credential_id}' has type "
+            f"'{credential.type.value}', expected '{expected_type.value}'",
+            provider=provider_id,
+            resource_id=resource.id,
+        )
+    return credential

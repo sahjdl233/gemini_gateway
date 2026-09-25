@@ -427,7 +427,11 @@ async def test_api_endpoint_429_keeps_rate_limit_semantics():
     http.responses.append(
         FakeResponse(429, json_body={"error": {"message": "quota"}}, headers={"Retry-After": "2"})
     )
-    adapter = make_adapter(clock=FakeClock(), http=http)
+    # client path resolves via material_for -> strict credential binding:
+    # the referenced credential must exist in the adapter's store
+    store = CredentialStore()
+    store.add(api_key_credential())
+    adapter = make_adapter(store, clock=FakeClock(), http=http)
     client = FirebaseClient(
         http=http, auth=adapter.auth, material_resolver=adapter.material_for
     )
@@ -453,7 +457,10 @@ async def test_401_refresh_retry_once_preserved():
     queue_exchange(http, ["jwt-fresh"])
     http.responses.append(FakeResponse(200, json_body={"candidates": []}))
 
-    adapter = make_adapter(clock=FakeClock(), http=http)
+    # client path resolves via material_for -> strict credential binding
+    store = CredentialStore()
+    store.add(api_key_credential())
+    adapter = make_adapter(store, clock=FakeClock(), http=http)
     client = FirebaseClient(
         http=http, auth=adapter.auth, material_resolver=adapter.material_for
     )

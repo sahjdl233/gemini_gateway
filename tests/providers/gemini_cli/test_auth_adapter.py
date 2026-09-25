@@ -447,3 +447,25 @@ def test_provider_builds_one_adapter_per_resource():
     import asyncio
 
     asyncio.run(check())
+
+
+async def test_dangling_credential_id_surfaces_as_401_through_client():
+    """AUTH-013 end-to-end: a deleted credential makes the live request
+    path fail with the 401-class CredentialUnavailableError — the legacy
+    fields on the resource are never resurrected."""
+    from core.auth_adapter import CredentialUnavailableError
+    from core.credential import CredentialStore, CredentialType
+    from core.errors import AuthenticationError
+
+    http = FakeHttp()
+    store = CredentialStore()  # empty: the credential was deleted
+    adapter = make_adapter(store, clock=FakeClock(), http=http)
+    client = GeminiCliClient(http=http, auth=adapter.auth)
+    resource = make_resource(credential_id="deleted-credential")
+
+    with pytest.raises(CredentialUnavailableError) as exc_info:
+        await client.post(resource, "https://cloudcode-pa.googleapis.com", {})
+
+    assert isinstance(exc_info.value, AuthenticationError)
+    assert "deleted-credential" in str(exc_info.value)
+    assert http.post_calls == []  # no token endpoint call attempted

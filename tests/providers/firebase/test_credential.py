@@ -7,6 +7,8 @@ behind a Credential-aware resolver.
 
 from __future__ import annotations
 
+import pytest
+
 from typing import Any, Dict
 
 from core.credential import Credential, CredentialStore, CredentialType
@@ -138,12 +140,20 @@ def test_provider_material_payload_only_fills_missing_legacy_fields():
     assert material["app_id"] == "legacy-app-id"
 
 
-def test_provider_material_wrong_type_falls_back_to_legacy():
+def test_provider_material_wrong_type_fails_closed():
+    """AUTH-013: credential_id set + wrong type -> no legacy fallback."""
+    from core.auth_adapter import CredentialUnavailableError
+
     store = CredentialStore()
     store.add(Credential(id="firebase-cred-01", type=CredentialType.OAUTH, payload={}))
     adapter = make_adapter(store)
-    material = adapter.material_for(make_resource(credential_id="firebase-cred-01"))
-    assert material["api_key"] == "legacy-api-key"
+    resource = make_resource(credential_id="firebase-cred-01")
+
+    with pytest.raises(CredentialUnavailableError) as exc_info:
+        adapter.material_for(resource)
+
+    # legacy fields on the resource must NOT be used
+    assert "legacy-api-key" not in str(exc_info.value)
 
 
 def test_provider_material_explicit_credential_wins_over_store():
@@ -197,3 +207,21 @@ async def test_client_default_resolver_uses_resource_fields():
     (call,) = http.calls
     assert "/projects/proj-1/models/" in call["url"]
     assert call["headers"]["x-goog-api-key"] == "legacy-api-key"
+
+
+def test_provider_material_dangling_credential_id_fails_closed():
+    """AUTH-013: dangling credential_id -> CredentialUnavailableError
+    (401-class); legacy fields on the resource are never used."""
+    from core.auth_adapter import CredentialUnavailableError
+    from core.errors import AuthenticationError
+
+    store = CredentialStore()  # credential deleted / never registered
+    adapter = make_adapter(store)
+    resource = make_resource(credential_id="firebase-cred-01")
+
+    with pytest.raises(CredentialUnavailableError) as exc_info:
+        adapter.material_for(resource)
+
+    assert isinstance(exc_info.value, AuthenticationError)
+    assert "firebase-cred-01" in str(exc_info.value)
+    assert "legacy-api-key" not in str(exc_info.value)

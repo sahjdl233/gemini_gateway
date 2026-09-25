@@ -89,25 +89,48 @@ def test_provider_material_with_credential_uses_payload():
     }
 
 
-def test_provider_material_with_wrong_credential_type_falls_back_to_legacy():
+def test_provider_material_with_wrong_credential_type_fails_closed():
+    """AUTH-013: credential_id set + wrong type -> no legacy fallback."""
+    from core.auth_adapter import CredentialUnavailableError
+
     store = CredentialStore()
     store.add(Credential(id="google-oauth-01", type=CredentialType.API_KEY, payload={}))
     adapter = make_adapter(store)
     resource = make_resource(credential_id="google-oauth-01")
 
-    material = adapter.material_for(resource)
+    with pytest.raises(CredentialUnavailableError) as exc_info:
+        adapter.material_for(resource)
 
-    assert material["refresh_token"] == "refresh-token-1"
+    # the legacy fields on the resource must NOT be used
+    assert "refresh-token-1" not in str(exc_info.value)
+    assert "api_key" in str(exc_info.value) or "type" in str(exc_info.value)
 
 
-def test_provider_material_unknown_credential_id_falls_back_to_legacy():
+def test_provider_material_unknown_credential_id_fails_closed():
+    """AUTH-013: dangling credential_id -> no silent legacy fallback."""
+    from core.auth_adapter import CredentialUnavailableError
+    from core.errors import AuthenticationError
+
     store = CredentialStore()
     adapter = make_adapter(store)
     resource = make_resource(credential_id="not-registered")
 
-    material = adapter.material_for(resource)
+    with pytest.raises(CredentialUnavailableError) as exc_info:
+        adapter.material_for(resource)
 
-    assert material["refresh_token"] == "refresh-token-1"
+    assert isinstance(exc_info.value, AuthenticationError)  # 401-class
+    assert "not-registered" in str(exc_info.value)
+    assert "refresh-token-1" not in str(exc_info.value)
+
+
+def test_provider_material_requires_store_when_credential_id_set():
+    from core.auth_adapter import CredentialUnavailableError
+
+    adapter = make_adapter(store=None)
+    resource = make_resource(credential_id="google-oauth-01")
+
+    with pytest.raises(CredentialUnavailableError):
+        adapter.material_for(resource)
 
 
 def test_provider_material_explicit_credential_wins_over_store():

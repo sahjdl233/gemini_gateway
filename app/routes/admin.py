@@ -376,11 +376,33 @@ async def update_credential_payload(credential_id: str, request: Request):
     return credential.redacted_dict()
 
 
+def _credential_is_referenced(request: Request, credential_id: str) -> bool:
+    """True when any runtime Resource references this credential.
+
+    Reference check is based on the live scheduler pools (AUTH-013):
+    deleting a bound credential would leave the resource with a dangling
+    reference, which the adapters now fail closed on.
+    """
+    scheduler = getattr(request.app.state, "scheduler", None)
+    for pool in getattr(scheduler, "pools", {}).values():
+        for resource in pool.resources:
+            if resource.credential_id == credential_id:
+                return True
+    return False
+
+
 @router.delete(
     "/credentials/{credential_id}", status_code=status.HTTP_204_NO_CONTENT
 )
 async def delete_credential(credential_id: str, request: Request):
     _require_admin(request)
+    # Delete protection (AUTH-013): a credential still referenced by any
+    # Resource must not be removed (identical for memory and postgres).
+    if _credential_is_referenced(request, credential_id):
+        raise HTTPException(
+            status_code=409,
+            detail="credential is still referenced by one or more resources",
+        )
     # Idempotent per the repository contract: unknown ids are a no-op.
     _credential_repository(request).remove(credential_id)
 

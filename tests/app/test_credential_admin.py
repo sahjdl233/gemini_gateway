@@ -16,6 +16,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.main import create_app
+from core.credential import Credential, CredentialType
 from core.credential_encryption import (
     ENCRYPTION_KEY_ID_ENV_VAR,
     ENCRYPTION_KEYS_ENV_VAR,
@@ -351,3 +352,131 @@ def test_add_without_payload_returns_400(tmp_path, monkeypatch):
             client.post("/admin/credentials", json=body, headers=ADMIN).status_code
             == 400
         )
+
+
+# -- AUTH-013: credential deletion protection ---------------------------------------
+
+
+def _config_with_bound_resource(backend: str | None = None) -> dict:
+    """A resource explicitly bound to a defined credential."""
+    config = {
+        "credentials": [
+            {
+                "id": "google-oauth-01",
+                "type": "oauth",
+                "payload": {"refresh_token": "rt", "client_id": "cid",
+                            "client_secret": "cs"},
+            }
+        ],
+        "providers": {
+            "gemini_cli": {
+                "enabled": True,
+                "resources": [
+                    {"id": "cli-1", "credential_id": "google-oauth-01",
+                     "project_id": "proj"}
+                ],
+            }
+        },
+    }
+    if backend:
+        config["credential_repository"] = {"backend": backend}
+    return config
+
+
+def test_delete_referenced_credential_returns_409(tmp_path, monkeypatch):
+    """AUTH-013: a credential still referenced by a Resource must not be
+    deletable — the resource would be left with a dangling reference."""
+    with make_client(tmp_path, monkeypatch, config=_config_with_bound_resource()) as client:
+        response = client.delete(
+            "/admin/credentials/google-oauth-01", headers=ADMIN
+        )
+        assert response.status_code == 409
+        # the credential survives
+        detail = client.get("/admin/credentials/google-oauth-01", headers=ADMIN)
+        assert detail.status_code == 200
+
+
+def test_delete_unreferenced_credential_returns_204(tmp_path, monkeypatch):
+    with make_client(tmp_path, monkeypatch, config=_config_with_bound_resource()) as client:
+        client.post(
+            "/admin/credentials",
+            headers=ADMIN,
+            json={"id": "unused-01", "type": "oauth",
+                  "payload": {"refresh_token": "rt"}},
+        )
+        response = client.delete("/admin/credentials/unused-01", headers=ADMIN)
+        assert response.status_code == 204
+        assert client.get("/admin/credentials/unused-01", headers=ADMIN).status_code == 404
+
+
+def test_delete_protection_consistent_in_postgres_mode(tmp_path, monkeypatch):
+    app, harness, repo = _postgres_app(tmp_path, monkeypatch)
+    client = TestClient(app)
+    repo.add(
+        Credential(
+            id="google-oauth-01",
+            type=CredentialType.OAUTH,
+            payload={"refresh_token": "rt", "client_id": "cid",
+                     "client_secret": "cs"},
+        )
+    )
+    # bind the app's live runtime resource to the durable credential
+    resource = app.state.scheduler.pools["fake"].resources[0]
+    resource.credential_id = "google-oauth-01"
+
+    referenced = client.delete(
+        "/admin/credentials/google-oauth-01", headers=ADMIN
+    )
+    assert referenced.status_code == 409
+    assert repo.get("google-oauth-01") is not None  # survived
+
+    # unbind: the credential becomes deletable (consistent with memory mode)
+    resource.credential_id = None
+    unreferenced = client.post(
+        "/admin/credentials",
+        headers=ADMIN,
+        json={"id": "unused-01", "type": "oauth", "payload": {"note": "x"}},
+    )
+    assert unreferenced.status_code == 201
+    assert (
+        client.delete("/admin/credentials/unused-01", headers=ADMIN).status_code
+        == 204
+    )
+
+
+def test_referenced_credential_delete_consistent_after_runtime_binding(tmp_path, monkeypatch):
+    """AUTH-010 migration binds resources to legacy-* credentials: those
+    are equally protected (reference check uses live scheduler pools)."""
+    from app.main import create_app
+
+    monkeypatch.setenv("ADMIN_TOKEN", "test-admin-secret")
+    config = {
+        "credential_repository": {"backend": "postgres"},
+        "providers": {
+            "gemini_cli": {
+                "enabled": True,
+                "resources": [
+                    {"id": "cli-1", "refresh_token": "rt", "client_id": "cid",
+                     "client_secret": "cs", "project_id": "proj"}
+                ],
+            }
+        },
+    }
+    harness = FakePostgres()
+    repo = PostgreSQLCredentialRepository(
+        harness.connection_factory(),
+        encryptor=CredentialEncryptor(os.urandom(32)),
+    )
+    monkeypatch.setattr("app.main.build_credential_store", lambda config: repo)
+    app = create_app(config, config_path=tmp_path / "config.yaml")
+    client = TestClient(app)
+
+    # migration bound the resource to the stable legacy id
+    resource = app.state.scheduler.pools["gemini_cli"].resources[0]
+    assert resource.credential_id == "legacy-gemini_cli-cli-1"
+
+    response = client.delete(
+        "/admin/credentials/legacy-gemini_cli-cli-1", headers=ADMIN
+    )
+    assert response.status_code == 409
+    assert repo.get("legacy-gemini_cli-cli-1") is not None

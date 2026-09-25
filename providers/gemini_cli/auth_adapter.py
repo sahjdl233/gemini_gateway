@@ -46,6 +46,7 @@ from core.auth_adapter import (
     InvalidCredentialError,
     ProviderAuthAdapter,
     RuntimeCredentials,
+    require_bound_credential,
 )
 from core.credential import Credential, CredentialStore, CredentialType
 from core.resource import Resource
@@ -93,13 +94,21 @@ class GeminiCliAuthAdapter(ProviderAuthAdapter):
     def material_for(self, resource: Any) -> dict:
         """Resolve OAuth material for a Resource.
 
-        Canonical: ``resource.credential_id`` → Credential(type=oauth)
-        payload.  Compatibility: legacy Resource fields when no usable
-        credential is registered.
+        Strict reference integrity (AUTH-013): a set ``credential_id``
+        must resolve to an existing oauth Credential — a missing or
+        mistyped credential raises CredentialUnavailableError instead of
+        silently falling back to the legacy Resource fields.  Legacy
+        fields apply only when ``credential_id`` is None.
         """
-        credential = None
-        if self._credential_store is not None and resource.credential_id:
-            credential = self._credential_store.get(resource.credential_id)
+        if not resource.credential_id:
+            return resource_material(resource)
+        credential = require_bound_credential(
+            resource.credential_id,
+            resource,
+            store=self._credential_store,
+            expected_type=CredentialType.OAUTH,
+            provider_id=self.provider_id,
+        )
         return self.material_from(credential, resource)
 
     def material_from(

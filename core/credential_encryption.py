@@ -36,13 +36,14 @@ Envelope format (v1)::
     {
       "v": 1,                        # envelope version (int)
       "alg": "AES-256-GCM",          # algorithm (str)
-      "kid": "default",              # key id, reserved for rotation (str)
+      "kid": "<active key id>",      # selects the keyring entry (str)
       "nonce": "<base64>",           # 12-byte AES-GCM nonce (str)
       "ciphertext": "<base64>"       # ciphertext + GCM tag (str)
     }
 
-``kid`` is recorded but only ``"default"`` is accepted in AUTH-007 —
-multi-key rotation arrives later (AUTH-008+).
+``kid`` selects the keyring entry at decryption time (AUTH-012 key
+rotation: ``GEMINI_GATEWAY_ENCRYPTION_KEYS`` + ``KEY_ID``; legacy
+single-key deployments keep ``kid="default"``).
 """
 
 from __future__ import annotations

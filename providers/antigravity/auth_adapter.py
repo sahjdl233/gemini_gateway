@@ -52,6 +52,7 @@ from core.auth_adapter import (
     InvalidCredentialError,
     ProviderAuthAdapter,
     RuntimeCredentials,
+    require_bound_credential,
 )
 from core.credential import Credential, CredentialStore, CredentialType
 from core.errors import (
@@ -104,14 +105,28 @@ class AntigravityAuthAdapter(ProviderAuthAdapter):
     def material_for(self, resource: Any) -> dict:
         """Resolve OAuth material for a Resource.
 
-        Canonical: ``resource.credential_id`` → Credential(type=oauth)
-        payload.  Compatibility: legacy Resource fields.  ``access_token``
-        is carried as a STATIC token source only (compat), never as the
-        target of refresh writes.
+        Strict reference integrity (AUTH-013): a set ``credential_id``
+        must resolve to an existing oauth Credential — a missing or
+        mistyped credential raises CredentialUnavailableError instead of
+        silently falling back to the legacy Resource fields.  Legacy
+        fields apply only when ``credential_id`` is None.
+        ``access_token`` is carried as a STATIC token source only
+        (compat), never as the target of refresh writes.
         """
-        credential = None
-        if self._credential_store is not None and resource.credential_id:
-            credential = self._credential_store.get(resource.credential_id)
+        if not resource.credential_id:
+            return {
+                "refresh_token": getattr(resource, "refresh_token", "") or "",
+                "client_id": getattr(resource, "client_id", "") or "",
+                "client_secret": getattr(resource, "client_secret", "") or "",
+                "access_token": getattr(resource, "access_token", "") or "",
+            }
+        credential = require_bound_credential(
+            resource.credential_id,
+            resource,
+            store=self._credential_store,
+            expected_type=CredentialType.OAUTH,
+            provider_id=self.provider_id,
+        )
         return self.material_from(credential, resource)
 
     def material_from(

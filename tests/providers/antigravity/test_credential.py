@@ -9,6 +9,8 @@ implementation — see test_auth_adapter.py.
 
 from __future__ import annotations
 
+import pytest
+
 import httpx
 
 from core.credential import Credential, CredentialStore, CredentialType
@@ -116,7 +118,10 @@ def test_provider_material_static_access_token_compat():
     assert material["refresh_token"] == ""
 
 
-def test_provider_material_wrong_type_falls_back_to_legacy():
+def test_provider_material_wrong_type_fails_closed():
+    """AUTH-013: credential_id set + wrong type -> no legacy fallback."""
+    from core.auth_adapter import CredentialUnavailableError
+
     store = CredentialStore()
     store.add(
         Credential(id="antigravity-oauth-01", type=CredentialType.API_KEY, payload={})
@@ -126,9 +131,11 @@ def test_provider_material_wrong_type_falls_back_to_legacy():
         id="a", credential_id="antigravity-oauth-01", access_token="legacy-token"
     )
 
-    material = adapter.material_for(resource)
+    with pytest.raises(CredentialUnavailableError) as exc_info:
+        adapter.material_for(resource)
 
-    assert material["access_token"] == "legacy-token"
+    # legacy fields on the resource must NOT be used
+    assert "legacy-token" not in str(exc_info.value)
 
 
 def test_provider_material_explicit_credential_wins_over_store():
@@ -179,3 +186,27 @@ async def test_provider_static_token_resource_makes_no_token_calls():
     assert not [c for c in backend.calls if "oauth2.googleapis.com" in c["url"]]
     api_calls = [c for c in backend.calls if "oauth2.googleapis.com" not in c["url"]]
     assert api_calls[0]["headers"]["Authorization"] == "Bearer legacy-token"
+
+
+def test_provider_material_dangling_credential_id_fails_closed():
+    """AUTH-013: dangling credential_id -> CredentialUnavailableError;
+    the resource's legacy access_token/refresh fields are never used."""
+    from core.auth_adapter import CredentialUnavailableError
+    from core.errors import AuthenticationError
+
+    store = CredentialStore()  # credential deleted
+    adapter = make_adapter(store)
+    resource = AntigravityResource(
+        id="a",
+        credential_id="deleted-credential",
+        access_token="legacy-token",
+        refresh_token="legacy-rt",
+    )
+
+    with pytest.raises(CredentialUnavailableError) as exc_info:
+        adapter.material_for(resource)
+
+    assert isinstance(exc_info.value, AuthenticationError)
+    assert "deleted-credential" in str(exc_info.value)
+    assert "legacy-token" not in str(exc_info.value)
+    assert "legacy-rt" not in str(exc_info.value)
