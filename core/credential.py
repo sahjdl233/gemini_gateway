@@ -35,6 +35,7 @@ secret, key, password, cookie) is masked.
 
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, List, Optional
@@ -118,12 +119,83 @@ class UnknownCredentialError(KeyError):
     """Raised when a credential id is required but not registered."""
 
 
-class CredentialStore:
-    """In-memory credential registry (AUTH-002 v1).
+class CredentialRepository(ABC):
+    """Stable credential persistence contract (TASK-AUTH-008).
+
+    The seam between the Credential domain and future durable
+    persistence (AUTH-009: PostgreSQL / Supabase)::
+
+        Credential
+            ↓
+        CredentialRepository            (this contract)
+            ↓
+        CredentialStore (in-memory)     ← current implementation
+        PostgresCredentialRepository    ← AUTH-009, unchanged providers
+
+    Contract semantics (frozen so a durable implementation can drop in
+    without touching Provider / AuthAdapter code):
+
+    * ``add`` rejects duplicate ids with DuplicateCredentialError.
+    * ``get`` returns the credential or ``None`` for unknown ids.
+    * ``require`` returns the credential or raises
+      UnknownCredentialError.
+    * ``update_payload`` requires the credential to exist
+      (UnknownCredentialError otherwise) and replaces the payload
+      atomically, bumping ``updated_at``.
+    * ``remove`` is idempotent for unknown ids.
+    * ``list`` returns all credentials in insertion order.
+    * Repositories persist only the durable Credential shape
+      (id / type / payload / timestamps); runtime auth state never
+      enters this contract.  Encryption of payloads at rest is a
+      repository-implementation concern (AUTH-007 primitive), invisible
+      to callers.
+    """
+
+    @abstractmethod
+    def add(self, credential: Credential) -> Credential:
+        """Register a credential; DuplicateCredentialError on reuse."""
+        ...
+
+    @abstractmethod
+    def get(self, credential_id: str) -> Optional[Credential]:
+        """Return the credential or None when unknown."""
+        ...
+
+    @abstractmethod
+    def require(self, credential_id: str) -> Credential:
+        """Return the credential or raise UnknownCredentialError."""
+        ...
+
+    @abstractmethod
+    def update_payload(
+        self,
+        credential_id: str,
+        payload: Dict[str, Any],
+    ) -> Credential:
+        """Replace the payload (must exist) and bump updated_at."""
+        ...
+
+    @abstractmethod
+    def remove(self, credential_id: str) -> None:
+        """Drop a credential; unknown ids are ignored (idempotent)."""
+        ...
+
+    @abstractmethod
+    def list(self) -> List[Credential]:
+        """All registered credentials (insertion order)."""
+        ...
+
+    def __contains__(self, credential_id: object) -> bool:
+        return self.get(str(credential_id)) is not None
+
+
+class CredentialStore(CredentialRepository):
+    """In-memory credential repository (AUTH-002 v1, AUTH-008 contract).
 
     Deliberately minimal: lookup + CRUD is all providers need to resolve
     ``resource.credential_id``.  Encryption and durable persistence are
-    AUTH-007 / AUTH-008 concerns; this store is the seam they replace.
+    AUTH-007 / AUTH-008+ concerns; this in-memory implementation is the
+    seam a durable repository replaces.
     All operations are synchronous dict operations (safe under asyncio's
     single-threaded event loop).
     """
