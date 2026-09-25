@@ -18,6 +18,13 @@ from core.credential import (
     DuplicateCredentialError,
     UnknownCredentialError,
 )
+from core.credential_encryption import (
+    ENCRYPTION_KEY_ID_ENV_VAR,
+    ENCRYPTION_KEYS_ENV_VAR,
+    CredentialEncryptionConfigError,
+    CredentialEncryptor,
+)
+from core.credential_postgres import PostgreSQLCredentialRepository
 
 
 router = APIRouter(prefix="/admin", tags=["admin"])
@@ -333,9 +340,13 @@ async def create_credential(request: Request):
         raise HTTPException(
             status_code=400, detail=f"unknown credential type: {raw_type!r}"
         ) from exc
-    payload = body.get("payload") or {}
+    payload = body.get("payload", None)
     if not isinstance(payload, dict):
-        raise HTTPException(status_code=400, detail="payload must be an object")
+        # payload must be a JSON object: null / array / string are all
+        # rejected (AUTH-011 fix; no `or {}` fallback).
+        raise HTTPException(
+            status_code=400, detail="body must contain a 'payload' object"
+        )
     try:
         credential = Credential(
             id=credential_id, type=credential_type, payload=payload
@@ -372,3 +383,38 @@ async def delete_credential(credential_id: str, request: Request):
     _require_admin(request)
     # Idempotent per the repository contract: unknown ids are a no-op.
     _credential_repository(request).remove(credential_id)
+
+
+@router.post("/credentials/rotate-key")
+async def rotate_credential_key(request: Request):
+    """Bulk re-encryption of durable credential payloads (AUTH-012).
+
+    Postgres mode only: memory mode has nothing durable to rotate (400).
+    Requires the keyring configuration (GEMINI_GATEWAY_ENCRYPTION_KEYS +
+    GEMINI_GATEWAY_ENCRYPTION_KEY_ID) to be present; a missing or invalid
+    configuration is a 400, never a silent no-op.  Returns rotation
+    counts only — no credential payload material.
+    """
+    _require_admin(request)
+    repository = _credential_repository(request)
+    if not isinstance(repository, PostgreSQLCredentialRepository):
+        raise HTTPException(
+            status_code=400,
+            detail="key rotation requires a durable credential repository",
+        )
+    if (
+        os.environ.get(ENCRYPTION_KEYS_ENV_VAR) is None
+        or os.environ.get(ENCRYPTION_KEY_ID_ENV_VAR) is None
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "key rotation requires GEMINI_GATEWAY_ENCRYPTION_KEYS and "
+                "GEMINI_GATEWAY_ENCRYPTION_KEY_ID to be configured"
+            ),
+        )
+    try:
+        new_encryptor = CredentialEncryptor.from_environment()
+    except CredentialEncryptionConfigError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return repository.rotate_key(new_encryptor)

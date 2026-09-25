@@ -19,6 +19,7 @@ store and this repository backed by the fake driver.
 from __future__ import annotations
 
 import base64
+import json
 import os
 from datetime import timedelta
 
@@ -498,3 +499,126 @@ def test_real_postgres_round_trip():
     assert loaded.payload == OAUTH_PAYLOAD
     repo.remove("real-integration-01")
     assert repo.get("real-integration-01") is None
+
+
+# -- AUTH-012: key rotation -------------------------------------------------------
+
+
+def _make_keyring_repo(fake, keys: dict, active: str):
+    from core.credential_encryption import CredentialEncryptor as E
+
+    return PostgreSQLCredentialRepository(
+        fake.connection_factory(), encryptor=E.from_keys(keys, active)
+    )
+
+
+def test_rotation_reencrypts_all_under_active_kid(fake):
+    old_key, new_key = os.urandom(32), os.urandom(32)
+    repo = _make_keyring_repo(fake, {"default": old_key}, "default")
+    for cid in ("c1", "c2", "c3"):
+        repo.add(oauth_credential(cid))
+    snapshot = {
+        cid: (row["type"], row["created_at"], row["updated_at"])
+        for cid, row in fake.raw_rows().items()
+    }
+    payloads = {cid: repo.get(cid).payload for cid in ("c1", "c2", "c3")}
+
+    new_encryptor = CredentialEncryptor.from_keys(
+        {"default": old_key, "v2": new_key}, active_kid="v2"
+    )
+    stats = repo.rotate_key(new_encryptor)
+
+    assert stats == {"total": 3, "rotated": 3, "skipped": 0}
+    # every envelope now carries the active kid and decrypts via the repo
+    for cid, row in fake.raw_rows().items():
+        import json as _json
+
+        assert _json.loads(row["payload_encrypted"])["kid"] == "v2"
+        assert repo.get(cid).payload == payloads[cid]
+        # id/type/created_at/updated_at untouched by rotation
+        assert (row["type"], row["created_at"], row["updated_at"]) == snapshot[cid]
+
+
+def test_rotation_skips_already_active_rows(fake):
+    old_key, new_key = os.urandom(32), os.urandom(32)
+    repo = _make_keyring_repo(fake, {"default": old_key}, "default")
+    repo.add(oauth_credential("c1"))
+    envelope_before = fake.raw_rows()["c1"]["payload_encrypted"]
+
+    new_encryptor = CredentialEncryptor.from_keys(
+        {"default": old_key, "v2": new_key}, active_kid="v2"
+    )
+    first = repo.rotate_key(new_encryptor)
+    assert first == {"total": 1, "rotated": 1, "skipped": 0}
+
+    envelope_after_first = fake.raw_rows()["c1"]["payload_encrypted"]
+    second = repo.rotate_key(new_encryptor)  # already v2: skip, no rewrite
+
+    assert second == {"total": 1, "rotated": 0, "skipped": 1}
+    assert fake.raw_rows()["c1"]["payload_encrypted"] == envelope_after_first
+
+
+def test_rotation_rolls_back_on_failure(fake):
+    old_key, new_key = os.urandom(32), os.urandom(32)
+    repo = _make_keyring_repo(fake, {"default": old_key}, "default")
+    repo.add(oauth_credential("c1"))
+    repo.add(oauth_credential("c2"))
+    rows_before = json.loads(json.dumps(
+        {cid: row["payload_encrypted"] for cid, row in fake.raw_rows().items()}
+    ))
+
+    # a new encryptor whose re-encryption fails on the second record
+    from core.credential_encryption import CredentialEncryptor as E
+
+    class FailingEncryptor(E):
+        def __init__(self, keys, active, fail_after):
+            instance = E.from_keys(keys, active)
+            self.__dict__.update(instance.__dict__)
+            self._fail_after = fail_after
+            self._calls = 0
+
+        def encrypt_payload(self, payload, **kwargs):
+            self._calls += 1
+            if self._calls > self._fail_after:
+                raise RuntimeError("re-encryption failed")
+            return E.encrypt_payload(self, payload, **kwargs)
+
+    failing = FailingEncryptor(
+        {"default": old_key, "v2": new_key}, "v2", fail_after=1
+    )
+
+    with pytest.raises(RuntimeError, match="re-encryption failed"):
+        repo.rotate_key(failing)
+
+    # rolled back: rows unchanged, still old kid, repo encryptor NOT adopted
+    rows_after = {cid: row["payload_encrypted"] for cid, row in fake.raw_rows().items()}
+    for cid, envelope in rows_after.items():
+        assert json.loads(envelope)["kid"] == "default"
+        assert envelope == rows_before[cid]
+    assert repo.get("c1").payload == OAUTH_PAYLOAD
+
+
+def test_rotation_without_old_key_fails_closed(fake):
+    """Restart scenario: the CURRENT keyring dropped the old kid, so the
+    rotation cannot decrypt the stored envelopes — fails closed and rolls
+    back (no data loss, no skip-to-broken, no plaintext fallback)."""
+    from core.credential_encryption import CredentialDecryptionError
+
+    old_key, new_key = os.urandom(32), os.urandom(32)
+    previous = _make_keyring_repo(fake, {"default": old_key}, "default")
+    previous.add(oauth_credential("c1"))
+
+    # "restart" with a keyring that no longer contains kid=default
+    restarted = _make_keyring_repo(fake, {"v9": new_key}, "v9")
+    with pytest.raises(CredentialDecryptionError):
+        restarted.rotate_key(restarted._encryptor)
+
+    # rolled back: rows still old kid, recoverable once the old key returns
+    assert json.loads(fake.raw_rows()["c1"]["payload_encrypted"])["kid"] == "default"
+    recovered = _make_keyring_repo(
+        fake, {"default": old_key, "v9": new_key}, "v9"
+    )
+    stats = recovered.rotate_key(
+        CredentialEncryptor.from_keys({"default": old_key, "v9": new_key}, "v9")
+    )
+    assert stats == {"total": 1, "rotated": 1, "skipped": 0}

@@ -93,6 +93,10 @@ _LIST_CREDENTIALS_SQL = (
     "SELECT id, type, payload_encrypted, created_at, updated_at "
     "FROM credentials ORDER BY created_at, id"
 )
+_LIST_FOR_UPDATE_SQL = _LIST_CREDENTIALS_SQL + " FOR UPDATE"
+# Key rotation rewrites ONLY the envelope: id/type/created_at/updated_at
+# are untouched (rotation is not a credential update).
+_ROTATE_PAYLOAD_SQL = "UPDATE credentials SET payload_encrypted = %s WHERE id = %s"
 
 # PostgreSQL constraint violation for duplicate primary keys (DBAPI
 # SQLSTATE; detected without importing any driver).
@@ -286,6 +290,55 @@ class PostgreSQLCredentialRepository(CredentialRepository):
         # Deterministic ORDER BY created_at, id (enforced by the SQL);
         # corrupt rows fail closed instead of being skipped.
         return [self._decrypt_row(row) for row in rows]
+
+    # -- key rotation (AUTH-012) -------------------------------------------------
+
+    def rotate_key(self, new_encryptor: CredentialEncryptor) -> Dict[str, int]:
+        """Re-encrypt every credential payload under the new encryptor.
+
+        Single transaction: rows are selected ``FOR UPDATE``, each
+        envelope whose ``kid`` differs from the new active kid is
+        decrypted with the CURRENT repository encryptor (whose keyring
+        must still contain that kid) and re-encrypted with
+        ``new_encryptor`` under the SAME AAD (id + type) and a fresh
+        nonce.  Envelopes already under the active kid are skipped and
+        not rewritten.  ``id`` / ``type`` / ``created_at`` /
+        ``updated_at`` are never modified.
+
+        Failure semantics: any decryption or driver failure rolls the
+        whole batch back (nothing is half-rotated) and the original
+        exception propagates; ``self._encryptor`` is only adopted after a
+        successful commit.
+
+        Returns ``{"total", "rotated", "skipped"}`` — no payload material.
+        """
+        rotated = 0
+        skipped = 0
+        with self._Transaction(self._connection_factory) as conn:
+            rows = conn.execute(_LIST_FOR_UPDATE_SQL).fetchall()
+            for row in rows:
+                envelope = row["payload_encrypted"]
+                if envelope.get("kid") == new_encryptor.active_kid:
+                    skipped += 1
+                    continue
+                aad = credential_aad(row["id"], row["type"])
+                payload = self._encryptor.decrypt_payload(
+                    envelope, associated_data=aad
+                )
+                new_envelope = new_encryptor.encrypt_payload(
+                    payload, associated_data=aad
+                )
+                cursor = conn.execute(
+                    _ROTATE_PAYLOAD_SQL,
+                    (json.dumps(new_envelope), row["id"]),
+                )
+                if getattr(cursor, "rowcount", 1) == 0:
+                    raise CredentialDecryptionError(
+                        "key rotation lost its locked row; rolled back"
+                    )
+                rotated += 1
+        self._encryptor = new_encryptor
+        return {"total": len(rows), "rotated": rotated, "skipped": skipped}
 
     # -- encryption helpers --------------------------------------------------------
 

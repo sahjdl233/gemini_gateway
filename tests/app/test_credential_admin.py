@@ -16,7 +16,11 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.main import create_app
-from core.credential_encryption import CredentialEncryptor
+from core.credential_encryption import (
+    ENCRYPTION_KEY_ID_ENV_VAR,
+    ENCRYPTION_KEYS_ENV_VAR,
+    CredentialEncryptor,
+)
 from core.credential_postgres import PostgreSQLCredentialRepository
 from tests.core._fake_postgres import FakePostgres
 
@@ -230,3 +234,120 @@ def test_postgres_mode_persists_encrypted_through_api(tmp_path, monkeypatch):
         ).json()["payload"]["refresh_token"] == "***"
         client.delete("/admin/credentials/google-oauth-01", headers=ADMIN)
         assert harness.raw_rows() == {}
+
+
+# -- AUTH-012: key rotation API ----------------------------------------------------
+
+
+def _postgres_app(tmp_path, monkeypatch):
+    monkeypatch.setenv("ADMIN_TOKEN", "test-admin-secret")
+    harness = FakePostgres()
+    repo = PostgreSQLCredentialRepository(
+        harness.connection_factory(),
+        encryptor=CredentialEncryptor(os.urandom(32)),
+    )
+    monkeypatch.setattr("app.main.build_credential_store", lambda config: repo)
+    config = {
+        "credential_repository": {"backend": "postgres"},
+        "providers": {
+            "fake": {
+                "enabled": True,
+                "resources": [{"id": "fake-01", "scenario": "success"}],
+            }
+        },
+    }
+    app = create_app(config, config_path=tmp_path / "config.yaml")
+    return app, harness, repo
+
+
+def test_rotate_key_success_returns_counts_only(tmp_path, monkeypatch):
+    app, harness, repo = _postgres_app(tmp_path, monkeypatch)
+    client = TestClient(app)
+    client.post("/admin/credentials", json=oauth_body(), headers=ADMIN)
+
+    keys = {"default": os.urandom(32), "v2": os.urandom(32)}
+    monkeypatch.setenv(ENCRYPTION_KEYS_ENV_VAR, json.dumps(
+        {kid: base64.b64encode(k).decode() for kid, k in keys.items()}
+    ))
+    monkeypatch.setenv(ENCRYPTION_KEY_ID_ENV_VAR, "v2")
+
+    response = client.post("/admin/credentials/rotate-key", headers=ADMIN)
+
+    assert response.status_code == 200
+    assert response.json() == {"total": 1, "rotated": 1, "skipped": 0}
+    # no credential payload in the rotation response
+    assert "super-secret-rt" not in response.text
+    # rotated to active kid and decrypts through the same repo
+    import json as _json
+
+    assert _json.loads(harness.raw_rows()["google-oauth-01"]["payload_encrypted"])[
+        "kid"
+    ] == "v2"
+    detail = client.get("/admin/credentials/google-oauth-01", headers=ADMIN)
+    assert detail.status_code == 200
+    assert "super-secret-rt" not in detail.text
+
+
+def test_rotate_key_without_keyring_config_returns_400(tmp_path, monkeypatch):
+    app, harness, repo = _postgres_app(tmp_path, monkeypatch)
+    client = TestClient(app)
+    monkeypatch.delenv(ENCRYPTION_KEYS_ENV_VAR, raising=False)
+    monkeypatch.delenv(ENCRYPTION_KEY_ID_ENV_VAR, raising=False)
+
+    response = client.post("/admin/credentials/rotate-key", headers=ADMIN)
+
+    assert response.status_code == 400
+
+
+def test_rotate_key_with_invalid_keyring_returns_400(tmp_path, monkeypatch):
+    app, harness, repo = _postgres_app(tmp_path, monkeypatch)
+    client = TestClient(app)
+    monkeypatch.setenv(ENCRYPTION_KEYS_ENV_VAR, "not-json")
+    monkeypatch.setenv(ENCRYPTION_KEY_ID_ENV_VAR, "v1")
+
+    response = client.post("/admin/credentials/rotate-key", headers=ADMIN)
+
+    assert response.status_code == 400
+
+
+def test_rotate_key_in_memory_mode_returns_400(tmp_path, monkeypatch):
+    with make_client(tmp_path, monkeypatch) as client:
+        monkeypatch.setenv(ENCRYPTION_KEYS_ENV_VAR, json.dumps(
+            {"v1": base64.b64encode(os.urandom(32)).decode()}
+        ))
+        monkeypatch.setenv(ENCRYPTION_KEY_ID_ENV_VAR, "v1")
+
+        response = client.post("/admin/credentials/rotate-key", headers=ADMIN)
+
+        assert response.status_code == 400
+
+
+def test_rotate_key_requires_admin(tmp_path, monkeypatch):
+    app, harness, repo = _postgres_app(tmp_path, monkeypatch)
+    client = TestClient(app)
+    assert client.post("/admin/credentials/rotate-key").status_code == 401
+
+
+# -- AUTH-011 fix: POST payload must be a JSON object ---------------------------------
+
+
+@pytest.mark.parametrize("bad_payload", [None, [], "x", 42])
+def test_add_rejects_non_object_payload(tmp_path, monkeypatch, bad_payload):
+    with make_client(tmp_path, monkeypatch) as client:
+        body = oauth_body()
+        body["payload"] = bad_payload
+
+        response = client.post(
+            "/admin/credentials", json=body, headers=ADMIN
+        )
+
+        assert response.status_code == 400
+
+
+def test_add_without_payload_returns_400(tmp_path, monkeypatch):
+    with make_client(tmp_path, monkeypatch) as client:
+        body = {"id": "x", "type": "oauth"}
+        assert (
+            client.post("/admin/credentials", json=body, headers=ADMIN).status_code
+            == 400
+        )
