@@ -33,10 +33,14 @@ model_registry:
 # credential_repository:
 #   backend: postgres
 
-# ---- AUTH-002: 可选的 Credential 定义（第一版骨架）----
+# ---- AUTH-002: 可选的 Credential 定义 ----
 # Credential 是长期认证材料的第一等所有者，Resource 通过 credential_id 引用它。
 # type 表示材料的生命周期/处理类别（none | api_key | oauth），不是 Provider 名。
-# 当前仍为明文持久化（现状）；加密在 AUTH-007 引入。
+# 存储位置由 credential_repository.backend 决定：memory（缺省，进程内）或
+# postgres（AUTH-009，payload 经 AUTH-007 AES-256-GCM 加密落库）。
+# 另：AUTH-010 会在 postgres 模式下自动把 Resource 的 legacy 凭据字段
+# （refresh_token/client_secret 等）迁移为加密 Credential 并回填
+# credential_id——legacy 字段保留为兼容路径，无需手工迁移。
 # credentials:
 #   - id: google-oauth-01
 #     type: oauth

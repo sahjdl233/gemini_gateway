@@ -166,6 +166,38 @@ def build_runtime(
     return scheduler
 
 
+def _migrate_legacy_credentials_if_durable(
+    config: Dict[str, Any],
+    credential_store: CredentialRepository,
+    scheduler: Scheduler,
+) -> None:
+    """AUTH-010: migrate legacy Resource credential fields into the
+    repository when the durable backend is active.
+
+    Only the postgres backend migrates: the in-memory backend keeps its
+    unchanged AUTH-002 behaviour (legacy fields remain the working
+    compatibility path, resources keep ``credential_id=None``).  When
+    migration is active, ANY repository failure propagates — startup
+    fails rather than continuing with unresolved credentials.
+    """
+    repo_cfg = config.get("credential_repository") or {}
+    if str(repo_cfg.get("backend", "memory")).lower() != "postgres":
+        return
+    from itertools import chain
+
+    from core.credential_migration import migrate_legacy_resource_credentials
+
+    resources = list(
+        chain.from_iterable(pool.resources for pool in scheduler.pools.values())
+    )
+    migrated = migrate_legacy_resource_credentials(credential_store, resources)
+    logger.info(
+        "credential.legacy_migrated new=%d resources=%d",
+        migrated,
+        len(resources),
+    )
+
+
 def create_app(
     config: Optional[Dict[str, Any]] = None,
     *,
@@ -178,6 +210,7 @@ def create_app(
         cfg = config
     credential_store = build_credential_store(cfg)
     scheduler = build_runtime(cfg, credential_store)
+    _migrate_legacy_credentials_if_durable(cfg, credential_store, scheduler)
     resource_manager = ResourceManager(scheduler, cfg, config_path)
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:

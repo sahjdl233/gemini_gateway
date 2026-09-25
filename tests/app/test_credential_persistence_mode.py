@@ -167,3 +167,105 @@ def test_wrong_key_reads_fail_closed_through_runtime_seam():
     )
     with pytest.raises(CredentialDecryptionError):
         reader.get("c2")
+
+
+# -- AUTH-010: legacy credential migration at startup ----------------------------
+
+
+def antigravity_legacy_config() -> dict:
+    return {
+        "credential_repository": {"backend": "postgres"},
+        "providers": {
+            "antigravity": {
+                "enabled": True,
+                "resources": [
+                    {
+                        "id": "ag-01",
+                        "refresh_token": "legacy-rt",
+                        "client_id": "legacy-cid",
+                        "client_secret": "legacy-cs",
+                        "project_id": "proj",
+                    }
+                ],
+            }
+        },
+    }
+
+
+def test_memory_backend_keeps_original_behaviour(monkeypatch):
+    """Memory mode: no migration, resources keep credential_id=None and
+    the legacy fields remain the working compatibility path."""
+    from app.main import create_app
+
+    config = {
+        "providers": {
+            "gemini_cli": {
+                "enabled": True,
+                "resources": [
+                    {
+                        "id": "cli-01",
+                        "refresh_token": "legacy-rt",
+                        "client_id": "legacy-cid",
+                        "client_secret": "legacy-cs",
+                        "project_id": "proj",
+                    }
+                ],
+            }
+        }
+    }
+    app = create_app(config)
+    resource = app.state.scheduler.pools["gemini_cli"].resources[0]
+    assert resource.credential_id is None
+    store = app.state.credential_store
+    assert store.get("legacy-gemini_cli-cli-01") is None
+
+
+def test_postgres_backend_migrates_legacy_resources(monkeypatch):
+    """Postgres mode: legacy fields are copied into an encrypted
+    Credential and the resource is repointed at credential_id."""
+    from app.main import create_app
+    from core.credential_encryption import CredentialEncryptor
+
+    harness = FakePostgres()
+    repo = PostgreSQLCredentialRepository(
+        harness.connection_factory(),
+        encryptor=CredentialEncryptor(os.urandom(32)),
+    )
+    monkeypatch.setattr(
+        "app.main.build_credential_store", lambda config: repo
+    )
+
+    app = create_app(antigravity_legacy_config())
+    resource = app.state.scheduler.pools["antigravity"].resources[0]
+    assert resource.credential_id == "legacy-antigravity-ag-01"
+    credential = repo.get(resource.credential_id)
+    assert credential.payload["refresh_token"] == "legacy-rt"
+    # encrypted at rest: no plaintext in the raw row
+    assert "legacy-rt" not in str(harness.raw_rows())
+
+
+def test_postgres_migration_failure_is_startup_failure(monkeypatch):
+    """A repository failure during migration must abort startup — never
+    silently continue with unresolved credentials."""
+    from app.main import create_app
+    from core.credential_encryption import CredentialEncryptor
+
+    harness = FakePostgres()
+    operation = {"n": 0}
+
+    def flaky_factory():
+        operation["n"] += 1
+        connection = harness.connection_factory()()
+        if operation["n"] >= 2:  # first op = get(), second = the INSERT
+            connection.fail_next_execute = RuntimeError("db write failed")
+        return connection
+
+    repo = PostgreSQLCredentialRepository(
+        flaky_factory, encryptor=CredentialEncryptor(os.urandom(32))
+    )
+    monkeypatch.setattr(
+        "app.main.build_credential_store", lambda config: repo
+    )
+
+    with pytest.raises(RuntimeError, match="db write failed"):
+        create_app(antigravity_legacy_config())
