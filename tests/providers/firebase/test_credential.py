@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import Any, Dict
 
 from core.credential import Credential, CredentialStore, CredentialType
+from providers.firebase.auth_adapter import FirebaseAuthAdapter
 from providers.firebase.client import FirebaseClient, resource_material
 from providers.firebase.provider import FirebaseProvider
 from providers.firebase.resource import FirebaseResource
@@ -26,6 +27,11 @@ def make_resource(**overrides: Any) -> FirebaseResource:
     }
     base.update(overrides)
     return FirebaseResource.model_validate(base)
+
+
+def make_adapter(store=None) -> FirebaseAuthAdapter:
+    """Build an adapter the way the Provider does (AUTH-005)."""
+    return FirebaseAuthAdapter(http=RecordingHttp(), credential_store=store)
 
 
 def make_credential() -> Credential:
@@ -77,18 +83,18 @@ def test_default_material_reads_legacy_resource_fields():
 
 
 def test_provider_material_without_credential_uses_legacy_fields():
-    provider = FirebaseProvider()
-    material = provider._firebase_material(make_resource())
+    adapter = make_adapter()
+    material = adapter.material_for(make_resource())
     assert material["api_key"] == "legacy-api-key"
 
 
 def test_provider_material_with_credential_uses_payload():
     store = CredentialStore()
     store.add(make_credential())
-    provider = FirebaseProvider(credential_store=store)
+    adapter = make_adapter(store)
     resource = make_resource(credential_id="firebase-cred-01")
 
-    material = provider._firebase_material(resource)
+    material = adapter.material_for(resource)
 
     assert material["api_key"] == "cred-api-key"
     assert material["app_id"] == "cred-app-id"
@@ -106,10 +112,10 @@ def test_provider_material_project_id_stays_on_resource():
             payload={"api_key": "cred-api-key", "project_id": "payload-project"},
         )
     )
-    provider = FirebaseProvider(credential_store=store)
+    adapter = make_adapter(store)
     resource = make_resource(credential_id="firebase-cred-01")
 
-    material = provider._firebase_material(resource)
+    material = adapter.material_for(resource)
 
     assert material["project_id"] == "proj-1"
 
@@ -123,10 +129,10 @@ def test_provider_material_payload_only_fills_missing_legacy_fields():
             payload={"api_key": "cred-api-key"},
         )
     )
-    provider = FirebaseProvider(credential_store=store)
+    adapter = make_adapter(store)
     resource = make_resource(credential_id="firebase-cred-01")
 
-    material = provider._firebase_material(resource)
+    material = adapter.material_for(resource)
 
     assert material["api_key"] == "cred-api-key"
     assert material["app_id"] == "legacy-app-id"
@@ -135,9 +141,26 @@ def test_provider_material_payload_only_fills_missing_legacy_fields():
 def test_provider_material_wrong_type_falls_back_to_legacy():
     store = CredentialStore()
     store.add(Credential(id="firebase-cred-01", type=CredentialType.OAUTH, payload={}))
-    provider = FirebaseProvider(credential_store=store)
-    material = provider._firebase_material(make_resource(credential_id="firebase-cred-01"))
+    adapter = make_adapter(store)
+    material = adapter.material_for(make_resource(credential_id="firebase-cred-01"))
     assert material["api_key"] == "legacy-api-key"
+
+
+def test_provider_material_explicit_credential_wins_over_store():
+    """Precedence: explicit credential param > credential_id lookup."""
+    store = CredentialStore()
+    store.add(make_credential())
+    adapter = make_adapter(store)
+    resource = make_resource(credential_id="firebase-cred-01")
+    explicit = Credential(
+        id="explicit-01",
+        type=CredentialType.API_KEY,
+        payload={"api_key": "explicit-api-key"},
+    )
+
+    material = adapter.material_from(explicit, resource)
+
+    assert material["api_key"] == "explicit-api-key"
 
 
 # -- client threads material into URL/headers/auth -----------------------------

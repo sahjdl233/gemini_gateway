@@ -1,9 +1,10 @@
-"""Antigravity credential migration tests (TASK-AUTH-002).
+"""Antigravity credential migration tests (AUTH-002 mapping + AUTH-006).
 
-Antigravity is CURRENTLY bearer access_token only: no OAuth refresh is
-implemented or implied.  These tests only verify that the bearer token
-may be resolved from a Credential payload when the resource references
-one, and that legacy ``access_token`` resources behave exactly as before.
+Covers the credential→material mapping on the AntigravityAuthAdapter and
+the end-to-end request path.  The former "no refresh logic exists" pin
+(kept while antigravity was bearer-token-only) is superseded by AUTH-006:
+refresh now exists, owned exclusively by the adapter's auth
+implementation — see test_auth_adapter.py.
 """
 
 from __future__ import annotations
@@ -11,116 +12,170 @@ from __future__ import annotations
 import httpx
 
 from core.credential import Credential, CredentialStore, CredentialType
+from providers.antigravity.auth_adapter import AntigravityAuthAdapter
 from providers.antigravity.client import AntigravityClient, resource_access_token
 from providers.antigravity.provider import AntigravityProvider
 from providers.antigravity.resource import AntigravityResource
 
 
 MODEL_RESPONSE = {"models": {"gemini-test": {"model": "gemini-test"}}}
+TOKEN_RESPONSE = {
+    "access_token": "cred-access-token",
+    "expires_in": 3600,
+}
 
 
-class RecordingBackend:
-    def __init__(self, response=None):
+class RoutingBackend:
+    """ExecutionBackend double: token endpoint vs API endpoint routing."""
+
+    def __init__(self, token_response=None, api_response=None):
         self.calls = []
-        self._response = response or httpx.Response(200, json=MODEL_RESPONSE)
+        self._token_response = token_response or httpx.Response(200, json=TOKEN_RESPONSE)
+        self._api_response = api_response or httpx.Response(200, json=MODEL_RESPONSE)
 
     async def execute(self, method, url, **kwargs):
         self.calls.append({"method": method, "url": url, **kwargs})
-        return self._response
+        if "oauth2.googleapis.com" in url:
+            return self._token_response
+        return self._api_response
 
     async def close(self):
         pass
 
 
-def make_credential() -> Credential:
+def make_credential(**payload_overrides) -> Credential:
+    payload = {
+        "refresh_token": "cred-refresh-token",
+        "client_id": "cred-client-id",
+        "client_secret": "cred-client-secret",
+    }
+    payload.update(payload_overrides)
     return Credential(
-        id="antigravity-oauth-01",
-        type=CredentialType.OAUTH,
-        payload={"access_token": "cred-access-token"},
+        id="antigravity-oauth-01", type=CredentialType.OAUTH, payload=payload
     )
 
 
-# -- token resolution ---------------------------------------------------------
+def make_adapter(store=None) -> AntigravityAuthAdapter:
+    return AntigravityAuthAdapter(http=object(), credential_store=store)
+
+
+# -- legacy client resolver (unchanged) ----------------------------------------
+
 
 def test_default_token_resolver_reads_legacy_field():
     resource = AntigravityResource(id="a", access_token="legacy-token")
     assert resource_access_token(resource) == "legacy-token"
 
 
-def test_provider_token_without_credential_uses_legacy_field():
-    provider = AntigravityProvider(backend=RecordingBackend())
-    resource = AntigravityResource(id="a", access_token="legacy-token")
-    assert provider._access_token_for(resource) == "legacy-token"
-
-
-def test_provider_token_with_credential_uses_payload():
-    store = CredentialStore()
-    store.add(make_credential())
-    provider = AntigravityProvider(backend=RecordingBackend(), credential_store=store)
-    resource = AntigravityResource(id="a", credential_id="antigravity-oauth-01")
-
-    assert provider._access_token_for(resource) == "cred-access-token"
-
-
-def test_provider_token_wrong_type_falls_back_to_legacy():
-    store = CredentialStore()
-    store.add(
-        Credential(id="antigravity-oauth-01", type=CredentialType.API_KEY, payload={})
-    )
-    provider = AntigravityProvider(backend=RecordingBackend(), credential_store=store)
-    resource = AntigravityResource(
-        id="a", credential_id="antigravity-oauth-01", access_token="legacy-token"
-    )
-    assert provider._access_token_for(resource) == "legacy-token"
-
-
-def test_provider_token_no_refresh_logic_exists():
-    """CURRENT boundary: antigravity has bearer tokens only — the resource
-    still carries refresh fields, but nothing consumes them."""
-    provider = AntigravityProvider(backend=RecordingBackend())
-    assert not hasattr(provider, "refresh")
-    assert not hasattr(provider.client, "refresh")
-
-
-# -- request path -------------------------------------------------------------
-
-async def test_client_bearer_token_comes_from_resolver():
-    backend = RecordingBackend()
-    client = AntigravityClient(
-        backend=backend,
-        token_resolver=lambda resource: "resolved-token",
-    )
-
-    await client.fetch_available_models(AntigravityResource(id="a"))
-
-    (call,) = backend.calls
-    assert call["headers"]["Authorization"] == "Bearer resolved-token"
-
-
 async def test_client_default_resolver_keeps_legacy_behavior():
-    backend = RecordingBackend()
+    backend = RoutingBackend()
     client = AntigravityClient(backend=backend)
 
     await client.fetch_available_models(
         AntigravityResource(id="a", access_token="legacy-token")
     )
-    assert backend.calls[0]["headers"]["Authorization"] == "Bearer legacy-token"
+    api_call = [c for c in backend.calls if "oauth2" not in c["url"]][0]
+    assert api_call["headers"]["Authorization"] == "Bearer legacy-token"
+    # static-token resources perform no token endpoint call at all
+    assert not [c for c in backend.calls if "oauth2" in c["url"]]
 
-    backend.calls.clear()
-    await client.fetch_available_models(AntigravityResource(id="a"))
-    assert "Authorization" not in backend.calls[0]["headers"]
+
+# -- material resolution --------------------------------------------------------
 
 
-async def test_provider_request_uses_credential_token_end_to_end():
-    backend = RecordingBackend()
+def test_provider_material_with_refresh_credential_uses_payload():
+    store = CredentialStore()
+    store.add(make_credential())
+    adapter = make_adapter(store)
+    resource = AntigravityResource(id="a", credential_id="antigravity-oauth-01")
+
+    material = adapter.material_for(resource)
+
+    assert material["refresh_token"] == "cred-refresh-token"
+    assert material["client_id"] == "cred-client-id"
+    assert material["client_secret"] == "cred-client-secret"
+
+
+def test_provider_material_static_access_token_compat():
+    """AUTH-002 compat: a credential carrying only a static access_token
+    still resolves (runtime seed), though validate() rejects it."""
+    store = CredentialStore()
+    store.add(
+        Credential(
+            id="antigravity-oauth-01",
+            type=CredentialType.OAUTH,
+            payload={"access_token": "cred-access-token"},
+        )
+    )
+    adapter = make_adapter(store)
+    resource = AntigravityResource(id="a", credential_id="antigravity-oauth-01")
+
+    material = adapter.material_for(resource)
+
+    assert material["access_token"] == "cred-access-token"
+    assert material["refresh_token"] == ""
+
+
+def test_provider_material_wrong_type_falls_back_to_legacy():
+    store = CredentialStore()
+    store.add(
+        Credential(id="antigravity-oauth-01", type=CredentialType.API_KEY, payload={})
+    )
+    adapter = make_adapter(store)
+    resource = AntigravityResource(
+        id="a", credential_id="antigravity-oauth-01", access_token="legacy-token"
+    )
+
+    material = adapter.material_for(resource)
+
+    assert material["access_token"] == "legacy-token"
+
+
+def test_provider_material_explicit_credential_wins_over_store():
+    store = CredentialStore()
+    store.add(make_credential())
+    adapter = make_adapter(store)
+    resource = AntigravityResource(id="a", credential_id="antigravity-oauth-01")
+    explicit = make_credential(refresh_token="explicit-refresh")
+
+    material = adapter.material_from(explicit, resource)
+
+    assert material["refresh_token"] == "explicit-refresh"
+
+
+# -- request path end-to-end ------------------------------------------------------
+
+
+async def test_provider_request_uses_credential_refresh_end_to_end():
+    """complete() resolves the credential via the adapter, refreshes at
+    the token endpoint through the shared backend, then calls the API."""
+    backend = RoutingBackend()
     store = CredentialStore()
     store.add(make_credential())
     provider = AntigravityProvider(backend=backend, credential_store=store)
     resource = AntigravityResource(
-        id="a", credential_id="antigravity-oauth-01", project_id="proj"
+        id="a",
+        credential_id="antigravity-oauth-01",
+        project_id="proj",
     )
 
     await provider.client.fetch_available_models(resource)
 
-    (call,) = backend.calls
-    assert call["headers"]["Authorization"] == "Bearer cred-access-token"
+    token_calls = [c for c in backend.calls if "oauth2.googleapis.com" in c["url"]]
+    api_calls = [c for c in backend.calls if "oauth2.googleapis.com" not in c["url"]]
+    assert len(token_calls) == 1
+    assert "grant_type=refresh_token" in token_calls[0]["data"].decode("utf-8")
+    assert api_calls[0]["headers"]["Authorization"] == "Bearer cred-access-token"
+
+
+async def test_provider_static_token_resource_makes_no_token_calls():
+    """Legacy static-token resources keep the pre-AUTH-006 behavior."""
+    backend = RoutingBackend()
+    provider = AntigravityProvider(backend=backend)
+    resource = AntigravityResource(id="a", access_token="legacy-token", project_id="p")
+
+    await provider.client.fetch_available_models(resource)
+
+    assert not [c for c in backend.calls if "oauth2.googleapis.com" in c["url"]]
+    api_calls = [c for c in backend.calls if "oauth2.googleapis.com" not in c["url"]]
+    assert api_calls[0]["headers"]["Authorization"] == "Bearer legacy-token"

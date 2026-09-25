@@ -20,13 +20,12 @@ import logging
 from typing import Any, AsyncIterator, Dict, List, Optional
 from urllib.parse import urlsplit
 
-from core.credential import CredentialType
 from core.health import HealthResult, HealthState
 from core.models import ChatChunk, ChatRequest, ChatResponse, ModelInfo
 from core.provider import Provider
 from core.resource import Resource
 
-from providers.firebase.auth import FirebaseAuth
+from providers.firebase.auth_adapter import FirebaseAuthAdapter
 from providers.firebase.client import FirebaseClient
 from providers.firebase.payload import build_payload, get_model_name
 from providers.firebase.resource import FirebaseResource
@@ -53,9 +52,12 @@ class FirebaseProvider(Provider):
         self._models = list(models) if models else list(DEFAULT_MODELS)
         self._http = http_client
         self._clients: Dict[str, FirebaseClient] = {}
-        # Optional CredentialStore (AUTH-002).  When a resource carries
-        # credential_id, its api_key/app_id/debug_token material is resolved
-        # from the referenced Credential instead of the legacy fields.
+        # Per-resource FirebaseAuthAdapter instances (AUTH-005).  The
+        # adapter owns the App Check lifecycle and the credential->material
+        # resolution; the Provider itself owns no auth logic.  Cache scope
+        # is resource-scoped: one adapter/JWT cache per Resource, even
+        # when Resources share a credential_id.
+        self._adapters: Dict[str, FirebaseAuthAdapter] = {}
         self._credential_store = credential_store
 
     # -- lifecycle / resource wiring --
@@ -64,41 +66,13 @@ class FirebaseProvider(Provider):
         """Inject an httpx.AsyncClient-compatible object (tests)."""
         self._http = client
         self._clients.clear()
+        self._adapters.clear()
 
     def set_credential_store(self, store: Any) -> None:
         """Attach the application-wide credential store (AUTH-002)."""
         self._credential_store = store
         self._clients.clear()
-
-    def _credential_for(self, resource: FirebaseResource) -> Optional[Any]:
-        if self._credential_store is None or not resource.credential_id:
-            return None
-        return self._credential_store.get(resource.credential_id)
-
-    def _firebase_material(self, resource: FirebaseResource) -> Dict[str, str]:
-        """Resolve project credentials: Credential payload first, legacy
-        fields as compatibility fallback (AUTH-002).
-
-        ``project_id`` is Resource identity (one Firebase Project = one
-        Resource); the Credential payload's project_id only fills the gap
-        when the Resource itself has none.
-        """
-        credential = self._credential_for(resource)
-        if credential is not None and credential.type is CredentialType.API_KEY:
-            payload = credential.payload
-            return {
-                "project_id": (
-                    resource.project_id or str(payload.get("project_id") or "")
-                ),
-                "app_id": str(payload.get("app_id") or resource.app_id or ""),
-                "api_key": str(payload.get("api_key") or resource.api_key or ""),
-                "debug_token": str(
-                    payload.get("debug_token") or resource.debug_token or ""
-                ),
-            }
-        from providers.firebase.client import resource_material
-
-        return resource_material(resource)
+        self._adapters.clear()
 
     async def _client_for(self, resource: FirebaseResource) -> FirebaseClient:
         """Return (and cache) the client + auth bound to one resource."""
@@ -108,14 +82,24 @@ class FirebaseProvider(Provider):
         http = self._http
         if http is None:
             http = self._build_http(resource)
-        auth = FirebaseAuth(client=http)
+        adapter = FirebaseAuthAdapter(
+            http=http,
+            credential_store=self._credential_store,
+        )
+        self._adapters[resource.id] = adapter
         client = FirebaseClient(
             http=http,
-            auth=auth,
-            material_resolver=lambda res: self._firebase_material(res),
+            auth=adapter.auth,
+            material_resolver=adapter.material_for,
         )
         self._clients[resource.id] = client
         return client
+
+    async def _auth_adapter_for(self, resource: FirebaseResource) -> FirebaseAuthAdapter:
+        """The per-resource auth adapter owning this resource's App Check
+        lifecycle (material resolution, exchange, invalidate)."""
+        await self._client_for(resource)
+        return self._adapters[resource.id]
 
     def _build_http(self, resource: FirebaseResource) -> Any:
         """Build an httpx client honouring the resource's optional proxy."""

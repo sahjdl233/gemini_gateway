@@ -28,11 +28,25 @@ class FirebaseAuth:
     EXCHANGE_URL = "https://firebaseappcheck.googleapis.com/v1"
     PRE_REFRESH_SECONDS = 300
 
-    def __init__(self, client: Any) -> None:
+    def __init__(self, client: Any, *, clock: Optional[Any] = None) -> None:
         self._client = client
+        # Optional injectable clock (AUTH-005, tests); defaults to time.time
+        # so runtime behaviour is unchanged.
+        self._clock = clock if clock is not None else time
         self._jwt: Optional[str] = None
         self._jwt_exp: float = 0.0
         self._lock = asyncio.Lock()
+
+    def _now(self) -> float:
+        now = getattr(self._clock, "time", None)
+        if now is not None and callable(now):
+            return float(now())
+        return float(time.time())
+
+    @property
+    def expires_at(self) -> float:
+        """Epoch seconds when the cached JWT expires (0 = none)."""
+        return self._jwt_exp
 
     async def get_jwt(
         self,
@@ -45,7 +59,7 @@ class FirebaseAuth:
     ) -> str:
         """Return a valid App Check JWT, refreshing if needed."""
         async with self._lock:
-            now = time.time()
+            now = self._now()
             if not force and self._jwt and self._jwt_exp > now + self.PRE_REFRESH_SECONDS:
                 return self._jwt
             jwt, exp = await self._exchange(
@@ -95,7 +109,7 @@ class FirebaseAuth:
         token = data["token"]
         ttl_str = str(data.get("ttl", "3600s")).rstrip("s")
         ttl = int(ttl_str) if ttl_str.isdigit() else 3600
-        return token, time.time() + ttl
+        return token, self._now() + ttl
 
     def invalidate(self) -> None:
         """Force invalidate cached JWT (call on 401)."""

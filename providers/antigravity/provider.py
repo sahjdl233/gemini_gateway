@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import json
 import logging
+import urllib.parse
 from codecs import getincrementaldecoder
-from typing import Any, AsyncIterator, Callable, Mapping, Optional, Sequence
+from typing import Any, AsyncIterator, Callable, Dict, Mapping, Optional, Sequence
 
-from core.credential import CredentialType
 from core.errors import ProtocolError, ProviderError
 from core.health import HealthResult, HealthState
 from core.model_registry import ModelInfo
@@ -17,13 +17,37 @@ from execution.http import HttpExecutionBackend
 from protocol.common import new_id
 from transport.proxy import ProxyConfig
 
-from .client import AntigravityClient, resource_access_token
+from .auth_adapter import AntigravityAuthAdapter
+from .client import AntigravityClient
 from .model_discovery import ModelDiscovery
 from .resource import AntigravityResource
 
 logger = logging.getLogger(__name__)
 
 DiscoveryResourceSource = Callable[[], Sequence[Resource]]
+
+
+class _BackendHttpPost:
+    """Minimal ``post(url, *, headers, data)`` surface over the provider's
+    shared ExecutionBackend (AUTH-006 wiring).
+
+    Lets the auth implementation issue its token endpoint call through the
+    same pooled transport as API requests without the backend learning
+    anything about OAuth.  ``data`` is a form dict, encoded here.
+    """
+
+    def __init__(self, backend: Any) -> None:
+        self._backend = backend
+
+    async def post(self, url: str, *, headers: Any = None, data: Any = None) -> Any:
+        body = (
+            urllib.parse.urlencode(data).encode("utf-8")
+            if data is not None
+            else None
+        )
+        return await self._backend.execute(
+            "POST", url, headers=headers, data=body
+        )
 
 
 def _require_resource(resource: Any) -> AntigravityResource:
@@ -85,14 +109,16 @@ class AntigravityProvider(Provider):
             max_connections=max_connections,
             max_keepalive_connections=max_keepalive_connections,
         )
-        # Optional CredentialStore (AUTH-002).  When a resource carries
-        # credential_id, its bearer token is resolved from the referenced
-        # Credential; resources without one keep using their access_token
-        # field.  No OAuth refresh lives here (CURRENT: bearer token only).
+        # Per-resource AntigravityAuthAdapter instances (AUTH-006).  The
+        # adapter owns the OAuth lifecycle (cache/refresh/rotation) and the
+        # credential->material resolution; the Provider itself owns no auth
+        # logic.  Cache scope is resource-scoped: one adapter/token cache
+        # per Resource, even when Resources share a credential_id.
+        self._adapters: Dict[str, AntigravityAuthAdapter] = {}
         self._credential_store = credential_store
         self.client = client or AntigravityClient(
             backend=self.backend,
-            token_resolver=self._access_token_for,
+            token_resolver=self._runtime_token_for,
         )
         self.discovery = ModelDiscovery(self.client)
         # A controlled, read-only resource view supplied by the application
@@ -104,21 +130,26 @@ class AntigravityProvider(Provider):
     def set_credential_store(self, store: Any) -> None:
         """Attach the application-wide credential store (AUTH-002)."""
         self._credential_store = store
+        self._adapters.clear()
 
-    def _credential_for(self, resource: AntigravityResource) -> Optional[Any]:
-        if self._credential_store is None or not resource.credential_id:
-            return None
-        return self._credential_store.get(resource.credential_id)
+    async def _adapter_for(self, resource: AntigravityResource) -> AntigravityAuthAdapter:
+        """The resource-scoped auth adapter owning this resource's OAuth
+        lifecycle.  Its auth implementation reuses the provider's shared
+        ExecutionBackend for token endpoint calls via a minimal post()
+        bridge — the backend itself learns nothing about OAuth."""
+        adapter = self._adapters.get(resource.id)
+        if adapter is None:
+            adapter = AntigravityAuthAdapter(
+                http=_BackendHttpPost(self.backend),
+                credential_store=self._credential_store,
+            )
+            self._adapters[resource.id] = adapter
+        return adapter
 
-    def _access_token_for(self, resource: AntigravityResource) -> Optional[str]:
-        """Resolve the bearer token: Credential payload first, legacy
-        access_token field as compatibility fallback (AUTH-002)."""
-        credential = self._credential_for(resource)
-        if credential is not None and credential.type is CredentialType.OAUTH:
-            token = credential.payload.get("access_token")
-            if token:
-                return str(token)
-        return resource_access_token(resource)
+    async def _runtime_token_for(self, resource: AntigravityResource) -> Optional[str]:
+        """Runtime bearer token for one request (may await a refresh)."""
+        adapter = await self._adapter_for(resource)
+        return await adapter.auth.get_access_token(resource)
 
     def set_discovery_resource_source(
         self, source: DiscoveryResourceSource

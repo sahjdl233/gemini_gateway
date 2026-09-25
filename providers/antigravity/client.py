@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 from typing import Any, Mapping, Optional
 
 import logging
@@ -75,6 +76,10 @@ class AntigravityClient:
         endpoint = f"{BASE_URL}/v1internal:{operation}"
         headers = {"Content-Type": "application/json"}
         token = self._token_resolver(resource)
+        if inspect.isawaitable(token):
+            # AUTH-006: the adapter-backed resolver runs the OAuth runtime
+            # (cache/refresh); the legacy static resolver stays sync.
+            token = await token
         if token:
             headers["Authorization"] = f"Bearer {token}"
         resp = await self._backend.execute(
@@ -186,6 +191,8 @@ class AntigravityClient:
         endpoint = f"{BASE_URL}/v1internal:streamGenerateContent?alt=sse"
         headers = {"Content-Type": "application/json"}
         token = self._token_resolver(resource)
+        if inspect.isawaitable(token):
+            token = await token
         if token:
             headers["Authorization"] = f"Bearer {token}"
         resp = await self._backend.execute_stream(
