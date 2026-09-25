@@ -274,3 +274,66 @@ def test_migrated_resource_resolves_via_credential_path():
         "client_id": "legacy-cid",
         "client_secret": "legacy-cs",
     }
+
+
+# -- AUTH-011 gap fill: PostgreSQL repository reuse semantics --------------------
+#
+# Same rules as above, proven against the durable repository (fake driver):
+# a NEW resource with an identity whose stable credential already exists
+# must reuse it — never overwrite, never duplicate — across migrations
+# that share one persistent store.
+
+
+def make_postgres_harness():
+    from core.credential_postgres import PostgreSQLCredentialRepository
+    from core.credential_encryption import CredentialEncryptor
+
+    harness = FakePostgres()
+    repo = PostgreSQLCredentialRepository(
+        harness.connection_factory(),
+        encryptor=CredentialEncryptor(os.urandom(32)),
+    )
+    return harness, repo
+
+
+def test_postgres_repo_reuses_stable_id_for_new_resource():
+    """Pre-seeded stable id + a brand-new resource object carrying newer
+    legacy fields: the existing credential wins, resource is repointed."""
+    harness, repo = make_postgres_harness()
+    stored = Credential(
+        id=legacy_credential_id("gemini_cli", "cli-01"),
+        type=CredentialType.OAUTH,
+        payload={"refresh_token": "stored-rt", "client_id": "stored-cid",
+                 "client_secret": "stored-cs"},
+    )
+    repo.add(stored)
+
+    new_resource = gemini_legacy_resource(refresh_token="newer-rt")
+
+    migrated = migrate_legacy_resource_credentials(repo, [new_resource])
+
+    assert migrated == 0
+    assert new_resource.credential_id == stored.id
+    reused = repo.get(stored.id)
+    assert reused.payload["refresh_token"] == "stored-rt"  # not overwritten
+    # encrypted at rest, no plaintext of either generation
+    assert "stored-rt" not in str(harness.raw_rows())
+    assert "newer-rt" not in str(harness.raw_rows())
+
+
+def test_postgres_repo_no_duplicate_across_two_migrations():
+    """Two migration passes sharing one persistent store (startup +
+    restart against the same PostgreSQL): exactly one row, second pass
+    creates nothing."""
+    harness, repo = make_postgres_harness()
+    resource = gemini_legacy_resource()
+
+    first = migrate_legacy_resource_credentials(repo, [resource])
+    rows_after_first = dict(harness.raw_rows())
+    second = migrate_legacy_resource_credentials(repo, [resource])
+
+    assert first == 1
+    assert second == 0
+    assert harness.raw_rows() == rows_after_first  # no rewrite, no duplicate
+    assert len(harness.raw_rows()) == 1
+    assert resource.credential_id == "legacy-gemini_cli-cli-01"

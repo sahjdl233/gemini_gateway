@@ -1,4 +1,4 @@
-"""Authenticated Antigravity Resource management API and lightweight UI."""
+"""Authenticated management API: Antigravity Resources + Credentials."""
 
 from __future__ import annotations
 
@@ -11,6 +11,13 @@ from fastapi import APIRouter, HTTPException, Request, status
 from fastapi.responses import HTMLResponse
 
 from app.management import ResourceManagementError, ResourceManager
+from core.credential import (
+    Credential,
+    CredentialRepository,
+    CredentialType,
+    DuplicateCredentialError,
+    UnknownCredentialError,
+)
 
 
 router = APIRouter(prefix="/admin", tags=["admin"])
@@ -270,3 +277,98 @@ async def delete_resource(resource_id: str, request: Request):
         await _manager(request).delete_resource(resource_id)
     except ResourceManagementError as exc:
         raise _not_found(exc) from exc
+
+
+# -- Credential management (AUTH-011) --------------------------------------------
+#
+# All operations go through the application-wide CredentialRepository
+# (``app.state.credential_store``) — never through PostgreSQL directly.
+# Responses carry the AUTH-002 redacted view only: secret-shaped payload
+# values are masked, plaintext secrets never leave the process.  In
+# postgres mode the repository persists encrypted envelopes; in memory
+# mode behaviour is unchanged (AUTH-002 in-memory store).
+
+
+def _credential_repository(request: Request) -> CredentialRepository:
+    return request.app.state.credential_store
+
+
+def _credential_http_error(exc: Exception) -> HTTPException:
+    if isinstance(exc, UnknownCredentialError):
+        return HTTPException(status_code=404, detail="credential not found")
+    if isinstance(exc, DuplicateCredentialError):
+        return HTTPException(status_code=409, detail="credential already exists")
+    return HTTPException(status_code=400, detail=str(exc))
+
+
+@router.get("/credentials")
+async def list_credentials(request: Request):
+    _require_admin(request)
+    repository = _credential_repository(request)
+    return [credential.redacted_dict() for credential in repository.list()]
+
+
+@router.get("/credentials/{credential_id}")
+async def get_credential(credential_id: str, request: Request):
+    _require_admin(request)
+    repository = _credential_repository(request)
+    try:
+        credential = repository.require(credential_id)
+    except UnknownCredentialError as exc:
+        raise _credential_http_error(exc) from exc
+    return credential.redacted_dict()
+
+
+@router.post("/credentials", status_code=status.HTTP_201_CREATED)
+async def create_credential(request: Request):
+    _require_admin(request)
+    body = await _json_object(request)
+    credential_id = body.get("id")
+    if not isinstance(credential_id, str) or not credential_id.strip():
+        raise HTTPException(status_code=400, detail="credential id is required")
+    raw_type = body.get("type", "none")
+    try:
+        credential_type = CredentialType(str(raw_type))
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400, detail=f"unknown credential type: {raw_type!r}"
+        ) from exc
+    payload = body.get("payload") or {}
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="payload must be an object")
+    try:
+        credential = Credential(
+            id=credential_id, type=credential_type, payload=payload
+        )
+        repository = _credential_repository(request)
+        repository.add(credential)
+    except (DuplicateCredentialError, UnknownCredentialError) as exc:
+        raise _credential_http_error(exc) from exc
+    return credential.redacted_dict()
+
+
+@router.patch("/credentials/{credential_id}")
+async def update_credential_payload(credential_id: str, request: Request):
+    _require_admin(request)
+    body = await _json_object(request)
+    payload = body.get("payload")
+    if not isinstance(payload, dict):
+        raise HTTPException(
+            status_code=400, detail="body must contain a 'payload' object"
+        )
+    try:
+        credential = _credential_repository(request).update_payload(
+            credential_id, payload
+        )
+    except UnknownCredentialError as exc:
+        raise _credential_http_error(exc) from exc
+    return credential.redacted_dict()
+
+
+@router.delete(
+    "/credentials/{credential_id}", status_code=status.HTTP_204_NO_CONTENT
+)
+async def delete_credential(credential_id: str, request: Request):
+    _require_admin(request)
+    # Idempotent per the repository contract: unknown ids are a no-op.
+    _credential_repository(request).remove(credential_id)
