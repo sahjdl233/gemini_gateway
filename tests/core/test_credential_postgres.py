@@ -266,6 +266,138 @@ def test_deterministic_list_order_and_tie_break(fake):
     assert [c.id for c in repo.list()] == ["c1", "c2", "k1"]
 
 
+# -- AUTH-009-FIX-01: atomic update_payload -------------------------------------
+#
+# Before the fix, update_payload() ran get() (an independent
+# connection/transaction) as a pre-check, then UPDATE — a TOCTOU window
+# where a concurrent delete between the two transactions would make the
+# UPDATE resurrect nothing / fail confusingly.  The fixed implementation
+# uses ONE transaction: SELECT type ... FOR UPDATE + UPDATE ... RETURNING.
+
+
+def _atomic_update_repo(fake, clock=None):
+    return PostgreSQLCredentialRepository(
+        fake.connection_factory(),
+        encryptor=CredentialEncryptor(os.urandom(32)),
+        clock=clock,
+    )
+
+
+def test_atomic_update_does_no_independent_pre_select(fake):
+    """A: update_payload must not issue get()'s SELECT-by-id as a
+    pre-existence check; existence is decided inside its own transaction
+    (SELECT ... FOR UPDATE + UPDATE ... RETURNING)."""
+    import json as _json
+
+    from core.credential_postgres import _SELECT_BY_ID_SQL
+
+    repo = _atomic_update_repo(fake)
+    repo.add(oauth_credential("c1"))
+    fake.connections.clear()
+
+    repo.update_payload("c1", {"refresh_token": "rt-2"})
+
+    executed = [c.executed for c in fake.connections]
+    assert len(executed) == 1  # exactly one connection/transaction
+    statements = executed[0]
+    select_by_id = " ".join(_SELECT_BY_ID_SQL.split())
+    assert select_by_id not in statements  # no independent get() pre-check
+    assert any("FOR UPDATE" in s for s in statements)
+    assert any("RETURNING" in s for s in statements)
+
+
+def test_atomic_update_unknown_credential_contract(fake):
+    """B: unknown id -> UnknownCredentialError; no UPDATE is issued."""
+    repo = _atomic_update_repo(fake)
+    with pytest.raises(UnknownCredentialError):
+        repo.update_payload("missing", {"x": 1})
+    (connection,) = fake.connections
+    executed = connection.executed
+    assert not any("RETURNING" in s for s in executed)  # no write attempted
+    assert connection.rollback_calls >= 1
+    assert connection.closed is True
+
+
+def test_atomic_update_returned_values_correct(fake):
+    """C: returned id/type/payload/created_at/updated_at all correct."""
+    from datetime import datetime, timezone
+
+    clock = FixedClock(datetime(2026, 1, 1, tzinfo=timezone.utc))
+    repo = _atomic_update_repo(fake, clock=clock)
+    credential = oauth_credential("c1")
+    credential.created_at = clock.now  # align domain stamps with the clock
+    credential.updated_at = clock.now
+    repo.add(credential)
+    original = repo.get("c1")
+
+    clock.advance(30)
+    updated = repo.update_payload("c1", {"refresh_token": "rt-new"})
+
+    assert updated.id == "c1"
+    assert updated.type is CredentialType.OAUTH
+    assert updated.payload == {"refresh_token": "rt-new"}
+    assert updated.created_at == original.created_at
+    assert updated.updated_at > original.updated_at
+
+
+def test_atomic_update_rollback_on_driver_failure(fake):
+    """D: UPDATE raises -> rollback -> connection closed -> original
+    infrastructure exception propagates (NOT UnknownCredentialError)."""
+    repo = _atomic_update_repo(fake)
+    repo.add(oauth_credential("c1"))
+    fake.connections.clear()
+
+    # fail the first execute of the next connection (the FOR UPDATE select)
+    def factory():
+        connection = fake.connection_factory()()
+        connection.fail_next_execute = RuntimeError("connection lost")
+        return connection
+
+    broken_repo = PostgreSQLCredentialRepository(
+        factory, encryptor=CredentialEncryptor(os.urandom(32))
+    )
+    with pytest.raises(RuntimeError) as exc_info:
+        broken_repo.update_payload("c1", {"x": 1})
+
+    assert not isinstance(exc_info.value, UnknownCredentialError)
+    (connection,) = fake.connections
+    assert connection.rollback_calls >= 1
+    assert connection.closed is True
+    # original payload untouched
+    assert repo.get("c1").payload == OAUTH_PAYLOAD
+
+
+def test_atomic_update_keeps_plaintext_out_of_raw_row(fake):
+    """E: after update, the raw DB row still only holds the envelope."""
+    import json as _json
+
+    repo = _atomic_update_repo(fake)
+    repo.add(oauth_credential("c1"))
+    repo.update_payload("c1", {"refresh_token": "rt-updated-secret"})
+
+    rendered = str(fake.raw_rows()["c1"])
+    assert "rt-updated-secret" not in rendered
+    envelope = _json.loads(fake.raw_rows()["c1"]["payload_encrypted"])
+    assert set(envelope) == {"v", "alg", "kid", "nonce", "ciphertext"}
+
+
+def test_atomic_update_regenerates_ciphertext(fake):
+    """F: payload A -> ciphertext A; payload B -> ciphertext B; both
+    differ (fresh nonce) and B decrypts correctly."""
+    import json as _json
+
+    repo = _atomic_update_repo(fake)
+    repo.add(oauth_credential("c1"))
+    ciphertext_a = fake.raw_rows()["c1"]["payload_encrypted"]
+
+    repo.update_payload("c1", {"refresh_token": "rt-b", "note": "payload B"})
+    ciphertext_b = fake.raw_rows()["c1"]["payload_encrypted"]
+
+    assert ciphertext_a != ciphertext_b
+    loaded = repo.get("c1")
+    assert loaded.payload == {"refresh_token": "rt-b", "note": "payload B"}
+
+
 # -- connection lifecycle ------------------------------------------------------------------
 
 

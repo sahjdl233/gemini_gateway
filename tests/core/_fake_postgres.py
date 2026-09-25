@@ -20,7 +20,8 @@ from core.credential_postgres import (
     _INSERT_CREDENTIAL_SQL,
     _LIST_CREDENTIALS_SQL,
     _SELECT_BY_ID_SQL,
-    _UPDATE_PAYLOAD_SQL,
+    _SELECT_TYPE_FOR_UPDATE_SQL,
+    _UPDATE_PAYLOAD_RETURNING_SQL,
     CREDENTIALS_SCHEMA_SQL,
 )
 
@@ -90,13 +91,21 @@ class FakePostgresConnection:
             return FakeCursor(
                 [self._as_jsonb(row)] if row else [], 1 if row else 0
             )
-        if statement == " ".join(_UPDATE_PAYLOAD_SQL.split()):
+        if statement == " ".join(_SELECT_TYPE_FOR_UPDATE_SQL.split()):
+            # Row lock emulation: real PostgreSQL would block concurrent
+            # deletes until this transaction ends.
+            (credential_id,) = params
+            row = self._table.get(credential_id)
+            return FakeCursor(
+                [{"type": row["type"]}] if row else [], 1 if row else 0
+            )
+        if statement == " ".join(_UPDATE_PAYLOAD_RETURNING_SQL.split()):
             envelope, updated_at, credential_id = params
             if credential_id not in self._table:
                 return FakeCursor([], 0)
             self._table[credential_id]["payload_encrypted"] = envelope
             self._table[credential_id]["updated_at"] = updated_at
-            return FakeCursor([], 1)
+            return FakeCursor([self._as_jsonb(self._table[credential_id])], 1)
         if statement == " ".join(_DELETE_CREDENTIAL_SQL.split()):
             (credential_id,) = params
             existed = self._table.pop(credential_id, None) is not None

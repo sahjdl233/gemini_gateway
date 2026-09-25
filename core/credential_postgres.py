@@ -25,8 +25,9 @@ Boundary rules frozen by AUTH-009:
   required to use or test it.  :func:`psycopg_connection_factory` is the
   only place that touches psycopg, and it imports lazily.
 * Duplicate detection relies on the PostgreSQL PRIMARY KEY constraint
-  (SQLSTATE 23505 → DuplicateCredentialError); driver exceptions are
-  never leaked through the contract.
+  (SQLSTATE 23505 → DuplicateCredentialError).  Other driver, database
+  and connection exceptions are NOT wrapped: they propagate unchanged so
+  infrastructure failures remain distinguishable from contract errors.
 * A corrupted row (bad envelope, tampered ciphertext, wrong key) raises
   :class:`CredentialDecryptionError` — corruption is never mistaken for
   "credential missing".
@@ -79,9 +80,13 @@ _SELECT_BY_ID_SQL = (
     "SELECT id, type, payload_encrypted, created_at, updated_at "
     "FROM credentials WHERE id = %s"
 )
-_UPDATE_PAYLOAD_SQL = (
+_SELECT_TYPE_FOR_UPDATE_SQL = (
+    "SELECT type FROM credentials WHERE id = %s FOR UPDATE"
+)
+_UPDATE_PAYLOAD_RETURNING_SQL = (
     "UPDATE credentials SET payload_encrypted = %s, updated_at = %s "
-    "WHERE id = %s"
+    "WHERE id = %s "
+    "RETURNING id, type, payload_encrypted, created_at, updated_at"
 )
 _DELETE_CREDENTIAL_SQL = "DELETE FROM credentials WHERE id = %s"
 _LIST_CREDENTIALS_SQL = (
@@ -232,28 +237,43 @@ class PostgreSQLCredentialRepository(CredentialRepository):
         credential_id: str,
         payload: Dict[str, Any],
     ) -> Credential:
-        row = self.get(credential_id)  # decrypt check + existence check
-        if row is None:
-            raise UnknownCredentialError(
-                f"credential '{credential_id}' is not registered"
-            )
-        aad = credential_aad(credential_id, row.type.value)
-        envelope = self._encryptor.encrypt_payload(
-            payload, associated_data=aad
-        )
-        updated_at = self._now()
+        """Atomically replace a credential's payload.
+
+        Single database transaction: ``SELECT type ... FOR UPDATE`` (row
+        lock; supplies the AAD type binding) followed by
+        ``UPDATE ... RETURNING``.  Existence is decided inside the same
+        transaction by the UPDATE itself — there is no independent
+        pre-SELECT, and a concurrent delete cannot slip through (the row
+        lock blocks it; a deleted row yields zero rows).
+
+        Failure semantics: unknown id -> UnknownCredentialError (with
+        rollback); any driver/database failure -> rollback and the
+        original infrastructure exception propagates — it is never
+        translated into UnknownCredentialError.
+        """
         with self._Transaction(self._connection_factory) as conn:
-            cursor = conn.execute(
-                _UPDATE_PAYLOAD_SQL,
-                (json.dumps(envelope), updated_at, credential_id),
-            )
-            if getattr(cursor, "rowcount", 1) == 0:
+            type_row = conn.execute(
+                _SELECT_TYPE_FOR_UPDATE_SQL, (credential_id,)
+            ).fetchone()
+            if type_row is None:
                 raise UnknownCredentialError(
                     f"credential '{credential_id}' is not registered"
                 )
-        row.payload = dict(payload)
-        row.updated_at = updated_at
-        return row
+            aad = credential_aad(credential_id, type_row["type"])
+            envelope = self._encryptor.encrypt_payload(
+                payload, associated_data=aad
+            )
+            updated_at = self._now()
+            cursor = conn.execute(
+                _UPDATE_PAYLOAD_RETURNING_SQL,
+                (json.dumps(envelope), updated_at, credential_id),
+            )
+            row = cursor.fetchone()
+            if row is None:  # defensive: deleted between lock and update
+                raise UnknownCredentialError(
+                    f"credential '{credential_id}' is not registered"
+                )
+        return self._decrypt_row(row)
 
     def remove(self, credential_id: str) -> None:
         with self._Transaction(self._connection_factory) as conn:
