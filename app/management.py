@@ -19,25 +19,50 @@ from core.pool import InMemoryPool
 from providers.antigravity.resource import AntigravityResource
 
 
+# WEBUI-001: the Admin Resource surface manages *runtime* configuration
+# only.  Long-lived credential material is owned by CredentialRepository and
+# reached through ``credential_id``; the legacy provider-specific secret
+# fields below stay on the Resource (startup compatibility, AUTH-010) but are
+# never an Admin WebUI / Resource API write target.
+_CREATE_FIELDS = (
+    "id",
+    "provider",
+)
 _EDITABLE_FIELDS = (
     "enabled",
     "credential_id",
+    "project_id",
+    "ide_type",
+)
+
+# Secret-like fields that must be rejected by the Admin Resource API.  The
+# rejection message never echoes the submitted value.
+_SECRET_FIELDS = (
     "access_token",
     "refresh_token",
     "client_id",
     "client_secret",
-    "project_id",
-    "ide_type",
+    "api_key",
+    "debug_token",
 )
-_PERSISTED_FIELDS = _EDITABLE_FIELDS + ("id", "provider", "token_expiry")
+
+# Legacy provider-specific credential fields: startup compatibility input and
+# existing config.yaml content only (AUTH-010).  They are preserved verbatim
+# on persist and are never writable through the Admin API.
+_LEGACY_CREDENTIAL_FIELDS = (
+    "access_token",
+    "refresh_token",
+    "client_id",
+    "client_secret",
+)
+
+_PERSISTED_FIELDS = (
+    _CREATE_FIELDS + _EDITABLE_FIELDS + ("token_expiry",) + _LEGACY_CREDENTIAL_FIELDS
+)
 
 
 class ResourceManagementError(Exception):
     """A safe management error whose message never contains credentials."""
-
-
-def _configured(value: Any) -> str | None:
-    return "configured" if value else None
 
 
 class ResourceManager:
@@ -60,6 +85,19 @@ class ResourceManager:
             resource.id: self._resource_values(resource)
             for resource in self._resources()
         }
+
+    @property
+    def _durable_credentials(self) -> bool:
+        """True when the durable CredentialRepository backend is active.
+
+        WEBUI-001: in postgres mode the Credential owns the long-lived
+        material, so Resource management must never (re)write it into
+        ``config.yaml``.  Existing legacy fields already in the file are left
+        untouched on purpose — this task does not widen the AUTH-010
+        migration scope.
+        """
+        repo_cfg = self.config.get("credential_repository") or {}
+        return str(repo_cfg.get("backend", "memory")).lower() == "postgres"
 
     def _read_source(self) -> Dict[str, Any]:
         if not self.config_path.exists():
@@ -132,11 +170,25 @@ class ResourceManager:
             "total_failures": resource.total_failures,
             "project_id": resource.project_id,
             "ide_type": resource.ide_type,
-            "access_token": _configured(resource.access_token),
-            "refresh_token": _configured(resource.refresh_token),
-            "client_id": _configured(resource.client_id),
-            "client_secret": _configured(resource.client_secret),
         }
+
+    @staticmethod
+    def _reject_secret_fields(payload: Dict[str, Any]) -> None:
+        """Refuse credential material in an Admin Resource mutation.
+
+        WEBUI-001: ``Resource`` is the runtime/scheduling object; durable
+        credential material belongs to ``Credential`` and is reached through
+        ``credential_id``.  The rejected *field names* are safe to report,
+        the submitted *values* never are.
+        """
+        offending = sorted(
+            field for field in _SECRET_FIELDS if field in payload
+        )
+        if offending:
+            raise ResourceManagementError(
+                "resource credential fields are managed through /admin/credentials: "
+                + ", ".join(offending)
+            )
 
     @staticmethod
     def _validate_values(values: Dict[str, Any], *, creating: bool) -> None:
@@ -145,6 +197,12 @@ class ResourceManager:
             if not isinstance(resource_id, str) or not resource_id.strip():
                 raise ResourceManagementError("resource id is required")
 
+        for field in _CREATE_FIELDS:
+            if field == "id":
+                continue
+            value = values.get(field)
+            if value is not None and not isinstance(value, str):
+                raise ResourceManagementError(f"{field} must be a string")
         if "enabled" in values and not isinstance(values["enabled"], bool):
             raise ResourceManagementError("enabled must be a boolean")
 
@@ -160,9 +218,10 @@ class ResourceManager:
     ) -> AntigravityResource:
         if "id" not in payload:
             raise ResourceManagementError("resource id is required")
+        self._reject_secret_fields(payload)
         values = {
             field: payload[field]
-            for field in _EDITABLE_FIELDS
+            for field in _CREATE_FIELDS + _EDITABLE_FIELDS
             if field in payload
         }
         values["id"] = payload["id"]
@@ -192,6 +251,7 @@ class ResourceManager:
     async def update_resource(
         self, resource_id: str, payload: Dict[str, Any]
     ) -> AntigravityResource:
+        self._reject_secret_fields(payload)
         unknown = set(payload) - set(_EDITABLE_FIELDS)
         if unknown:
             raise ResourceManagementError("resource contains unsupported fields")
@@ -258,6 +318,15 @@ class ResourceManager:
             }
             for field in _PERSISTED_FIELDS:
                 if field in ("id", "provider"):
+                    continue
+                if self._durable_credentials and field in _LEGACY_CREDENTIAL_FIELDS:
+                    # WEBUI-001: durable CredentialRepository owns the long-lived
+                    # material.  Never re-derive it from the live Resource, but do
+                    # not wipe pre-existing legacy keys out of config.yaml either
+                    # -- the startup migration path (AUTH-010) still consumes them
+                    # and this task deliberately does not widen that scope.
+                    if field in source:
+                        item[field] = source[field]
                     continue
                 current = getattr(resource, field, None)
                 original = self._original_values.get(resource.id, {}).get(field)

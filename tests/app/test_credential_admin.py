@@ -480,3 +480,81 @@ def test_referenced_credential_delete_consistent_after_runtime_binding(tmp_path,
     )
     assert response.status_code == 409
     assert repo.get("legacy-gemini_cli-cli-1") is not None
+
+
+# -- WEBUI-001: Credential section of the Admin surface --------------------------
+def test_credential_responses_carry_the_reference_flag(tmp_path, monkeypatch):
+    """The WebUI needs to know whether a Credential is still bound."""
+    with make_client(tmp_path, monkeypatch, config=_config_with_bound_resource()) as client:
+        bound = client.get("/admin/credentials/google-oauth-01", headers=ADMIN)
+        assert bound.status_code == 200
+        assert bound.json()["referenced"] is True
+        client.post(
+            "/admin/credentials",
+            headers=ADMIN,
+            json={"id": "unused-02", "type": "oauth",
+                  "payload": {"refresh_token": "rt"}},
+        )
+        free = client.get("/admin/credentials/unused-02", headers=ADMIN)
+        assert free.json()["referenced"] is False
+        listing = client.get("/admin/credentials", headers=ADMIN)
+        flags = {item["id"]: item["referenced"] for item in listing.json()}
+        assert flags == {"google-oauth-01": True, "unused-02": False}
+
+
+def test_credential_crud_never_returns_plaintext_secrets(tmp_path, monkeypatch):
+    """Create / read / update / delete stay redacted end to end."""
+    with make_client(tmp_path, monkeypatch) as client:
+        created = client.post("/admin/credentials", json=oauth_body(), headers=ADMIN)
+        assert created.status_code == 201
+        assert created.json()["payload"]["refresh_token"] == "***"
+        assert "super-secret-rt" not in created.text
+
+        listing = client.get("/admin/credentials", headers=ADMIN)
+        assert "super-secret-rt" not in listing.text
+        assert "super-secret-cs" not in listing.text
+
+        patched = client.patch(
+            "/admin/credentials/google-oauth-01",
+            headers=ADMIN,
+            json={"payload": {"refresh_token": "rotated-secret"}},
+        )
+        assert patched.status_code == 200
+        assert "rotated-secret" not in patched.text
+        assert patched.json()["payload"]["refresh_token"] == "***"
+
+        assert client.delete("/admin/credentials/google-oauth-01",
+                             headers=ADMIN).status_code == 204
+        assert client.get("/admin/credentials/google-oauth-01",
+                          headers=ADMIN).status_code == 404
+
+
+def test_credential_patch_goes_through_the_repository(tmp_path, monkeypatch):
+    """WEBUI-001 §6: updates always go through CredentialRepository."""
+    with make_client(tmp_path, monkeypatch) as client:
+        client.post("/admin/credentials", json=oauth_body(), headers=ADMIN)
+        repository = client.app.state.credential_store
+        original = repository.get("google-oauth-01")
+        assert original.payload["refresh_token"] == "super-secret-rt"
+        assert (
+            client.patch(
+                "/admin/credentials/google-oauth-01",
+                headers=ADMIN,
+                json={"payload": {"refresh_token": "new-rt"}},
+            ).status_code
+            == 200
+        )
+        # the repository (not a side store) holds the new material
+        assert repository.get("google-oauth-01").payload["refresh_token"] == "new-rt"
+
+
+def test_delete_referenced_credential_returns_409_and_keeps_it(
+    tmp_path, monkeypatch
+):
+    """AUTH-013 through the API used by the WebUI."""
+    with make_client(tmp_path, monkeypatch, config=_config_with_bound_resource()) as client:
+        response = client.delete("/admin/credentials/google-oauth-01", headers=ADMIN)
+        assert response.status_code == 409
+        assert "referenced" in response.text
+        assert client.get("/admin/credentials/google-oauth-01",
+                          headers=ADMIN).status_code == 200
