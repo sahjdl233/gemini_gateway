@@ -18,6 +18,7 @@ from fastapi import FastAPI
 from app.bootstrap import register_builtin_providers
 from app.routes.chat import router as chat_router
 from app.routes.models import router as models_router
+from app.routes.admin import mount_admin_assets
 from app.routes.admin import router as admin_router
 from app.management import ResourceManager
 from config.loader import default_config, load_config
@@ -231,6 +232,11 @@ def create_app(
     app.state.config = cfg
     app.state.resource_manager = resource_manager
     app.state.credential_store = credential_store
+    # WEBUI-002 §5: serve the compiled Vue SPA bundle from webui/dist. The
+    # mount is applied here (not on the router) so it lands under /admin/, and
+    # it is registered *before* the admin router so the SPA catch-all route
+    # cannot shadow the hashed asset URLs.
+    mount_admin_assets(app)
     app.include_router(models_router)
     app.include_router(chat_router)
     app.include_router(admin_router)

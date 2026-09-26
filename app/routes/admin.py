@@ -5,10 +5,12 @@ from __future__ import annotations
 import hmac
 import json
 import os
+from pathlib import Path
 from typing import Any, Dict
 
 from fastapi import APIRouter, HTTPException, Request, status
-from fastapi.responses import HTMLResponse
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 
 from app.management import ResourceManagementError, ResourceManager
 from core.credential import (
@@ -74,262 +76,33 @@ def _not_found(exc: ResourceManagementError) -> HTTPException:
     return HTTPException(status_code=400, detail=str(exc))
 
 
-@router.get("/", response_class=HTMLResponse, include_in_schema=False)
-async def admin_page() -> str:
-    return """<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Gemini Gateway Admin</title>
-  <style>
-    body{font:15px system-ui,sans-serif;max-width:1180px;margin:2rem auto;padding:0 1rem;color:#222}
-    table{border-collapse:collapse;width:100%}th,td{padding:.55rem;border-bottom:1px solid #ddd;text-align:left;vertical-align:top}
-    input{width:100%;box-sizing:border-box;padding:.45rem;margin:.2rem 0}
-    button{cursor:pointer;margin:.15rem;padding:.35rem .6rem}
-    form{border:1px solid #ddd;padding:1rem;margin:1rem 0;max-width:720px}
-    label{display:block;margin:.45rem 0}.muted{color:#666}.message{min-height:1.4em}
-    .disabled{opacity:.65}dialog{border:1px solid #aaa;padding:1rem;max-width:460px}
-    h2{margin-top:2.2rem;border-bottom:1px solid #ddd;padding-bottom:.3rem}
-    h3{margin-top:1.4rem}
-    textarea{width:100%;box-sizing:border-box;font-family:ui-monospace,monospace;padding:.45rem}
-    code{font-family:ui-monospace,monospace;font-size:.9em;word-break:break-all}
-  </style>
-</head>
-<body>
-  <h1>Gemini Gateway</h1>
-  <p class="muted">Dashboard &mdash; runtime Resources and long-lived Credentials</p>
-  <p>
-    <label>Admin token
-      <input id="token" type="password" autocomplete="off" size="40">
-    </label>
-    <button id="load" type="button">Refresh</button>
-  </p>
-  <div id="message" class="message"></div>
+# WEBUI-002 §5/§7: the Admin page is a compiled Vue 3 + Vite SPA served from
+# ``webui/dist``.  The Python module no longer embeds any HTML/JS: it only
+# resolves the built entry, serves the hashed assets, and applies an SPA
+# fallback for client-side routes.  The Admin *API* contract below is
+# unchanged from WEBUI-001.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_WEBUI_DIST = _REPO_ROOT / "webui" / "dist"
+_WEBUI_ASSETS = _WEBUI_DIST / "assets"
+_WEBUI_INDEX = _WEBUI_DIST / "index.html"
 
-  <h2>Resources</h2>
-  <p class="muted">
-    Runtime configuration and scheduling only. Long-lived credential material is
-    owned by a Credential and reached through <code>credential_id</code>.
-  </p>
-  <table id="resource-table">
-    <thead><tr>
-      <th>ID</th><th>Provider</th><th>Credential</th><th>Health</th><th>Cooldown</th>
-      <th>In flight</th><th>Requests</th><th>Failures</th><th>Actions</th>
-    </tr></thead>
-    <tbody id="resources"></tbody>
-  </table>
-  <h3 id="form-title">Add Resource</h3>
-  <form id="resource-form">
-    <input type="hidden" name="original_id">
-    <label>Resource ID<input name="id" required></label>
-    <label>Credential ID<input name="credential_id" autocomplete="off"></label>
-    <label>Project ID<input name="project_id"></label>
-    <label>IDE Type<input name="ide_type" value="ANTIGRAVITY"></label>
-    <label><input type="checkbox" name="enabled" checked> Enabled</label>
-    <button type="submit">Save</button>
-    <button id="cancel-edit" type="button" hidden>Cancel edit</button>
-  </form>
+_MISSING_WEBUI_HINT = (
+    "Admin WebUI bundle is not built. Run 'npm install && npm run build' "
+    f"in {_REPO_ROOT / 'webui'} and restart the gateway."
+)
 
-  <h2 id="credentials">Credentials</h2>
-  <p class="muted">
-    Managed through the CredentialRepository. Payloads are always redacted on
-    read; a stored payload is never rendered back into this page.
-  </p>
-  <p><button id="new-credential" type="button">New Credential</button></p>
-  <table id="credential-table">
-    <thead><tr>
-      <th>ID</th><th>Type</th><th>Payload (redacted)</th><th>Referenced</th>
-      <th>Created</th><th>Updated</th><th>Actions</th>
-    </tr></thead>
-    <tbody id="credential-rows"></tbody>
-  </table>
 
-  <dialog id="credential-dialog">
-    <form id="credential-form">
-      <h3 id="credential-dialog-title">New Credential</h3>
-      <label>Credential ID<input name="id" autocomplete="off" required></label>
-      <label>Type
-        <select name="type">
-          <option value="none">none</option>
-          <option value="oauth">oauth</option>
-          <option value="api_key">api_key</option>
-        </select>
-      </label>
-      <label>Payload JSON
-        <textarea name="payload" rows="8" spellcheck="false" placeholder='{&quot;refresh_token&quot;: &quot;...&quot;}'></textarea>
-      </label>
-      <p class="muted" id="payload-hint"></p>
-      <button type="submit">Save</button>
-      <button type="button" id="credential-cancel">Cancel</button>
-    </form>
-  </dialog>
-<script>
-const token = document.getElementById('token');
-const message = document.getElementById('message');
-const form = document.getElementById('resource-form');
-const tbody = document.getElementById('resources');
-const credTbody = document.getElementById('credential-rows');
-const credDialog = document.getElementById('credential-dialog');
-const credForm = document.getElementById('credential-form');
-let rows = [];
-let credentials = [];
-function esc(value) {
-  return String(value ?? '').replace(/[&<>"']/g, c => ({
-    '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'
-  }[c]));
-}
-async function api(path, options = {}) {
-  const headers = {'Authorization': 'Bearer ' + token.value};
-  if (options.body) headers['Content-Type'] = 'application/json';
-  const response = await fetch(path, {...options, headers});
-  const text = await response.text();
-  if (!response.ok) {
-    let detail = text;
-    try { detail = JSON.parse(text).detail || text; } catch (_) {}
-    throw new Error(detail);
-  }
-  return text ? JSON.parse(text) : null;
-}
-function renderResources() {
-  tbody.innerHTML = rows.map(r => `<tr class="${r.enabled ? '' : 'disabled'}">
-    <td>${esc(r.id)}</td><td>${esc(r.provider)}</td>
-    <td>${esc(r.credential_id || '')}</td>
-    <td>${esc(r.enabled ? 'enabled' : 'disabled')}</td>
-    <td>${esc(r.health)}</td><td>${esc(r.cooldown_until || 'none')}</td>
-    <td>${esc(r.in_flight)}</td><td>${esc(r.total_requests)}</td><td>${esc(r.total_failures)}</td>
-    <td>
-      <button data-action="enabled" data-id="${esc(r.id)}" data-value="${!r.enabled}">${r.enabled ? 'Disable' : 'Enable'}</button>
-      <button data-action="edit" data-id="${esc(r.id)}">Edit</button>
-      <button data-action="delete" data-id="${esc(r.id)}">Delete</button>
-    </td></tr>`).join('');
-}
-function renderCredentials() {
-  credTbody.innerHTML = credentials.map(c => `<tr>
-    <td>${esc(c.id)}</td><td>${esc(c.type)}</td>
-    <td><code>${esc(JSON.stringify(c.payload || {}))}</code></td>
-    <td>${c.referenced ? 'yes' : 'no'}</td>
-    <td>${esc(c.created_at || '')}</td><td>${esc(c.updated_at || '')}</td>
-    <td>
-      <button data-action="cred-edit" data-id="${esc(c.id)}">Edit</button>
-      <button data-action="cred-delete" data-id="${esc(c.id)}">Delete</button>
-    </td></tr>`).join('');
-}
-async function loadResources() {
-  try { rows = await api('/admin/resources'); renderResources(); message.textContent = ''; }
-  catch (error) { message.textContent = error.message; }
-}
-async function loadCredentials() {
-  try { credentials = await api('/admin/credentials'); renderCredentials(); }
-  catch (error) { message.textContent = error.message; }
-}
-function resetForm() {
-  form.reset(); form.elements.original_id.value = '';
-  form.elements.ide_type.value = 'ANTIGRAVITY'; form.elements.enabled.checked = true;
-  document.getElementById('form-title').textContent = 'Add Resource';
-  document.getElementById('cancel-edit').hidden = true;
-}
-function editResource(id) {
-  const resource = rows.find(item => item.id === id); if (!resource) return;
-  resetForm(); form.elements.original_id.value = resource.id; form.elements.id.value = resource.id;
-  for (const name of ['project_id', 'ide_type', 'credential_id']) form.elements[name].value = resource[name] || '';
-  form.elements.enabled.checked = resource.enabled;
-  document.getElementById('form-title').textContent = 'Edit Resource ' + resource.id;
-  document.getElementById('cancel-edit').hidden = false;
-}
-async function setEnabled(id, enabled) {
-  await api(`/admin/resources/${encodeURIComponent(id)}/${enabled ? 'enable' : 'disable'}`, {method:'POST'});
-  await loadResources();
-}
-async function deleteResource(id) {
-  if (!confirm(`Delete Resource "${id}"?`)) return;
-  await api('/admin/resources/' + encodeURIComponent(id), {method:'DELETE'});
-  await loadResources();
-}
-function openCredentialDialog(id) {
-  credForm.reset();
-  document.getElementById('credential-dialog-title').textContent =
-    id ? 'Edit Credential ' + id : 'New Credential';
-  document.getElementById('payload-hint').textContent = id
-    ? 'Leave the payload empty to keep the stored payload unchanged.'
-    : '';
-  credForm.elements.id.value = id || '';
-  credForm.elements.id.readOnly = Boolean(id);
-  // The stored payload is never read back into the form (redacted or not).
-  credForm.elements.payload.value = '';
-  if (id) {
-    const existing = credentials.find(item => item.id === id);
-    if (existing) credForm.elements.type.value = existing.type;
-  }
-  credDialog.showModal();
-}
-document.getElementById('new-credential').addEventListener('click', () => openCredentialDialog(null));
-document.getElementById('credential-cancel').addEventListener('click', () => credDialog.close());
-credTbody.addEventListener('click', async event => {
-  const button = event.target.closest('button[data-action]'); if (!button) return;
-  const id = button.dataset.id;
-  try {
-    if (button.dataset.action === 'cred-edit') { openCredentialDialog(id); return; }
-    if (!confirm(`Delete Credential "${id}"?`)) return;
-    await api('/admin/credentials/' + encodeURIComponent(id), {method:'DELETE'});
-    await loadCredentials();
-  } catch (error) { message.textContent = error.message; }
-});
-credForm.addEventListener('submit', async event => {
-  event.preventDefault();
-  const data = new FormData(credForm);
-  const id = String(data.get('id') || '').trim();
-  const raw = String(data.get('payload') || '').trim();
-  let payload = {};
-  if (raw) {
-    try { payload = JSON.parse(raw); }
-    catch (_) { message.textContent = 'Payload must be valid JSON'; return; }
-  }
-  try {
-    if (credForm.elements.id.readOnly) {
-      if (raw) {
-        await api('/admin/credentials/' + encodeURIComponent(id),
-                  {method:'PATCH', body: JSON.stringify({payload})});
-      }
-    } else {
-      await api('/admin/credentials', {method:'POST',
-                body: JSON.stringify({id, type: data.get('type'), payload})});
-    }
-    credDialog.close();
-    credForm.elements.payload.value = '';
-    message.textContent = '';
-    await loadCredentials();
-  } catch (error) { message.textContent = error.message; }
-});
-document.getElementById('load').addEventListener('click', () => {
-  loadResources(); loadCredentials();
-});
-document.getElementById('cancel-edit').addEventListener('click', resetForm);
-tbody.addEventListener('click', async event => {
-  const button = event.target.closest('button[data-action]'); if (!button) return;
-  try {
-    if (button.dataset.action === 'edit') editResource(button.dataset.id);
-    else if (button.dataset.action === 'enabled') await setEnabled(button.dataset.id, button.dataset.value === 'true');
-    else await deleteResource(button.dataset.id);
-  } catch (error) { message.textContent = error.message; }
-});
-form.addEventListener('submit', async event => {
-  event.preventDefault(); const data = new FormData(form); const payload = {};
-  for (const [key, value] of data.entries()) if (key !== 'original_id' && value !== '') payload[key] = value;
-  payload.enabled = data.get('enabled') === 'on';
-  const originalId = data.get('original_id');
-  try {
-    if (originalId) {
-      delete payload.id;
-      await api('/admin/resources/' + encodeURIComponent(originalId), {method:'PATCH', body:JSON.stringify(payload)});
-    }
-    else await api('/admin/resources', {method:'POST', body:JSON.stringify(payload)});
-    resetForm(); await loadResources();
-  } catch (error) { message.textContent = error.message; }
-});
-</script>
-</body>
-</html>"""
+def _webui_index_response() -> FileResponse:
+    """Return the compiled SPA entry (WEBUI-002 acceptance)."""
+    if not _WEBUI_INDEX.is_file():
+        raise HTTPException(status_code=503, detail=_MISSING_WEBUI_HINT)
+    return FileResponse(_WEBUI_INDEX, media_type="text/html")
+
+
+@router.get("/", include_in_schema=False)
+async def admin_page() -> FileResponse:
+    """Serve the compiled SPA entry at ``/admin/`` (WEBUI-002 §5)."""
+    return _webui_index_response()
 
 
 @router.get("/resources")
@@ -571,3 +344,37 @@ async def rotate_credential_key(request: Request):
     except CredentialEncryptionConfigError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return repository.rotate_key(new_encryptor)
+
+
+@router.get("/{spa_path:path}", include_in_schema=False)
+async def admin_spa_fallback(spa_path: str) -> FileResponse:
+    """SPA fallback for client-side routes (WEBUI-002 §5).
+
+    Declared last so every API route above wins the match; a deep link such as
+    ``/admin/credentials`` from a browser refresh resolves to the same entry
+    document the SPA router then handles in the browser.
+    """
+    del spa_path  # the SPA owns its own routing
+    return _webui_index_response()
+
+
+def mount_admin_assets(app: Any) -> bool:
+    """Serve ``/admin/assets/...`` from the Vite build output (WEBUI-002 §5).
+
+    ``APIRouter.mount`` would register the mount at the application root
+    (ignoring ``prefix``), which would publish the bundle at ``/assets/...``
+    instead of the ``/admin/assets/...`` URLs the built HTML references.  The
+    mount therefore has to be applied to the app by :func:`create_app`.
+
+    Returns ``True`` when the bundle is present.  When ``webui/dist`` has not
+    been built the route is simply not registered and ``/admin/`` answers 503
+    with build instructions instead of crashing the whole gateway.
+    """
+    if not _WEBUI_ASSETS.is_dir():
+        return False
+    app.mount(
+        "/admin/assets",
+        StaticFiles(directory=str(_WEBUI_ASSETS)),
+        name="admin-assets",
+    )
+    return True

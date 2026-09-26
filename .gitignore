@@ -29,3 +29,11 @@ Thumbs.db
 
 # Reference source only — not part of the gateway code
 vertex-singbox/
+
+# WEBUI-002: the Vue 3 + Vite Admin frontend. Dependencies and build output
+# are reproducible from webui/package.json + package-lock.json, so only the
+# source tree and the lockfile are tracked.
+webui/node_modules/
+webui/dist/
+webui/*.local
+webui/npm-debug.log*

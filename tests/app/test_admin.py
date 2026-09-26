@@ -4,10 +4,15 @@ WEBUI-001: the Admin Resource surface manages *runtime* configuration only.
 Long-lived credential material belongs to Credential and is reached through
 ``credential_id``; the Resource API must refuse secret fields outright and the
 WebUI must not offer them as inputs.
+
+WEBUI-002: ``/admin/`` is served from the compiled Vue 3 + Vite bundle in
+``webui/dist`` (no Python inline HTML), with assets under ``/admin/assets/``.
 """
 from __future__ import annotations
 
 import os
+import re
+from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
@@ -63,36 +68,92 @@ def test_admin_requires_authentication(tmp_path, monkeypatch):
     assert response.status_code == 401
 
 
-# -- WEBUI: no Resource credential inputs (WEBUI-001 §1) --------------------------
-def test_admin_page_has_no_resource_credential_inputs(tmp_path, monkeypatch):
+# -- WebUI: built Vue SPA is served, not Python inline HTML (WEBUI-002 §5/§8) ---
+SECRET_FIELD_NAMES = (
+    "access_token",
+    "refresh_token",
+    "client_id",
+    "client_secret",
+    "api_key",
+    "debug_token",
+)
+
+
+def _webui_dist() -> Path:
+    return Path(__file__).resolve().parents[2] / "webui" / "dist"
+
+
+def test_admin_page_serves_built_spa_entry(tmp_path, monkeypatch):
+    """GET /admin/ returns webui/dist/index.html, not inline Python HTML."""
+    index = _webui_dist() / "index.html"
+    if not index.is_file():
+        pytest.skip("webui/dist not built; run `npm install && npm run build` in webui/")
     with _client(tmp_path, monkeypatch) as client:
         response = client.get("/admin/")
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/html")
-    for field in (
-        "access_token",
-        "refresh_token",
-        "client_id",
-        "client_secret",
-        "api_key",
-        "debug_token",
-    ):
-        assert f'name="{field}"' not in response.text
+    assert response.text == index.read_text(encoding="utf-8")
+    # The Vite entry mounts an empty root div; the old inline page shipped
+    # server-rendered tables and an inline <script> instead.
+    assert '<div id="app"></div>' in response.text
+    assert "<table" not in response.text
+    assert "addEventListener" not in response.text
 
 
-def test_admin_page_exposes_resources_and_credentials_sections(tmp_path, monkeypatch):
+def test_admin_page_assets_are_served_with_correct_content_types(
+    tmp_path, monkeypatch
+):
+    """Hashed build assets resolve under /admin/assets/ (WEBUI-002 §5)."""
+    index = _webui_dist() / "index.html"
+    if not index.is_file():
+        pytest.skip("webui/dist not built; run `npm install && npm run build` in webui/")
+    body = index.read_text(encoding="utf-8")
+    urls = re.findall(r'(?:src|href)="(/admin/assets/[^"]+)"', body)
+    assert urls, "built index.html must reference /admin/assets/..."
     with _client(tmp_path, monkeypatch) as client:
-        body = client.get("/admin/").text
-    assert "Resources" in body
-    assert "Credentials" in body
-    assert "redacted" in body.lower()
+        for url in urls:
+            asset = client.get(url)
+            assert asset.status_code == 200, url
+            assert asset.content, url
+        script = client.get(next(u for u in urls if u.endswith(".js")))
+    assert "javascript" in script.headers["content-type"]
 
 
-def test_admin_page_embeds_no_secret_material(tmp_path, monkeypatch):
+def test_admin_spa_fallback_serves_entry_for_client_routes(tmp_path, monkeypatch):
+    """SPA fallback never shadows the Admin API (WEBUI-002 §5)."""
+    index = _webui_dist() / "index.html"
+    if not index.is_file():
+        pytest.skip("webui/dist not built; run `npm install && npm run build` in webui/")
+    entry = index.read_text(encoding="utf-8")
     with _client(tmp_path, monkeypatch) as client:
-        body = client.get("/admin/").text
+        # An unknown client-side route falls back to the SPA entry...
+        assert client.get("/admin/some-client-route").text == entry
+        # ...while real API paths keep their own semantics.
+        assert client.get("/admin/resources").status_code == 401
+        assert client.get(
+            "/admin/resources", headers=ADMIN
+        ).status_code == 200
+        missing = client.get("/admin/resources/does-not-exist", headers=ADMIN)
+    assert missing.status_code == 404
+
+
+def test_built_admin_bundle_has_no_resource_credential_inputs(tmp_path, monkeypatch):
+    """The shipped bundle offers no Resource credential form fields (§8)."""
+    assets = _webui_dist() / "assets"
+    if not assets.is_dir():
+        pytest.skip("webui/dist not built; run `npm install && npm run build` in webui/")
+    sources = _webui_dist() / "index.html"
+    bundles = [p for p in assets.iterdir() if p.suffix in (".js", ".css")]
+    assert bundles, "expected hashed JS/CSS bundles in webui/dist/assets"
+    combined = sources.read_text(encoding="utf-8") + "".join(
+        p.read_text(encoding="utf-8") for p in bundles
+    )
+    for field in SECRET_FIELD_NAMES:
+        assert f'name="{field}"' not in combined
+    # Placeholder text on the Credential payload editor is the one legitimate
+    # mention of a secret-shaped key, and it lives in the credential form.
     for secret in ("access-secret-a", "refresh-secret-a", "client-secret-a"):
-        assert secret not in body
+        assert secret not in combined
 
 
 # -- Resource API: runtime fields only (WEBUI-001 §1) ----------------------------
