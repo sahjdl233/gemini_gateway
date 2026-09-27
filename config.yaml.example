@@ -76,6 +76,11 @@ providers:
 # anonymous_vertex（Anonymous Vertex / Agent Platform studio）
 # 这是第一个真实上游（非官方接口，反向工程性质）。api_key 可省略（走匿名 key）；如需自定义，
 # 通过环境变量占位符注入，禁止把真实 key 写进配置。
+# 注意：每次请求都需要获取 reCAPTCHA Enterprise token。默认运行路径为
+# fetch_recaptcha_token()，会真实访问 https://www.google.com/recaptcha/enterprise/
+# 的 anchor（GET）+ reload（POST）流程；因此该 provider 在运行时依赖 Google 的
+# reCAPTCHA 端点可用性。FakeRecaptchaTokenProvider 仅为测试替身，仅在注入
+# token_fetcher / 调用 set_token_fetcher() 时使用，不是运行时默认实现。
   anonymous_vertex:
     enabled: true
     # 模型列表（可选）：覆盖内置文本模型清单。缺省使用 provider 内置清单

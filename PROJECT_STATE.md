@@ -58,7 +58,7 @@ Currently registered as builtin providers in `app/bootstrap.py`:
 | provider_id | directory | notes |
 |---|---|---|
 | `fake` | `providers/fake/` | Offline test scenarios. |
-| `anonymous_vertex` | `providers/anonymous_vertex/` | **Unofficial, reverse-engineered** Google Agent Platform (`batchGraphql`) interface; not a supported API. |
+| `anonymous_vertex` | `providers/anonymous_vertex/` | **Unofficial, reverse-engineered** Google Agent Platform (`batchGraphql`) interface; not a supported API. Each request goes through a live reCAPTCHA Enterprise token flow. |
 | `firebase` | `providers/firebase/` | Firebase AI Logic (`firebasevertexai`). One Firebase Project = one Resource. |
 | `gemini_cli` | `providers/gemini_cli/` | Google Code Assist (`cloudcode-pa.googleapis.com/v1internal`, OAuth Bearer). One Google account = one Resource. |
 | `antigravity` | `providers/antigravity/` | Currently the only provider on the `ExecutionBackend` seam. |
@@ -121,8 +121,14 @@ CredentialRepository
 - `anonymous_vertex` targets a non-official, reverse-engineered endpoint, so it
   is exposed to upstream changes, TLS ClientHello fingerprinting and anti-bot
   measures.
-- `anonymous_vertex` needs a reCAPTCHA Enterprise token per request; the
-  bundled token provider is a fake/offline source, not a live solver.
+- `anonymous_vertex` obtains a reCAPTCHA Enterprise token for every request. The
+  default runtime path is `fetch_recaptcha_token()`, which performs real Google
+  reCAPTCHA anchor (GET) and reload (POST) requests against
+  `https://www.google.com/recaptcha/enterprise/...`. `FakeRecaptchaTokenProvider`
+  is a deterministic, network-free test double; it is only used when a
+  `token_fetcher` is injected (or `set_token_fetcher()` is called), never as the
+  runtime default. This makes the provider dependent on a live reCAPTCHA flow
+  and on Google's endpoint availability.
 - Model-family support varies per provider and follows each provider's
   configured model snapshot.
 - Only `providers/antigravity/` has been migrated to `ExecutionBackend`; the
