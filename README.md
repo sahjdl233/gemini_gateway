@@ -2,7 +2,7 @@
 
 独立于 OmniRoute 的 Gemini 专用 Gateway：对外提供统一的 OpenAI-compatible API，对内通过可插拔 Provider Adapter 接入不同 Gemini 上游。
 
-> 当前阶段（TASK-002）已接入第一个真实上游 anonymous_vertex（Anonymous Vertex / Agent Platform studio 逆向协议），同时保留 fake 用于离线测试。不存储任何 Google 凭据。
+> 当前阶段：Post-WEBUI-002 / Post-AUTH-015。已集成多个 Provider（fake / anonymous_vertex / firebase / gemini_cli / antigravity），并具备 Credential 架构、PostgreSQL 加密落库与 Vue 3 Admin WebUI。
 
 ## 架构
 
@@ -22,10 +22,11 @@ Provider Adapter (Provider 抽象)
 Anonymous Vertex / Agent Platform studio (batchGraphql)
 ```
 
-核心原则（TASK-000 第 1-27 条）：
+核心原则（源自项目初始设计约定）：
 
 - Provider 与 Scheduler 彻底分离：Scheduler 不知道 Google 协议。
 - Resource 是核心抽象：Firebase=Project、Vertex=Egress/Session、CLI=Credential/Account。
+- 敏感认证材料不作为 Resource 字段直接存储：Resource 只持有 `credential_id`，凭据由 Credential 体系管理。
 - 429 是一等公民：RateLimitError 携带 retry_after / provider / resource_id / scope。
 - Cooldown 支持 Retry-After，缺失时用指数退避 + jitter，禁止写死 sleep。
 - Streaming 从第一天设计：Provider -> AsyncIterator[ChatChunk] -> Gateway SSE。
@@ -73,14 +74,15 @@ curl -N -X POST http://127.0.0.1:8000/v1/chat/completions \
 
 ## 配置
 
-第一版不使用数据库，使用 YAML 文件：
+配置使用 YAML 文件：
 
 - config.yaml —— 运行时配置（可选，缺省使用内置 fake 配置）
-- config.yaml.example —— 配置示例（含 anonymous_vertex 用法）
+- config.yaml.example —— 配置示例
 
-敏感信息一律通过环境变量占位符注入，禁止写入 Git。TASK-002 的 anonymous_vertex
-默认走 Google 公开匿名 key；如需自定义 api_key 或代理，请用环境变量占位符，
-禁止把真实 key 写进配置（见 config.yaml.example）。
+敏感信息一律通过环境变量占位符注入，禁止写入 Git。
+- GEMINI_GATEWAY_ENCRYPTION_KEYS / GEMINI_GATEWAY_ENCRYPTION_KEY_ID 控制 AES-256-GCM 加密 keyring / key rotation
+- GEMINI_GATEWAY_ENCRYPTION_KEY 提供 legacy 兼容 key（如源码仍保留）
+- GEMINI_GATEWAY_DATABASE_URL 控制 PostgreSQL Credential backend
 
 ## 目录结构
 
@@ -89,7 +91,7 @@ app/          FastAPI 应用与路由
 core/         models / provider / resource / pool / scheduler / errors / health / cooldown
 protocol/     openai / gemini / common（HTTP <-> 内部模型 <-> Provider）
 transport/    http / proxy / streaming（Proxy 独立于 Provider）
-providers/    fake(已实现) / anonymous_vertex(已实现) / firebase(已实现) / vertex(已实现) / gemini_cli(已实现) / antigravity(已实现)
+providers/    fake / anonymous_vertex / firebase / gemini_cli / antigravity / vertex
 config/       YAML/JSON 加载与 env 占位符替换
 tests/        core / protocol / providers / app
 ```

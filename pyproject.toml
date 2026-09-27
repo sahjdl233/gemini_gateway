@@ -1,7 +1,7 @@
 [project]
 name = "gemini-gateway"
 version = "0.1.0"
-description = "OpenAI-compatible Gemini Gateway (TASK-000 architecture skeleton; no real Google access)"
+description = "OpenAI-compatible Gemini Gateway with multiple Provider integrations (fake / anonymous_vertex / firebase / gemini_cli / antigravity)"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [

@@ -1,9 +1,8 @@
 # Gemini Gateway 配置示例（复制为 config.yaml 使用）
 # 敏感信息一律通过环境变量占位符注入，禁止写入 Git。
-# 占位符写法：NAME 来自环境变量 FIREBASE_PROJECT_01（TASK-002 起）。
+# 占位符写法：NAME 来自环境变量 FIREBASE_PROJECT_01。
 #
-# TASK-002 已接入第一个真实上游 anonymous_vertex（Anonymous Vertex /
-# Agent Platform studio 逆向协议）；fake 仅用于离线测试。
+# 当前已集成 anonymous_vertex / firebase / gemini_cli / antigravity 等 Provider。
 # 真实敏感信息（api_key 等）一律通过环境变量占位符注入，禁止写死。
 
 server:
@@ -67,8 +66,8 @@ providers:
         scenario: rate_limit
         retry_after: 1.0           # 模拟上游 Retry-After（秒）
 
-# TASK-002: Anonymous Vertex（Anonymous Vertex / Agent Platform studio）
-# 这是第一个真实 Google 上游。api_key 可省略（走匿名 key）；如需自定义，
+# anonymous_vertex（Anonymous Vertex / Agent Platform studio）
+# 这是第一个真实上游（非官方接口，反向工程性质）。api_key 可省略（走匿名 key）；如需自定义，
 # 通过环境变量占位符注入，禁止把真实 key 写进配置。
   anonymous_vertex:
     enabled: true

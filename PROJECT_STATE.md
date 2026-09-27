@@ -1,7 +1,7 @@
 # Gemini Gateway
 
 Current Phase:
-TASK-002
+Post-WEBUI-002 / Post-AUTH-015 maintenance state
 
 Completed:
 - Core architecture: models, resources, pools, scheduler, errors, health, cooldown
