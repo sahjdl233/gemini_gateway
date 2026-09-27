@@ -40,19 +40,26 @@ model_registry:
 # 另：AUTH-010 会在 postgres 模式下自动把 Resource 的 legacy 凭据字段
 # （refresh_token/client_secret 等）迁移为加密 Credential 并回填
 # credential_id——legacy 字段保留为兼容路径，无需手工迁移。
+# 推荐写法：把长期认证材料集中放在 credentials 里，Resource 只写
+# credential_id + 非敏感字段（如 project_id）。取消注释即可启用；下方
+# firebase / gemini_cli 的 resources 已预留对应的 credential_id 注释行。
+#
 # credentials:
-#   - id: google-oauth-01
-#     type: oauth
-#     payload:
-#       refresh_token: ${GEMINI_CLI_01_REFRESH_TOKEN}
-#       client_id: ${GEMINI_CLI_01_CLIENT_ID}
-#       client_secret: ${GEMINI_CLI_01_CLIENT_SECRET}
+#   # Firebase：api_key / app_id / debug_token
 #   - id: firebase-01
 #     type: api_key
 #     payload:
 #       api_key: ${FIREBASE_01_API_KEY}
 #       app_id: ${FIREBASE_01_APP_ID}
 #       debug_token: ${FIREBASE_01_DEBUG_TOKEN}
+#
+#   # Gemini CLI：OAuth（refresh_token / client_id / client_secret）
+#   - id: google-oauth-01
+#     type: oauth
+#     payload:
+#       refresh_token: ${GEMINI_CLI_01_REFRESH_TOKEN}
+#       client_id: ${GEMINI_CLI_01_CLIENT_ID}
+#       client_secret: ${GEMINI_CLI_01_CLIENT_SECRET}
 
 providers:
   fake:
@@ -87,8 +94,9 @@ providers:
         #   port: PROXY_PORT
 
 # ---- TASK-004: Firebase AI Logic（firebasevertexai）----
-# 一个 Firebase Project = 一个 Resource。凭证（api_key / app_id / debug_token）
-# 一律通过环境变量占位符注入，禁止写死；真实凭证不得提交到 Git。
+# 一个 Firebase Project = 一个 Resource。
+# 推荐：凭证放在上方 credentials 定义的 Credential 里，Resource 只写
+# credential_id + project_id。project_id 属于非敏感字段。
   firebase:
     enabled: true
     # 模型列表（配置快照，非上游探测）：覆盖默认清单（gemini-3.8-flash /
@@ -98,7 +106,11 @@ providers:
     #   - gemini-3.7-flash
     resources:
       - id: firebase-project-01
+        # 推荐：引用上方 credentials 中的 firebase-01（api_key/app_id/debug_token）
+        # credential_id: firebase-01
         project_id: FIREBASE_PROJECT_01
+        # ---- legacy 兼容路径：以下为 Resource 上的 inline 凭据字段。
+        # 仅在迁移期/无 Credential 后端时使用；新配置请改用上面的 credential_id。
         api_key: ${FIREBASE_01_API_KEY}
         app_id: ${FIREBASE_01_APP_ID}
         debug_token: ${FIREBASE_01_DEBUG_TOKEN}
@@ -113,7 +125,8 @@ providers:
 # 协议：cloudcode-pa.googleapis.com/v1internal（OAuth Bearer）。
 # 每个资源 = 一个 Google OAuth 账号（凭证经浏览器一次性 onboarding 后落盘，
 # 引导脚本见 docs/TASK-008-IMPLEMENTATION.md）。
-# 敏感凭证一律通过环境变量占位符注入，禁止写死。
+# 推荐：OAuth 材料放在上方 credentials 定义的 Credential 里，Resource 只写
+# credential_id + project_id。project_id 属于非敏感字段。
   gemini_cli:
     enabled: true
     # 模型列表（配置快照）：覆盖默认清单（gemini-2.5-flash / gemini-2.5-pro）
@@ -121,9 +134,10 @@ providers:
     #   - gemini-2.5-flash
     resources:
       - id: cli-account-01
-        # 可选：引用上方 credentials 定义的凭据（AUTH-002）；未设置时
-        # 继续使用下方 legacy 字段（兼容路径）。
+        # 推荐：引用上方 credentials 定义的凭据（AUTH-002）
         # credential_id: google-oauth-01
+        # ---- legacy 兼容路径：以下为 Resource 上的 inline 凭据字段。
+        # 仅在迁移期/无 Credential 后端时使用；新配置请改用上面的 credential_id。
         # 首次 onboarding 后写入 resource 的字段（令牌/项目由脚本生成）：
         refresh_token: ${GEMINI_CLI_01_REFRESH_TOKEN}
         client_id: ${GEMINI_CLI_01_CLIENT_ID}

@@ -16,7 +16,7 @@ Gemini Gateway (FastAPI + Scheduler)
 Provider Adapter (Provider 抽象)
         |            |
         v            v
-  AnonymousVertex  FakeProvider  GeminiCLI  Firebase  Vertex  Antigravity
+  AnonymousVertex  FakeProvider  GeminiCLI  Firebase  Antigravity
         |
         v
 Anonymous Vertex / Agent Platform studio (batchGraphql)
@@ -84,6 +84,59 @@ curl -N -X POST http://127.0.0.1:8000/v1/chat/completions \
 - GEMINI_GATEWAY_ENCRYPTION_KEY 提供 legacy 兼容 key（如源码仍保留）
 - GEMINI_GATEWAY_DATABASE_URL 控制 PostgreSQL Credential backend
 
+### Credential 配置
+
+长期认证材料统一放在 `credentials` 里，Resource 通过 `credential_id` 引用，
+Resource 上只保留 `project_id` 等非敏感字段：
+
+```yaml
+credentials:
+  - id: firebase-01
+    type: api_key
+    payload:
+      api_key: ${FIREBASE_01_API_KEY}
+      app_id: ${FIREBASE_01_APP_ID}
+      debug_token: ${FIREBASE_01_DEBUG_TOKEN}
+  - id: google-oauth-01
+    type: oauth
+    payload:
+      refresh_token: ${GEMINI_CLI_01_REFRESH_TOKEN}
+      client_id: ${GEMINI_CLI_01_CLIENT_ID}
+      client_secret: ${GEMINI_CLI_01_CLIENT_SECRET}
+
+providers:
+  firebase:
+    enabled: true
+    resources:
+      - id: firebase-project-01
+        credential_id: firebase-01
+        project_id: FIREBASE_PROJECT_01
+```
+
+Legacy 的 provider-specific 凭据字段（直接写在 Resource 上的
+`api_key` / `refresh_token` 等）仍然受支持，仅作为迁移 / 兼容路径；在
+postgres backend 下会自动迁移为加密 Credential 并回填 `credential_id`。
+
+## Admin WebUI
+
+Admin WebUI 使用 **Vue 3 + TypeScript + Vite**，前端源码位于 `webui/`：
+
+- Dashboard / Resources / Credentials 三个视图，敏感字段在 UI 与 API 响应中均脱敏
+- Admin API 由 `ADMIN_TOKEN` 环境变量保护
+
+构建：
+
+```bash
+cd webui
+npm install
+npm run build
+```
+
+产物输出到 `webui/dist`，由 FastAPI 通过 `mount_admin_assets()` 提供服务。
+
+生产部署只需 **Python / Uvicorn + `webui/dist`**：Node.js / npm 仅用于前端开发
+和重新构建 bundle，gateway 运行本身不需要 Node。
+
 ## 目录结构
 
 ```
@@ -91,10 +144,17 @@ app/          FastAPI 应用与路由
 core/         models / provider / resource / pool / scheduler / errors / health / cooldown
 protocol/     openai / gemini / common（HTTP <-> 内部模型 <-> Provider）
 transport/    http / proxy / streaming（Proxy 独立于 Provider）
-providers/    fake / anonymous_vertex / firebase / gemini_cli / antigravity / vertex
+execution/    ExecutionBackend 抽象与 HTTP 实现（当前仅 antigravity 已接入）
+providers/    fake / anonymous_vertex / firebase / gemini_cli / antigravity
 config/       YAML/JSON 加载与 env 占位符替换
 tests/        core / protocol / providers / app
+webui/        Admin WebUI 前端（Vue 3 + TypeScript + Vite），构建产物在 webui/dist
 ```
+
+当前在 `app/bootstrap.py` 中注册的 builtin provider 为：
+`fake` / `anonymous_vertex` / `firebase` / `gemini_cli` / `antigravity`。
+`providers/vertex/` 目录虽然存在，但未注册为 builtin provider，不属于当前
+运行时 provider 集合。
 
 ## 测试原则
 
