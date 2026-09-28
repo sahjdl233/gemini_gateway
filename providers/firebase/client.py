@@ -99,6 +99,7 @@ class FirebaseClient:
                 material["api_key"],
                 material["debug_token"],
                 force=(attempt == 1),
+                resource_id=getattr(resource, "id", None),
             )
             headers = self._build_headers(material, jwt)
             url = self._build_url(material["project_id"], model, streaming=False)
@@ -145,6 +146,7 @@ class FirebaseClient:
                 material["api_key"],
                 material["debug_token"],
                 force=(attempt == 1),
+                resource_id=getattr(resource, "id", None),
             )
             headers = self._build_headers(material, jwt)
             url = self._build_url(material["project_id"], model, streaming=True)

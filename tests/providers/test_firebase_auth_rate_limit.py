@@ -72,15 +72,44 @@ async def test_exchange_429_with_retry_after_raises_rate_limit(fake_http: FakeHt
     )
 
     with pytest.raises(RateLimitError) as excinfo:
+        await auth.get_jwt(
+            "proj", "app", "key", "debug", resource_id="fb-resource-01"
+        )
+
+    exc = excinfo.value
+    assert isinstance(exc, FirebaseRateLimitError)
+    # TASK-AUTH-016 contract fields + TASK-AUTH-016-FIX-01 resource_id.
+    assert exc.provider == "firebase"
+    assert exc.resource_id == "fb-resource-01"
+    assert exc.scope == "resource"
+    assert exc.retry_after == 42.0
+    assert exc.default_status == 429
+    assert is_retryable(exc)
+
+
+async def test_exchange_429_without_resource_id_still_rate_limits(
+    fake_http: FakeHttp,
+):
+    """``resource_id`` is optional: legacy callers still get a 429.
+
+    The keyword defaults to None so pre-FIX-01 call sites keep working;
+    the error must still be a rate limit rather than degrading into an
+    auth failure when no resource context is supplied.
+    """
+    auth = make_auth(fake_http)
+    fake_http.responses.append(
+        FakeResponse(429, content=b"{}", headers={"retry-after": "3"})
+    )
+
+    with pytest.raises(RateLimitError) as excinfo:
         await auth.get_jwt("proj", "app", "key", "debug")
 
     exc = excinfo.value
     assert isinstance(exc, FirebaseRateLimitError)
-    # TASK-AUTH-016 contract fields.
     assert exc.provider == "firebase"
-    assert exc.retry_after == 42.0
-    assert exc.default_status == 429
-    assert is_retryable(exc)
+    assert exc.resource_id is None
+    assert exc.scope == "resource"
+    assert exc.retry_after == 3.0
 
 
 async def test_exchange_429_retry_after_header_case_insensitive(
@@ -221,3 +250,164 @@ async def test_exchange_429_is_never_a_credential_refresh_failure(
         await auth.get_jwt("proj", "app", "key", "debug")
 
     assert not isinstance(excinfo.value, CredentialRefreshFailure)
+
+
+# -- adapter surface: the AUTH-003 contract must also preserve 429 ----------
+
+
+def _api_key_credential(**overrides):
+    from core.credential import Credential, CredentialType
+
+    payload = {
+        "api_key": "cred-api-key",
+        "app_id": "cred-app-id",
+        "debug_token": "cred-debug-token",
+    }
+    payload.update(overrides)
+    return Credential(
+        id="firebase-cred-01", type=CredentialType.API_KEY, payload=payload
+    )
+
+
+def _credentialless(resource_id: str):
+    from tests.providers._firebase_fakes import make_resource
+
+    return make_resource(
+        id=resource_id,
+        credential_id="firebase-cred-01",
+        api_key="",
+        app_id="",
+        debug_token="",
+    )
+
+
+@pytest.mark.parametrize("surface", ["get_runtime_credentials", "refresh"])
+async def test_adapter_surface_never_wraps_429_as_credential_failure(
+    fake_http: FakeHttp,
+    surface,
+):
+    """BOTH adapter entry points must re-raise the exchange 429 untouched.
+
+    ``FirebaseAuth`` raises ``FirebaseRateLimitError``, but the adapter is a
+    separate wrapping layer -- a missing ``except RateLimitError: raise``
+    there would still hand the Scheduler a 401-class
+    ``CredentialRefreshFailure``.  Both surfaces are covered because callers
+    use them interchangeably.
+    """
+    from providers.firebase.auth_adapter import FirebaseAuthAdapter
+
+    fake_http.responses.append(
+        FakeResponse(429, content=b"{}", headers={"retry-after": "9"})
+    )
+    adapter = FirebaseAuthAdapter(http=fake_http)
+    resource = _credentialless("fb-resource-42")
+    credential = _api_key_credential()
+
+    with pytest.raises(RateLimitError) as excinfo:
+        if surface == "refresh":
+            await adapter.refresh(credential, resource)
+        else:
+            await adapter.get_runtime_credentials(credential, resource)
+
+    exc = excinfo.value
+    assert not isinstance(exc, CredentialRefreshFailure)
+    assert isinstance(exc, FirebaseRateLimitError)
+    assert exc.provider == "firebase"
+    # FIX-01: the resource actually in use must reach the error.
+    assert exc.resource_id == "fb-resource-42"
+    assert exc.scope == "resource"
+    assert exc.retry_after == 9.0
+    assert exc.default_status == 429
+    assert is_retryable(exc)
+
+
+@pytest.mark.parametrize("surface", ["get_runtime_credentials", "refresh"])
+async def test_adapter_surface_still_maps_auth_failure_to_401(
+    fake_http: FakeHttp,
+    surface,
+):
+    """The 429 carve-out must not disable the genuine auth mapping."""
+    from core.errors import AuthenticationError
+    from providers.firebase.auth_adapter import FirebaseAuthAdapter
+
+    fake_http.responses.append(FakeResponse(400, content=b"{}"))
+    adapter = FirebaseAuthAdapter(http=fake_http)
+    resource = _credentialless("fb-resource-42")
+    credential = _api_key_credential()
+
+    expected = (
+        CredentialRefreshFailure if surface == "refresh" else FirebaseAuthError
+    )
+    with pytest.raises(expected) as excinfo:
+        if surface == "refresh":
+            await adapter.refresh(credential, resource)
+        else:
+            await adapter.get_runtime_credentials(credential, resource)
+
+    assert not isinstance(excinfo.value, RateLimitError)
+    assert isinstance(excinfo.value, AuthenticationError)
+    assert excinfo.value.default_status == 401
+    assert not is_retryable(excinfo.value)
+
+
+async def test_adapter_repeated_429s_do_not_poison_state(fake_http: FakeHttp):
+    """Firebase has no give-up counter; prove throttling stays transient.
+
+    Many consecutive exchange 429s must all surface as rate limits, and a
+    later healthy exchange must still succeed with no manual recovery.
+    """
+    from providers.firebase.auth_adapter import FirebaseAuthAdapter
+
+    for _ in range(6):
+        fake_http.responses.append(
+            FakeResponse(429, content=b"{}", headers={"retry-after": "5"})
+        )
+    adapter = FirebaseAuthAdapter(http=fake_http)
+    resource = _credentialless("fb-resource-42")
+    credential = _api_key_credential()
+
+    for _ in range(6):
+        with pytest.raises(RateLimitError):
+            await adapter.get_runtime_credentials(credential, resource)
+
+    fake_http.responses.append(fake_http.exchange_ok(token="jwt-recovered"))
+    creds = await adapter.get_runtime_credentials(credential, resource)
+    assert creds.headers["X-Firebase-AppCheck"] == "jwt-recovered"
+
+
+# -- FIX-01: resource_id must reach the 429 from every real call path ------
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_client_propagates_resource_id_onto_429(
+    fake_http: FakeHttp,
+    streaming,
+):
+    """The real request path (FirebaseClient) must also carry resource_id.
+
+    The client is a separate call site from the adapter; without it a 429
+    raised during an actual completion would reach the Scheduler without a
+    resource id even when the adapter path is fully fixed.
+    """
+    from providers.firebase.client import FirebaseClient
+    from tests.providers._firebase_fakes import make_resource
+
+    fake_http.responses.append(
+        FakeResponse(429, content=b"{}", headers={"retry-after": "6"})
+    )
+    client = FirebaseClient(http=fake_http, auth=make_auth(fake_http))
+    resource = make_resource(id="fb-client-77", credential_id=None)
+
+    with pytest.raises(RateLimitError) as excinfo:
+        if streaming:
+            async for _ in client.stream(resource, "gemini-2.5-flash", {"x": 1}):
+                pass
+        else:
+            await client.complete(resource, "gemini-2.5-flash", {"x": 1})
+
+    exc = excinfo.value
+    assert not isinstance(exc, CredentialRefreshFailure)
+    assert exc.provider == "firebase"
+    assert exc.resource_id == "fb-client-77"
+    assert exc.scope == "resource"
+    assert exc.default_status == 429

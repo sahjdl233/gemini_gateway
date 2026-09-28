@@ -49,8 +49,26 @@ def make_credential() -> Credential:
 
 
 class NoopAuth:
-    async def get_jwt(self, project_id, app_id, api_key, debug_token, *, force=False):
-        self.last_args = (project_id, app_id, api_key, debug_token, force)
+    async def get_jwt(
+        self,
+        project_id,
+        app_id,
+        api_key,
+        debug_token,
+        *,
+        force=False,
+        resource_id=None,
+    ):
+        # resource_id (TASK-AUTH-016-FIX-01) rides along so the 429 raised by
+        # a real FirebaseAuth can name the Resource that was in use.
+        self.last_args = (
+            project_id,
+            app_id,
+            api_key,
+            debug_token,
+            force,
+            resource_id,
+        )
         return "jwt-1"
 
 

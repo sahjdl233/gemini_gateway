@@ -58,6 +58,7 @@ class FirebaseAuth:
         debug_token: str,
         *,
         force: bool = False,
+        resource_id: Optional[str] = None,
     ) -> str:
         """Return a valid App Check JWT, refreshing if needed."""
         async with self._lock:
@@ -65,7 +66,7 @@ class FirebaseAuth:
             if not force and self._jwt and self._jwt_exp > now + self.PRE_REFRESH_SECONDS:
                 return self._jwt
             jwt, exp = await self._exchange(
-                project_id, app_id, api_key, debug_token
+                project_id, app_id, api_key, debug_token, resource_id=resource_id
             )
             self._jwt = jwt
             self._jwt_exp = exp
@@ -78,6 +79,8 @@ class FirebaseAuth:
         app_id: str,
         api_key: str,
         debug_token: str,
+        *,
+        resource_id: Optional[str] = None,
     ) -> tuple:
         """POST to exchangeDebugToken and return (jwt, expiry_ts)."""
         url = (
@@ -113,6 +116,7 @@ class FirebaseAuth:
                 raise FirebaseRateLimitError(
                     "App Check exchange rate limited: 429",
                     provider="firebase",
+                    resource_id=resource_id,
                     scope="resource",
                     retry_after=extract_retry_after(resp),
                 )

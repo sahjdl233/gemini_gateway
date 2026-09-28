@@ -190,6 +190,7 @@ class FirebaseAuthAdapter(ProviderAuthAdapter):
             material["app_id"],
             material["api_key"],
             material["debug_token"],
+            resource_id=resource.id,
         )
         return RuntimeCredentials(
             headers={
@@ -223,6 +224,7 @@ class FirebaseAuthAdapter(ProviderAuthAdapter):
                 material["api_key"],
                 material["debug_token"],
                 force=True,
+                resource_id=resource.id,
             )
         except FirebaseNetworkError:
             raise  # transport problem: keep retryable network semantics
