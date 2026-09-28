@@ -40,7 +40,9 @@ Boundaries frozen by AUTH-005:
   ``FirebaseNetworkError``/``FirebaseTimeoutError`` — a transport
   problem is not a credential failure and must stay retryable.  API
   endpoint 429 stays rate-limit semantics and is never a credential
-  failure.
+  failure.  The App Check exchange endpoint follows the same rule
+  (TASK-AUTH-016): its 429 also surfaces as ``RateLimitError`` with the
+  parsed Retry-After, never as ``CredentialRefreshFailure`` / 401.
 """
 
 from __future__ import annotations
@@ -56,6 +58,7 @@ from core.auth_adapter import (
     require_bound_credential,
 )
 from core.credential import Credential, CredentialStore, CredentialType
+from core.errors import RateLimitError
 from core.resource import Resource
 
 from providers.firebase.auth import FirebaseAuth
@@ -225,6 +228,12 @@ class FirebaseAuthAdapter(ProviderAuthAdapter):
             raise  # transport problem: keep retryable network semantics
         except FirebaseTimeoutError:
             raise  # transport problem: keep retryable timeout semantics
+        except RateLimitError:
+            # TASK-AUTH-016: App Check exchange 429 is capacity, not a bad
+            # credential.  Keep rate-limit semantics; never a 401 refresh
+            # failure.  Listed after the transport errors on purpose:
+            # the Firebase error tree keeps those distinct.
+            raise
         except FirebaseAuthError as exc:
             # Contract form of the existing auth failure.  The message
             # names the failure mode only — no debug token, api key or

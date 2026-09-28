@@ -37,6 +37,8 @@ Boundaries frozen by AUTH-004:
   ``GeminiCliAuthError``, itself a core ``AuthenticationError``).
   Transport errors during refresh stay ``GeminiCliNetworkError`` — a
   network problem is not a credential failure and must stay retryable.
+  A 429 from the token endpoint stays ``RateLimitError`` (TASK-AUTH-016)
+  — token-endpoint throttling is capacity, never a credential failure.
 """
 
 from __future__ import annotations
@@ -52,6 +54,7 @@ from core.auth_adapter import (
     require_bound_credential,
 )
 from core.credential import Credential, CredentialStore, CredentialType
+from core.errors import RateLimitError
 from core.resource import Resource
 
 from providers.gemini_cli.auth import DEFAULT_TOKEN_URL, GeminiCliAuth, resource_material
@@ -225,6 +228,11 @@ class GeminiCliAuthAdapter(ProviderAuthAdapter):
             token = await self._auth.get_access_token(
                 resource, force=True, material=material
             )
+        except RateLimitError:
+            # TASK-AUTH-016: token-endpoint 429 is capacity, not a bad
+            # credential.  Keep rate-limit semantics so the Scheduler
+            # can cooldown the resource; never map it to a 401.
+            raise
         except GeminiCliAuthError as exc:
             # Contract form of the existing auth failure.  The message
             # names the failure mode only — no tokens or secrets (the

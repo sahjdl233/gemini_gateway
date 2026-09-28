@@ -21,6 +21,7 @@ from core.auth_adapter import (
     RuntimeCredentials,
 )
 from core.credential import Credential, CredentialStore, CredentialType
+from core.errors import RateLimitError
 from providers.firebase.auth import FirebaseAuth
 from providers.firebase.auth_adapter import FirebaseAuthAdapter
 from providers.firebase.client import FirebaseClient
@@ -404,17 +405,33 @@ async def test_exchange_timeout_keeps_timeout_semantics():
         await adapter.refresh(api_key_credential(), credentialless_resource())
 
 
-async def test_exchange_429_stays_auth_exchange_error_not_credential_delete():
-    """Current FirebaseAuth classifies any non-200 exchange as
-    FirebaseAuthError — behaviour unchanged; the contract surface wraps it
-    as a refresh failure.  It is never an InvalidCredentialError."""
+async def test_exchange_429_stays_rate_limit_not_credential_failure():
+    """TASK-AUTH-016: an exchange-endpoint 429 is capacity, not a broken
+    credential.
+
+    FirebaseAuth classifies 429 as ``RateLimitError`` (carrying the parsed
+    Retry-After), and the adapter contract surface lets it through
+    untouched so the Scheduler can cooldown the resource.  It is never an
+    ``InvalidCredentialError`` and never a ``CredentialRefreshFailure``.
+    """
     http = FakeHttp()
-    http.responses.append(FakeResponse(429, json_body={"error": {"message": "throttled"}}))
+    http.responses.append(
+        FakeResponse(
+            429,
+            json_body={"error": {"message": "throttled"}},
+            headers={"Retry-After": "12"},
+        )
+    )
     adapter = make_adapter(clock=FakeClock(), http=http)
 
-    with pytest.raises(CredentialRefreshFailure) as exc_info:
+    with pytest.raises(RateLimitError) as exc_info:
         await adapter.refresh(api_key_credential(), credentialless_resource())
-    assert not isinstance(exc_info.value, InvalidCredentialError)
+    exc = exc_info.value
+    assert not isinstance(exc, InvalidCredentialError)
+    assert not isinstance(exc, CredentialRefreshFailure)
+    assert exc.provider == "firebase"
+    assert exc.retry_after == 12.0
+    assert exc.default_status == 429
 
 
 async def test_api_endpoint_429_keeps_rate_limit_semantics():

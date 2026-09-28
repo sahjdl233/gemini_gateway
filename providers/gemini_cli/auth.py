@@ -17,7 +17,12 @@ import logging
 import time
 from typing import Any, Optional
 
-from providers.gemini_cli.errors import GeminiCliAuthError, GeminiCliNetworkError
+from providers.gemini_cli.errors import (
+    GeminiCliAuthError,
+    GeminiCliNetworkError,
+    GeminiCliRateLimitError,
+    extract_retry_after,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +30,35 @@ logger = logging.getLogger(__name__)
 DEFAULT_TOKEN_URL = "https://oauth2.googleapis.com/token"
 PRE_REFRESH_SECONDS = 180  # refresh 3 minutes before expiry (TASK-007:5)
 MAX_REFRESH_ATTEMPTS = 3  # hard cap; no infinite refresh
+
+
+def _raise_refresh_http_error(resp: Any, resource: Any, *, body: Any) -> None:
+    """Classify a non-200 token-endpoint response.
+
+    TASK-AUTH-016: a 429 at the TOKEN endpoint is capacity, not a bad
+    credential.  It must surface as ``RateLimitError`` (carrying the
+    parsed Retry-After) so the Scheduler can cooldown the resource —
+    never as ``GeminiCliAuthError`` / ``CredentialRefreshFailure`` / 401.
+    Retry-After parsing failure must never degrade the 429 into an auth
+    failure: an unparsable header simply yields ``retry_after=None`` and
+    the CooldownManager falls back to its own backoff.
+    """
+    if getattr(resp, "status_code", None) == 429:
+        raise GeminiCliRateLimitError(
+            "gemini_cli auth: token endpoint rate limited",
+            provider="gemini_cli",
+            resource_id=resource.id,
+            scope="resource",
+            retry_after=extract_retry_after(resp),
+        )
+    raise GeminiCliAuthError(
+        "gemini_cli auth: refresh failed status="
+        + str(resp.status_code)
+        + " body="
+        + str(body)[:200],
+        provider="gemini_cli",
+        resource_id=resource.id,
+    )
 
 
 def resource_material(resource: Any) -> dict:
@@ -202,15 +236,18 @@ class GeminiCliAuth:
             ) from exc
 
         if resp.status_code != 200:
-            self._consecutive_refresh_failures += 1
             body = getattr(resp, "text", "") or getattr(resp, "content", b"")
-            raise GeminiCliAuthError(
-                "gemini_cli auth: refresh failed status="
-                + str(resp.status_code)
-                + " body="
-                + str(body)[:200],
-                provider="gemini_cli",
-                resource_id=resource.id,
+            if resp.status_code != 429:
+                # A 429 is throttling, not a broken credential: it must not
+                # consume the MAX_REFRESH_ATTEMPTS give-up budget, or a burst
+                # of token-endpoint throttling would permanently disable the
+                # credential (the 4th 429 would surface as a 401-class
+                # GeminiCliAuthError).  Only genuine refresh failures count.
+                self._consecutive_refresh_failures += 1
+            _raise_refresh_http_error(
+                resp,
+                resource,
+                body=body,
             )
 
         try:

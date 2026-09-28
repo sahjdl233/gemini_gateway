@@ -17,6 +17,8 @@ from providers.firebase.errors import (
     FirebaseAuthError,
     FirebaseNetworkError,
     FirebaseTimeoutError,
+    FirebaseRateLimitError,
+    extract_retry_after,
 )
 
 logger = logging.getLogger(__name__)
@@ -101,6 +103,19 @@ class FirebaseAuth:
                 ) from exc
             raise FirebaseNetworkError(msg, provider="firebase") from exc
         if resp.status_code != 200:
+            if resp.status_code == 429:
+                # TASK-AUTH-016: App Check throttling is capacity, not an
+                # invalid debug token.  Surface RateLimitError with the
+                # parsed Retry-After so the Scheduler can cooldown.
+                # An unparsable/absent header yields retry_after=None and
+                # the CooldownManager falls back to its own backoff — a
+                # header problem must never become an auth failure.
+                raise FirebaseRateLimitError(
+                    "App Check exchange rate limited: 429",
+                    provider="firebase",
+                    scope="resource",
+                    retry_after=extract_retry_after(resp),
+                )
             raise FirebaseAuthError(
                 f"App Check JWT exchange failed: {resp.status_code}",
                 provider="firebase",
