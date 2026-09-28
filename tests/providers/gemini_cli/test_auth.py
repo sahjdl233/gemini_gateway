@@ -8,7 +8,7 @@ import pytest
 
 from providers.gemini_cli.auth import GeminiCliAuth, MAX_REFRESH_ATTEMPTS
 from providers.gemini_cli.errors import GeminiCliAuthError, GeminiCliNetworkError
-from tests.providers._gemini_cli_fakes import FakeHttp, make_resource
+from tests.providers._gemini_cli_fakes import FakeHttp, make_backend, make_resource
 
 
 class FakeClock:
@@ -81,7 +81,7 @@ async def test_401_force_refresh_retry_once():
     )
 
     auth = GeminiCliAuth(http, clock=FakeClock())
-    client = GeminiCliClient(http=http, auth=auth)
+    client = GeminiCliClient(backend=make_backend(http), auth=auth)
     resource = make_resource()
     resp = await client.post(resource, "https://cloudcode-pa.googleapis.com", {"model": "x", "project": "p", "request": {}})
 
@@ -104,7 +104,7 @@ async def test_401_retry_only_once():
     from providers.gemini_cli.client import GeminiCliClient
 
     auth = GeminiCliAuth(http, clock=FakeClock())
-    client = GeminiCliClient(http=http, auth=auth)
+    client = GeminiCliClient(backend=make_backend(http), auth=auth)
     with pytest.raises(Exception) as excinfo:
         await client.post(make_resource(), "https://cloudcode-pa.googleapis.com", {"model": "x", "project": "p", "request": {}})
     from core.errors import AuthenticationError

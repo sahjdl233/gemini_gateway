@@ -13,7 +13,7 @@ from providers.gemini_cli.onboard import (
     parse_operation,
     poll_operation,
 )
-from tests.providers._gemini_cli_fakes import FakeHttp, make_resource
+from tests.providers._gemini_cli_fakes import FakeHttp, make_backend, make_resource
 
 
 # ---------------------------------------------------------------------------
@@ -129,7 +129,7 @@ def _client_for(http):
     from providers.gemini_cli.client import GeminiCliClient
 
     auth = GeminiCliAuth(http, clock=_AuthFakeClock())
-    return GeminiCliClient(http=http, auth=auth)
+    return GeminiCliClient(backend=make_backend(http), auth=auth)
 
 
 async def test_discover_existing_project_skips_onboarding():

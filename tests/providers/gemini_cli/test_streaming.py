@@ -6,7 +6,12 @@
 from __future__ import annotations
 
 from providers.gemini_cli.streaming import iter_sse_events, iter_chunks
-from tests.providers._gemini_cli_fakes import FakeHttp, FakeResponse, make_resource
+from tests.providers._gemini_cli_fakes import (
+    FakeHttp,
+    FakeResponse,
+    make_backend,
+    make_resource,
+)
 
 
 class FakeStream:
@@ -142,11 +147,11 @@ def _provider_with_stream(http):
     from providers.gemini_cli.client import GeminiCliClient
 
     auth = GeminiCliAuth(http, clock=_AuthFakeClock())
-    client = GeminiCliClient(http=http, auth=auth)
+    client = GeminiCliClient(backend=make_backend(http), auth=auth)
     from providers.gemini_cli.provider import GeminiCliProvider
     provider = GeminiCliProvider(models=["gemini-2.5-flash"])
     provider._clients.clear()
-    provider._http = http
+    provider.set_http_client(http)
     original_client_for = provider._client_for
     async def _mock_client_for(resource):
         return client

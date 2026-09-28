@@ -24,7 +24,7 @@ from providers.gemini_cli.auth import MAX_REFRESH_ATTEMPTS, PRE_REFRESH_SECONDS
 from providers.gemini_cli.auth_adapter import GeminiCliAuthAdapter
 from providers.gemini_cli.client import GeminiCliClient
 
-from tests.providers._gemini_cli_fakes import FakeHttp, make_resource
+from tests.providers._gemini_cli_fakes import FakeHttp, make_backend, make_resource
 
 
 class FakeClock:
@@ -133,7 +133,7 @@ async def test_legacy_resource_without_credential_still_authenticates():
     adapter = GeminiCliAuthAdapter(
         http=http, credential_store=None, clock=FakeClock()
     )
-    client = GeminiCliClient(http=http, auth=adapter.auth)
+    client = GeminiCliClient(backend=make_backend(http), auth=adapter.auth)
 
     resp = await client.post(
         legacy_resource(), "https://cloudcode-pa.googleapis.com", {}
@@ -305,7 +305,7 @@ async def test_401_force_refresh_retry_once_preserved():
     store = CredentialStore()
     store.add(oauth_credential())
     adapter = make_adapter(store, clock=FakeClock(), http=http)
-    client = GeminiCliClient(http=http, auth=adapter.auth)
+    client = GeminiCliClient(backend=make_backend(http), auth=adapter.auth)
     resource = credentialless_resource()
 
     resp = await client.post(resource, "https://cloudcode-pa.googleapis.com", {})
@@ -325,7 +325,7 @@ async def test_401_then_refresh_failure_does_not_loop():
     store = CredentialStore()
     store.add(oauth_credential())
     adapter = make_adapter(store, clock=FakeClock(), http=http)
-    client = GeminiCliClient(http=http, auth=adapter.auth)
+    client = GeminiCliClient(backend=make_backend(http), auth=adapter.auth)
     resource = credentialless_resource()
 
     from core.errors import AuthenticationError
@@ -460,7 +460,7 @@ async def test_dangling_credential_id_surfaces_as_401_through_client():
     http = FakeHttp()
     store = CredentialStore()  # empty: the credential was deleted
     adapter = make_adapter(store, clock=FakeClock(), http=http)
-    client = GeminiCliClient(http=http, auth=adapter.auth)
+    client = GeminiCliClient(backend=make_backend(http), auth=adapter.auth)
     resource = make_resource(credential_id="deleted-credential")
 
     with pytest.raises(CredentialUnavailableError) as exc_info:

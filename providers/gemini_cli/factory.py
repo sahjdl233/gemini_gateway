@@ -31,12 +31,31 @@ class GeminiCliProviderFactory:
         config: Any = None,
     ) -> GeminiCliProvider:
         models = None
+        proxy = None
+        timeout_seconds = None
         if config and isinstance(config, dict):
             models = config.get("models")
-        return GeminiCliProvider(
-            models=models,
-            credential_store=self._credential_store,
-        )
+            proxy_cfg = config.get("proxy")
+            if proxy_cfg is not None:
+                from transport.proxy import ProxyConfig
+
+                if isinstance(proxy_cfg, ProxyConfig):
+                    proxy = proxy_cfg
+                else:
+                    proxy = GeminiCliProvider.proxy_config_for(
+                        GeminiCliResource(provider=provider_id, proxy=proxy_cfg)
+                    )
+            raw_timeout = config.get("timeout_seconds")
+            if isinstance(raw_timeout, (int, float)):
+                timeout_seconds = float(raw_timeout)
+        kwargs: dict = {
+            "models": models,
+            "credential_store": self._credential_store,
+            "proxy": proxy,
+        }
+        if timeout_seconds is not None:
+            kwargs["timeout_seconds"] = timeout_seconds
+        return GeminiCliProvider(**kwargs)
 
 
 class GeminiCliResourceFactory:

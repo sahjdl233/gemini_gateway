@@ -8,7 +8,13 @@ import pytest
 from providers.gemini_cli.client import DEFAULT_BASE_URL
 from providers.gemini_cli.provider import GeminiCliProvider
 from providers.gemini_cli.resource import GeminiCliResource
-from tests.providers._gemini_cli_fakes import FakeHttp, FakeResponse, envelope, make_resource
+from tests.providers._gemini_cli_fakes import (
+    FakeHttp,
+    FakeResponse,
+    envelope,
+    make_backend,
+    make_resource,
+)
 from core.models import ChatMessage, ChatRequest
 
 # Fix FakeResponse import visibility
@@ -88,7 +94,14 @@ def test_provider_http_client_injection():
     provider = GeminiCliProvider()
     fake = FakeHttp()
     provider.set_http_client(fake)
-    assert provider._http is fake
+    # TASK-ARCH-004: injection now lands on the shared ExecutionBackend,
+    # which borrows the client (owned=False) instead of the provider
+    # holding a bare per-resource HTTP path.
+    from execution.http import HttpExecutionBackend
+
+    assert isinstance(provider.backend, HttpExecutionBackend)
+    assert provider.backend._client is fake
+    assert provider.backend._owns_client is False
 
 
 
@@ -111,11 +124,11 @@ def _provider_with_http(http):
     from providers.gemini_cli.client import GeminiCliClient
 
     auth = GeminiCliAuth(http, clock=_AuthFakeClock())
-    client = GeminiCliClient(http=http, auth=auth)
+    client = GeminiCliClient(backend=make_backend(http), auth=auth)
     provider = GeminiCliProvider(models=["gemini-2.5-flash"])
     # monkeypatch internal client cache
     provider._clients.clear()
-    provider._http = http
+    provider.set_http_client(http)
     # we need to intercept _client_for to use our pre-authenticated client
     original_client_for = provider._client_for
     async def _mock_client_for(resource):

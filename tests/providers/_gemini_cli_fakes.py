@@ -38,6 +38,20 @@ def function_call_part(name: str, args: Optional[dict] = None) -> Dict[str, Any]
     return {"functionCall": {"name": name, "args": args or {}}}
 
 
+def _decode_form(content: Any) -> Any:
+    """Decode a urlencoded request body back into a dict for assertions.
+
+    ``_BackendHttpPost`` encodes the OAuth form dict before handing it to
+    the backend; tests assert on ``post_calls[i]["data"]`` as a dict, so the
+    round trip is undone here.
+    """
+    if not isinstance(content, (bytes, bytearray)):
+        return content
+    from urllib.parse import parse_qsl
+
+    return dict(parse_qsl(content.decode("utf-8")))
+
+
 class FakeResponse:
     def __init__(
         self,
@@ -87,6 +101,7 @@ class FakeHttp:
         self.responses: List[FakeResponse] = []
         self.stream_responses: List[FakeResponse] = []
         self.raise_exc: Optional[Exception] = None
+        self.closed = False
 
     async def post(self, url, *, headers=None, json=None, data=None) -> FakeResponse:
         self.post_calls.append(
@@ -98,7 +113,40 @@ class FakeHttp:
             raise exc
         return self.responses.pop(0)
 
-    def stream(self, method, url, *, headers=None, json=None) -> FakeResponse:
+    # -- ExecutionBackend surface (TASK-ARCH-004) ----------------------------
+    # HttpExecutionBackend talks ``request()``/``stream()`` instead of
+    # ``post()``.  These keep BOTH spellings on one queue of responses so a
+    # test can mix OAuth token calls and API calls on the same fake.
+
+    async def request(
+        self,
+        method: str,
+        url: str,
+        *,
+        json: Any = None,
+        content: Any = None,
+        headers: Any = None,
+        params: Any = None,
+        timeout: Any = None,
+    ) -> FakeResponse:
+        return await self.post(
+            url,
+            headers=headers,
+            json=json,
+            data=_decode_form(content),
+        )
+
+    def stream(
+        self,
+        method: str,
+        url: str,
+        *,
+        json: Any = None,
+        content: Any = None,
+        headers: Any = None,
+        params: Any = None,
+        timeout: Any = None,
+    ) -> FakeResponse:
         self.stream_calls.append(
             {"method": method, "url": url, "headers": headers, "json": json}
         )
@@ -107,6 +155,9 @@ class FakeHttp:
             self.raise_exc = None
             raise exc
         return self.stream_responses.pop(0)
+
+    async def aclose(self) -> None:
+        self.closed = True
 
     def token_ok(self, token: str = "access-token-1", expires_in: int = 3600) -> FakeResponse:
         return FakeResponse(
@@ -142,4 +193,16 @@ def make_resource(**overrides: Any) -> Any:
     }
     base.update(overrides)
     return GeminiCliResource.model_validate(base)
+
+
+def make_backend(http: Any) -> Any:
+    """Wrap a FakeHttp in the real HttpExecutionBackend used in production.
+
+    TASK-ARCH-004: tests still drive GeminiCliClient through the shared
+    ExecutionBackend.  ``owned=False`` means the backend BORROWS the fake,
+    so ``Provider.close()`` must never close it.
+    """
+    from execution.http import HttpExecutionBackend
+
+    return HttpExecutionBackend(client=http, owned=False)
 
