@@ -7,6 +7,8 @@ import time
 
 import pytest
 
+from core.errors import TimeoutError, UpstreamUnavailableError
+from core.models import ModelInfo
 from core.model_registry import ModelRegistry
 from providers.fake import FakeProvider
 
@@ -136,3 +138,146 @@ async def test_list_models_aggregates_all():
     assert "gemini-3.8-flash" in ids
     assert "gemini-test" in ids
     assert "gemini-other" in ids
+
+
+# ---------------------------------------------------------------------------
+# TASK-MODEL-001: Discovery failure must not empty a provider out of the index.
+# ---------------------------------------------------------------------------
+
+
+class ScriptedProvider(FakeProvider):
+    """FakeProvider whose list_models() follows a scripted list of results.
+
+    Each entry is either a list of model ids (Discovery success) or an
+    exception instance to raise (Discovery failure). The last entry repeats
+    once the script is exhausted, and the call count is tracked so tests can
+    assert refresh behaviour.
+    """
+
+    def __init__(self, script):
+        super().__init__()
+        self.script = list(script)
+        self.list_calls = 0
+
+    async def list_models(self):
+        self.list_calls += 1
+        step = self.script[min(self.list_calls - 1, len(self.script) - 1)]
+        if isinstance(step, BaseException):
+            raise step
+        return [ModelInfo(id=mid, provider="scripted") for mid in step]
+
+
+async def _model_ids(registry: ModelRegistry) -> set:
+    return {m.id for m in await registry.list_models()}
+
+
+async def test_first_discovery_success_records_models():
+    """First Discovery succeeds -> models are indexed, no failure recorded."""
+    prov = ScriptedProvider([["m-a", "m-b"]])
+    registry = ModelRegistry(providers={"p": prov}, refresh_interval=300.0)
+
+    assert await _model_ids(registry) == {"m-a", "m-b"}
+    assert registry.failures == {}
+    assert registry.provider_status("p")["discovered"] is True
+    assert registry.provider_status("p")["failed"] is False
+
+
+async def test_first_discovery_failure_yields_no_models_but_is_recorded():
+    """First-ever Discovery failure: no models, but distinguishable from an
+    empty discovery via the failure channel."""
+    prov = ScriptedProvider([UpstreamUnavailableError("boom", provider="p")])
+    registry = ModelRegistry(providers={"p": prov}, refresh_interval=300.0)
+
+    assert await _model_ids(registry) == set()
+    assert "p" in registry.failures
+    status = registry.provider_status("p")
+    assert status["discovered"] is False
+    assert status["failed"] is True
+    assert status["last_error"] == "boom"
+
+
+async def test_empty_discovery_is_distinct_from_failed_discovery():
+    """A successful-but-empty Discovery must NOT be reported as a failure."""
+    prov = ScriptedProvider([[]])
+    registry = ModelRegistry(providers={"p": prov}, refresh_interval=300.0)
+
+    assert await _model_ids(registry) == set()
+    assert registry.failures == {}
+    status = registry.provider_status("p")
+    assert status["discovered"] is True
+    assert status["failed"] is False
+
+
+async def test_ttl_refresh_success_after_initial_failure():
+    """First attempt fails, a later TTL refresh succeeds -> models appear."""
+    prov = ScriptedProvider(
+        [UpstreamUnavailableError("boom", provider="p"), ["m-a"]]
+    )
+    registry = ModelRegistry(providers={"p": prov}, refresh_interval=1.0)
+
+    assert await _model_ids(registry) == set()
+    assert "p" in registry.failures
+
+    _force_expired(registry)
+    assert await _model_ids(registry) == {"m-a"}
+    assert registry.failures == {}
+    assert registry.provider_status("p")["discovered"] is True
+
+
+async def test_partial_failure_keeps_previous_models():
+    """TTL refresh where one provider fails: the other provider's models stay,
+    and the failing provider keeps its own last known good list."""
+    good = ScriptedProvider([["g-1"]])
+    flaky = ScriptedProvider(
+        [["f-1"], UpstreamUnavailableError("net down", provider="b")]
+    )
+    registry = ModelRegistry(
+        providers={"good": good, "flaky": flaky}, refresh_interval=300.0
+    )
+
+    assert await _model_ids(registry) == {"g-1", "f-1"}
+
+    _force_expired(registry)
+    assert await _model_ids(registry) == {"g-1", "f-1"}
+    assert registry.failures == {"flaky": "net down"}
+    assert registry.provider_status("flaky")["discovered"] is True
+    assert registry.provider_status("flaky")["failed"] is True
+
+
+async def test_all_providers_failing_keeps_entire_stale_index():
+    """Every provider fails on refresh -> the whole stale index survives."""
+    a = ScriptedProvider([["a-1"], UpstreamUnavailableError("x", provider="a")])
+    b = ScriptedProvider([["b-1"], TimeoutError("y", provider="b")])
+    registry = ModelRegistry(providers={"a": a, "b": b}, refresh_interval=300.0)
+
+    assert await _model_ids(registry) == {"a-1", "b-1"}
+
+    _force_expired(registry)
+    assert await _model_ids(registry) == {"a-1", "b-1"}
+    assert set(registry.failures) == {"a", "b"}
+
+
+async def test_non_provider_error_does_not_abort_refresh():
+    """A non-ProviderError (e.g. Antigravity's RuntimeError) is isolated to
+    that provider and does not abort the whole refresh or lose good data."""
+    good = ScriptedProvider([["g-1"]])
+    boom = ScriptedProvider([RuntimeError("no backend")])
+    registry = ModelRegistry(
+        providers={"good": good, "boom": boom}, refresh_interval=300.0
+    )
+
+    assert await _model_ids(registry) == {"g-1"}
+    assert registry.provider_status("boom")["failed"] is True
+
+
+async def test_failure_then_recovery_via_list_models():
+    """End-to-end: a failed refresh must not make a known model disappear."""
+    prov = ScriptedProvider(
+        [["gemini-3.8-flash"], UpstreamUnavailableError("blip", provider="p")]
+    )
+    registry = ModelRegistry(providers={"p": prov}, refresh_interval=1.0)
+
+    assert "p" in await registry.providers_for("gemini-3.8-flash")
+    _force_expired(registry)
+    assert "p" in await registry.providers_for("gemini-3.8-flash")
+    assert registry.failures == {"p": "blip"}
