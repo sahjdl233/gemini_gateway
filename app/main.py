@@ -116,7 +116,7 @@ def build_runtime(
         if not registry.has(provider_id):
             raise UnknownProviderError(
                 "provider '" + provider_id + "' is not registered "
-                "(no real Google access allowed in this phase)"
+                "(unknown provider id in the 'providers' config section)"
             )
         provider = registry.create(provider_id, pcfg)
         set_credential_store = getattr(provider, "set_credential_store", None)

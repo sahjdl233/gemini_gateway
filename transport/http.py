@@ -1,8 +1,8 @@
-"""Async HTTP transport for future Google providers.
+"""Async HTTP transport for Google providers.
 
-TASK-000 does NOT make any real HTTP request to Google.  This module
-only shapes how later provider adapters will talk over the wire, keeping
-proxy/egress fully decoupled from provider logic.
+Builds a real httpx.AsyncClient and issues real requests.  This module owns
+how provider adapters talk over the wire, keeping proxy/egress fully
+decoupled from provider logic.
 """
 
 from __future__ import annotations

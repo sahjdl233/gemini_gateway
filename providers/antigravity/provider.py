@@ -440,7 +440,6 @@ class AntigravityProvider(Provider):
 def _parse_usage(usage_meta: dict[str, Any]) -> Optional[Usage]:
     if not usage_meta:
         return None
-    pass
     return Usage(
         prompt_tokens=usage_meta.get("promptTokenCount", 0),
         completion_tokens=usage_meta.get("candidatesTokenCount", 0),
