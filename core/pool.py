@@ -8,12 +8,52 @@ from __future__ import annotations
 
 import asyncio
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from datetime import datetime
 from typing import List, Optional, Set
 
 from .cooldown import CooldownManager
 from .errors import ProviderError
 from .health import HealthState
-from .resource import Resource
+from .resource import Resource, ResourceKey
+
+
+@dataclass(frozen=True)
+class _RuntimeState:
+    """The scheduling-relevant runtime state of a single Resource.
+
+    TASK-STATE-001: only these fields survive a Resource object being
+    re-created from a new definition.  Configuration / identity fields
+    (id, provider, enabled, credential_id, provider-specific fields and any
+    authentication material) are deliberately excluded: they always come
+    from the *new* definition.  ``in_flight`` is excluded on purpose -- an
+    in-flight count is never inherited, and a resource that still has active
+    requests can never be reconciled at all (see
+    :meth:`InMemoryPool.reconcile_resources`).
+    """
+
+    health: HealthState
+    cooldown_until: Optional[datetime]
+    consecutive_failures: int
+    total_requests: int
+    total_failures: int
+
+    @classmethod
+    def capture(cls, resource: Resource) -> "_RuntimeState":
+        return cls(
+            health=resource.health,
+            cooldown_until=resource.cooldown_until,
+            consecutive_failures=resource.consecutive_failures,
+            total_requests=resource.total_requests,
+            total_failures=resource.total_failures,
+        )
+
+    def apply_to(self, resource: Resource) -> None:
+        resource.health = self.health
+        resource.cooldown_until = self.cooldown_until
+        resource.consecutive_failures = self.consecutive_failures
+        resource.total_requests = self.total_requests
+        resource.total_failures = self.total_failures
 
 
 class ResourcePool(ABC):
@@ -150,10 +190,106 @@ class InMemoryPool(ResourcePool):
             resource.total_failures += 1
             self._cooldown.apply_failure(resource)
 
-    async def record_rate_limit(
-        self, resource: Resource, retry_after: Optional[float] = None
-    ) -> None:
+   async def record_rate_limit(
+       self, resource: Resource, retry_after: Optional[float] = None
+   ) -> None:
+       async with self._lock:
+           resource.total_requests += 1
+           resource.total_failures += 1
+           self._cooldown.apply_rate_limit(resource, retry_after)
+
+    async def reconcile_resources(self, new_resources: List[Resource]) -> None:
+        """Replace resources while preserving per-ResourceKey runtime state.
+
+        TASK-STATE-001:
+        - Runtime state (health, cooldown_until, consecutive_failures,
+          total_requests, total_failures) is preserved by ResourceKey.
+        - Configuration fields (id, provider, enabled, credential_id, etc)
+          always come from the new Resource object.
+        - in_flight is never preserved and must be zero on any replaced
+          resource; otherwise the operation fails.
+        - The cursor tie-breaker is advanced as little as reasonably possible.
+
+        The method is atomic: on any validation error the pool state is left
+        untouched.
+        """
         async with self._lock:
-            resource.total_requests += 1
-            resource.total_failures += 1
-            self._cooldown.apply_rate_limit(resource, retry_after)
+            # Fast path: if the new list equals the old list (object identity)
+            # we can skip all work.
+            if self._resources is new_resources:
+                return
+
+            # 1) Build a map of old runtime state keyed by ResourceKey.
+            # We capture the state into _RuntimeState for atomicity.
+            old_by_key: dict[ResourceKey, _RuntimeState] = {}
+            for r in self._resources:
+                # The current resource's state
+                state = _RuntimeState.capture(r)
+                # Store a copy that includes the current in_flight for validation
+                # (Note: _RuntimeState as defined doesn't store in_flight, 
+                # but we need it for the check).
+                # Let's just use the resource objects for in_flight checks.
+                old_by_key[r.resource_key] = state
+
+            # 2) Validate in_flight constraints and build the new list.
+            new_list: list[Resource] = []
+            for nr in new_resources:
+                key = nr.resource_key
+                
+                # Check in_flight for the old resource with the same key
+                old_res = next((r for r in self._resources if r.resource_key == key), None)
+                if old_res and old_res.in_flight > 0:
+                    raise RuntimeError(
+                        f"Cannot reconcile resource {nr.provider}:{nr.id} "
+                        f"because it has {old_res.in_flight} in-flight requests"
+                    )
+
+                # Deep-copy the new resource definition so we never mutate the
+                # caller's object.
+                nr_copy = Resource.model_validate(nr.model_dump())
+
+                # Apply runtime state if it existed
+                if key in old_by_key:
+                    old_by_key[key].apply_to(nr_copy)
+                
+                new_list.append(nr_copy)
+
+            # Check for removed resources that are still in-flight
+            new_keys = {r.resource_key for r in new_resources}
+            for r in self._resources:
+                if r.resource_key not in new_keys and r.in_flight > 0:
+                    raise RuntimeError(
+                        f"Cannot reconcile pool because resource {r.provider}:{r.id} "
+                        f"is being removed while having {r.in_flight} in-flight requests"
+                    )
+
+            # 3) Preserve cursor tie-breaker as far as possible.
+            old_cursor = self._cursor
+            old_len = len(self._resources)
+
+            if old_len == 0:
+                new_cursor = 0
+            else:
+                cursor_key = self._resources[old_cursor % old_len].resource_key
+                try:
+                    new_index = next(
+                        i for i, r in enumerate(new_list) if r.resource_key == cursor_key
+                    )
+                except StopIteration:
+                    # cursor target removed: scan forward from old position for
+                    # the first surviving ResourceKey
+                    new_index = 0
+                    for offset in range(old_len):
+                        probe = (old_cursor + offset) % old_len
+                        probe_key = self._resources[probe].resource_key
+                        if probe_key in new_keys:
+                            new_index = next(
+                                i for i, r in enumerate(new_list) if r.resource_key == probe_key
+                            )
+                            break
+
+                new_cursor = new_index
+
+            # 4) Atomic commit
+            self._resources = new_list
+            self._cursor = new_cursor
