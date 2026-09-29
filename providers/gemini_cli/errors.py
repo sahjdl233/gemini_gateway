@@ -34,6 +34,17 @@ class GeminiCliProtocolError(ProviderError):
     default_status = 502
 
 
+class GeminiCliConfigError(ProviderError):
+    """Invalid or contradictory gemini_cli configuration.
+
+    Raised while WIRING the provider (before any request is served), so a
+    misconfigured deployment fails at startup instead of silently routing
+    traffic through the wrong egress.
+    """
+
+    default_status = 500
+
+
 class GeminiCliAuthError(AuthenticationError, GeminiCliProtocolError):
     pass
 

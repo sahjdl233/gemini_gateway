@@ -36,7 +36,12 @@ class GeminiCliResource(Resource):
     # Optional: pin to a specific model.
     pinned_model: Optional[str] = None
 
-    # Optional: per-resource HTTP/SOCKS5 proxy.
+    # Optional: legacy HTTP/SOCKS5 proxy, kept as compatibility input only.
+    # TASK-ARCH-004: one Provider owns ONE HttpExecutionBackend and therefore
+    # ONE AsyncClient, so transport (and its proxy) is Provider-level config.
+    # This field may only define that ONE egress, and only when the provider
+    # declares no proxy of its own; several Resources specifying DIFFERENT
+    # proxies is a configuration error (see GeminiCliProvider).
     proxy: Optional[str] = None
 
     # Onboarding knobs.

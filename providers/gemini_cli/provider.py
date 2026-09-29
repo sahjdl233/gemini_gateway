@@ -41,7 +41,7 @@ from transport.proxy import ProxyConfig
 
 from providers.gemini_cli.auth_adapter import GeminiCliAuthAdapter
 from providers.gemini_cli.client import GeminiCliClient, DEFAULT_BASE_URL
-from providers.gemini_cli.errors import GeminiCliProtocolError
+from providers.gemini_cli.errors import GeminiCliConfigError, GeminiCliProtocolError
 from providers.gemini_cli.payload import build_envelope, get_model_name
 from providers.gemini_cli.resource import GeminiCliResource
 from providers.gemini_cli.response import parse_chunk, parse_response
@@ -138,6 +138,13 @@ class GeminiCliProvider(Provider):
         # when Resources share a credential_id.
         self._adapters: Dict[str, GeminiCliAuthAdapter] = {}
         self._credential_store = credential_store
+        # ``proxy`` given to the constructor is PROVIDER-level transport
+        # configuration: it belongs to the one shared backend and therefore
+        # to the whole provider.  Resource-level ``proxy`` is legacy
+        # compatibility input only (see ``_resolve_effective_proxy``).
+        self._provider_proxy: Optional[ProxyConfig] = proxy
+        self._effective_proxy: Optional[ProxyConfig] = proxy
+        self._resource_proxies: Dict[str, str] = {}
 
     def set_credential_store(self, store: Any) -> None:
         """Attach the application-wide credential store (AUTH-002)."""
@@ -156,17 +163,14 @@ class GeminiCliProvider(Provider):
     ) -> ExecutionBackend:
         """Return the one shared backend, creating it on first use.
 
-        Because there is exactly ONE backend per provider, a per-Resource
-        proxy cannot be attached to the transport at request time.  The
-        first Resource that materialises the backend therefore defines the
-        egress, via ``proxy_config_for`` -> ``ProxyConfig``.  An explicit
-        ``proxy=`` passed to the constructor always wins, and Resources
-        without a proxy keep the historical direct connection.
+        Because there is exactly ONE backend per provider, proxy is
+        PROVIDER-level transport configuration: it is resolved once, from
+        the provider config (authoritative) or the single legacy Resource
+        that declares one.  See ``_resolve_effective_proxy``.
         """
         if self._backend is None:
             options = dict(self._backend_options)
-            if options.get("proxy") is None and resource is not None:
-                options["proxy"] = self.proxy_config_for(resource)
+            options["proxy"] = self._effective_proxy
             self._backend = HttpExecutionBackend(**options)
             self._owns_backend = True
         return self._backend
@@ -223,12 +227,22 @@ class GeminiCliProvider(Provider):
     def proxy_config_for(resource: GeminiCliResource) -> Optional[ProxyConfig]:
         """Translate a Resource's proxy string into a ``ProxyConfig``.
 
-        Proxy support is unchanged (TASK-ARCH-004 §4); only the owner
-        changed.  The config is handed to ``HttpExecutionBackend``, which
-        applies it to the ONE shared AsyncClient.  Unparsable values fall
-        back to a direct connection exactly as before.
+        Compatibility input only (TASK-ARCH-004): a Resource can no longer
+        own transport, so this value may only ever define the ONE shared
+        backend's egress, and only when the provider itself declares no
+        proxy.  Unparsable values fall back to a direct connection exactly
+        as before.
         """
-        raw = getattr(resource, "proxy", None) or ""
+        return GeminiCliProvider.parse_proxy(getattr(resource, "proxy", None))
+
+    @staticmethod
+    def parse_proxy(raw: Any) -> Optional[ProxyConfig]:
+        """Parse a proxy URL string into a ``ProxyConfig``.
+
+        Empty or unparsable values yield ``None``, which means "direct" --
+        the historical behaviour, preserved so a bad legacy value can never
+        invent an egress.
+        """
         if not raw or not isinstance(raw, str) or not raw.strip():
             return None
         try:
@@ -242,6 +256,47 @@ class GeminiCliProvider(Provider):
             )
         except Exception:  # noqa: BLE001
             return None
+
+    def register_resource_proxy(self, resource: GeminiCliResource) -> None:
+        """Record a Resource's legacy ``proxy`` and re-resolve the egress.
+
+        Called while the Application layer builds the provider's Resource
+        list, i.e. BEFORE any request is served.  A Resource-level proxy is
+        accepted only as compatibility input:
+
+        * provider-level proxy configured -> provider wins, always;
+        * exactly one Resource with a proxy -> that proxy is used;
+        * several Resources with DIFFERENT proxies -> hard error.
+
+        Silently letting the first Resource win would send Resource B's
+        traffic through Resource A's egress, which is precisely the
+        silent mis-routing TASK-ARCH-004 forbids.
+        """
+        raw = getattr(resource, "proxy", None) or ""
+        if not isinstance(raw, str) or not raw.strip():
+            return
+        self._resource_proxies[resource.id] = raw.strip()
+        self._effective_proxy = self._resolve_effective_proxy()
+
+    def _resolve_effective_proxy(self) -> Optional[ProxyConfig]:
+        """Decide the ONE proxy the shared backend will egress through."""
+        if self._provider_proxy is not None:
+            # Provider-level configuration is authoritative; Resource-level
+            # proxies are legacy and never override it.
+            return self._provider_proxy
+
+        distinct = sorted(set(self._resource_proxies.values()))
+        if not distinct:
+            return None
+        if len(distinct) > 1:
+            raise GeminiCliConfigError(
+                "gemini_cli provider requires one shared proxy, but "
+                "resources specify conflicting proxies: "
+                + ", ".join(distinct)
+                + " -- set a single provider-level 'proxy' instead",
+                provider="gemini_cli",
+            )
+        return self.parse_proxy(distinct[0])
 
     async def _ensure_project(self, resource: GeminiCliResource) -> None:
         """Ensure resource has a project_id, running loadCodeAssist/onboard if needed."""

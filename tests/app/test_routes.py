@@ -402,7 +402,14 @@ def test_root_health():
 
 
 def _gemini_cli_config():
-    """Config using gemini_cli provider (HTTP client injected via _build_http)."""
+    """Config using the gemini_cli provider.
+
+    TASK-ARCH-004: the transport is no longer built per Resource.  Tests
+    inject their fake transport through
+    ``GeminiCliProvider.set_http_client()``, which hands it to the ONE
+    provider-owned ``HttpExecutionBackend`` (``owned=False``), so a request
+    really flows ``Provider -> Client -> HttpExecutionBackend -> FakeHttp``.
+    """
     return {
         "scheduler": {
             "max_retries": 2,
@@ -432,13 +439,48 @@ def _gemini_cli_config():
     }
 
 
+def _gemini_cli_app_with_http(http, config=None):
+    """Build the app with a gemini_cli provider bound to a FakeHttp.
+
+    TASK-ARCH-004: the provider owns exactly ONE ``HttpExecutionBackend``
+    for its whole lifetime, and that backend owns ONE AsyncClient shared
+    by every gemini_cli Resource.  The removed ``_build_http`` hook was a
+    per-Resource escape hatch that no longer exists, so tests inject at the
+    provider level through ``set_http_client()`` -- it wraps the fake in a
+    real ``HttpExecutionBackend(owned=False)`` and every request travels
+
+        GeminiCliProvider -> GeminiCliClient -> HttpExecutionBackend -> FakeHttp
+
+    Injection happens while ``create_app`` runs, because the Application
+    layer creates its own provider instance from the registry; patching the
+    factory (and restoring it immediately) keeps the production wiring
+    untouched.
+    """
+    from app.main import create_app
+    from providers.gemini_cli.factory import GeminiCliProviderFactory
+    from providers.gemini_cli.provider import GeminiCliProvider
+
+    if config is None:
+        config = _gemini_cli_config()
+
+    original = GeminiCliProviderFactory.create_provider
+
+    def fake_create_provider(self_factory, provider_id, cfg=None):
+        models = cfg.get("models") if isinstance(cfg, dict) else None
+        provider = GeminiCliProvider(models=models)
+        provider.set_http_client(http)
+        return provider
+
+    GeminiCliProviderFactory.create_provider = fake_create_provider
+    try:
+        return create_app(config)
+    finally:
+        GeminiCliProviderFactory.create_provider = original
+
+
 def test_gemini_cli_non_stream_gateway():
     """gemini_cli complete -> OpenAI-compatible ChatResponse через gateway."""
-    from unittest.mock import patch
-    from app.main import create_app
-    from providers.gemini_cli.provider import GeminiCliProvider
     from tests.providers._gemini_cli_fakes import FakeHttp
-    import json
 
     http = FakeHttp()
     http.responses.append(http.token_ok("token-1", 3600))
@@ -463,15 +505,14 @@ def test_gemini_cli_non_stream_gateway():
         )
     )
 
-    with patch.object(GeminiCliProvider, "_build_http", return_value=http):
-        client = TestClient(create_app(_gemini_cli_config()))
-        resp = client.post(
-            "/v1/chat/completions",
-            json={
-                "model": "gemini-2.5-flash",
-                "messages": [{"role": "user", "content": "Hi"}],
-            },
-        )
+    client = TestClient(_gemini_cli_app_with_http(http, _gemini_cli_config()))
+    resp = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "gemini-2.5-flash",
+            "messages": [{"role": "user", "content": "Hi"}],
+        },
+    )
     assert resp.status_code == 200
     body = resp.json()
     assert body["object"] == "chat.completion"
@@ -479,15 +520,19 @@ def test_gemini_cli_non_stream_gateway():
     assert body["choices"][0]["finish_reason"] == "stop"
     assert body["usage"]["prompt_tokens"] == 5
     assert body["usage"]["completion_tokens"] == 3
+    # The request really travelled the ARCH-004 chain and the shared
+    # backend drove the injected transport (OAuth refresh + generateContent).
+    assert [call["url"] for call in http.post_calls] == [
+        "https://oauth2.googleapis.com/token",
+        "https://cloudcode-pa.googleapis.com/v1internal:generateContent",
+    ]
 
 
 def test_gemini_cli_stream_gateway():
     """gemini_cli stream -> OpenAI SSE chunks via gateway."""
-    from unittest.mock import patch
-    from app.main import create_app
-    from providers.gemini_cli.provider import GeminiCliProvider
-    from tests.providers._gemini_cli_fakes import FakeHttp, FakeResponse
     import json
+
+    from tests.providers._gemini_cli_fakes import FakeHttp, FakeResponse
 
     http = FakeHttp()
     http.responses.append(http.token_ok("token-1", 3600))
@@ -501,19 +546,18 @@ def test_gemini_cli_stream_gateway():
         )
     )
 
-    with patch.object(GeminiCliProvider, "_build_http", return_value=http):
-        client = TestClient(create_app(_gemini_cli_config()))
-        with client.stream(
-            "POST",
-            "/v1/chat/completions",
-            json={
-                "model": "gemini-2.5-flash",
-                "messages": [{"role": "user", "content": "Hi"}],
-                "stream": True,
-            },
-        ) as resp:
-            assert resp.status_code == 200
-            lines = [line for line in resp.iter_lines() if line]
+    client = TestClient(_gemini_cli_app_with_http(http, _gemini_cli_config()))
+    with client.stream(
+        "POST",
+        "/v1/chat/completions",
+        json={
+            "model": "gemini-2.5-flash",
+            "messages": [{"role": "user", "content": "Hi"}],
+            "stream": True,
+        },
+    ) as resp:
+        assert resp.status_code == 200
+        lines = [line for line in resp.iter_lines() if line]
 
     assert lines[0].startswith("data: {")
     assert lines[-1] == "data: [DONE]"

@@ -137,6 +137,12 @@ providers:
     # 模型列表（配置快照）：覆盖默认清单（gemini-2.5-flash / gemini-2.5-pro）
     # models:
     #   - gemini-2.5-flash
+    # ---- 代理配置（provider 级，TASK-ARCH-004）。
+    # 一个 Provider 只拥有一个 HttpExecutionBackend，而该 Backend
+    # 只拥有一个共享的 AsyncClient，因此代理属于
+    # Provider 层的 transport 配置，对该 Provider 下的所有
+    # Resource 生效；缺省直连。
+    # proxy: socks5://user:pass@host:port
     resources:
       - id: cli-account-01
         # 推荐：引用上方 credentials 定义的凭据（AUTH-002）
@@ -148,4 +154,12 @@ providers:
         client_id: ${GEMINI_CLI_01_CLIENT_ID}
         client_secret: ${GEMINI_CLI_01_CLIENT_SECRET}
         project_id: ${GEMINI_CLI_01_PROJECT_ID}
-        # proxy: socks5://user:pass@host:port   # 可选；缺省直连
+        # ---- legacy 兼容：Resource 级 proxy。仅兼容旧配置，
+        # 新配置请写上方 provider 级的 proxy。兼容规则：
+        #   1) provider 级 proxy 已配置 → provider 级优先，
+        #      Resource 级被忽略；
+        #   2) provider 级未配置且只有一个 Resource 写了
+        #      proxy → 采用它；
+        #   3) 同一 Provider 下多个 Resource 写了不同的 proxy
+        #      → 启动期直接报配置错误（不会静默走第一个）。
+        # proxy: socks5://user:pass@host:port

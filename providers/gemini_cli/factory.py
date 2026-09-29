@@ -42,9 +42,7 @@ class GeminiCliProviderFactory:
                 if isinstance(proxy_cfg, ProxyConfig):
                     proxy = proxy_cfg
                 else:
-                    proxy = GeminiCliProvider.proxy_config_for(
-                        GeminiCliResource(provider=provider_id, proxy=proxy_cfg)
-                    )
+                    proxy = GeminiCliProvider.parse_proxy(proxy_cfg)
             raw_timeout = config.get("timeout_seconds")
             if isinstance(raw_timeout, (int, float)):
                 timeout_seconds = float(raw_timeout)
@@ -55,7 +53,28 @@ class GeminiCliProviderFactory:
         }
         if timeout_seconds is not None:
             kwargs["timeout_seconds"] = timeout_seconds
-        return GeminiCliProvider(**kwargs)
+        provider = GeminiCliProvider(**kwargs)
+        # TASK-ARCH-004: proxy is PROVIDER-level transport configuration
+        # because one Provider owns one HttpExecutionBackend and therefore
+        # one AsyncClient.  Resource-level ``proxy`` survives only as a
+        # compatibility input; conflicting Resource proxies are rejected
+        # here, at wiring time, so a bad config fails at startup rather than
+        # silently sending one Resource's traffic through another's egress.
+        if isinstance(config, dict):
+            for item in config.get("resources") or []:
+                if not isinstance(item, dict):
+                    continue
+                raw = item.get("proxy")
+                if not raw or not isinstance(raw, str) or not raw.strip():
+                    continue
+                provider.register_resource_proxy(
+                    GeminiCliResource(
+                        provider=provider_id,
+                        id=str(item.get("id") or ""),
+                        proxy=raw,
+                    )
+                )
+        return provider
 
 
 class GeminiCliResourceFactory:
