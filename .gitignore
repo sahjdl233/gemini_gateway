@@ -4,7 +4,18 @@ __pycache__/
 *.egg-info/
 .venv/
 .pytest_cache/
-
+# TASK-CLEANUP-002: local test output / capture files. These are re-created by
+# every pytest run and must never be committed. The *.txt capture files are
+# listed explicitly (instead of a blanket *.txt rule) because real documents,
+# fixtures and prompts live in .txt files that DO belong in the repo.
+*.out
+pytest_*.txt
+test_fail.txt
+failure_details.txt
+# Local runtime logs
+*.log
+# repomix one-shot repository snapshots (regenerate on demand, huge diffs)
+repomix-output.xml
 # Local config (may contain secrets) — never commit real values
 config.yaml
 config/providers.yaml
