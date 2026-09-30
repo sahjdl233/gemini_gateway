@@ -190,13 +190,13 @@ class InMemoryPool(ResourcePool):
             resource.total_failures += 1
             self._cooldown.apply_failure(resource)
 
-   async def record_rate_limit(
-       self, resource: Resource, retry_after: Optional[float] = None
-   ) -> None:
-       async with self._lock:
-           resource.total_requests += 1
-           resource.total_failures += 1
-           self._cooldown.apply_rate_limit(resource, retry_after)
+    async def record_rate_limit(
+        self, resource: Resource, retry_after: Optional[float] = None
+    ) -> None:
+        async with self._lock:
+            resource.total_requests += 1
+            resource.total_failures += 1
+            self._cooldown.apply_rate_limit(resource, retry_after)
 
     async def reconcile_resources(self, new_resources: List[Resource]) -> None:
         """Replace resources while preserving per-ResourceKey runtime state.
@@ -246,7 +246,7 @@ class InMemoryPool(ResourcePool):
 
                 # Deep-copy the new resource definition so we never mutate the
                 # caller's object.
-                nr_copy = Resource.model_validate(nr.model_dump())
+                nr_copy = nr.model_copy(deep=True)
 
                 # Apply runtime state if it existed
                 if key in old_by_key:
