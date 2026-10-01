@@ -13,7 +13,9 @@ and their provider-specific subtypes.  Mirrors the pattern established by
   not touch credential secrets, and does not fill DTO defaults — callers
   must validate and complete the DTO before passing it in.
 * Typed errors carry the composite identity so call sites can distinguish
-  duplicates from other conflicts.
+  duplicates from other conflicts: ``DuplicateResourceDefinitionError`` for
+  a rejected ``add``, ``UnknownResourceDefinitionError`` for ``require`` and
+  ``update`` against a missing key.
 
 Design baseline: ``docs/DB-RESOURCE-DESIGN-001.md`` (§4).
 
@@ -32,13 +34,43 @@ from core.resource_definition import (
 )
 
 
-class ResourceDefinitionNotFoundError(ResourceDefinitionError, KeyError):
-    """Raised when a resource definition does not exist in the store."""
+class _ResourceIdentityError(ResourceDefinitionError):
+    """Base for repository errors that carry the composite identity.
+
+    Identity is the composite ``(provider, resource_id)`` pair, so both
+    attributes are always available on the raised error and call sites
+    never have to parse the message text.
+    """
+
+    def __init__(
+        self,
+        provider: str,
+        resource_id: str,
+        message: Optional[str] = None,
+    ) -> None:
+        self.provider = provider
+        self.resource_id = resource_id
+        super().__init__(message or self._default_message())
+
+    def _default_message(self) -> str:
+        return (
+            f"{type(self).__name__}: provider={self.provider!r}, "
+            f"resource_id={self.resource_id!r}"
+        )
 
 
-class DuplicateResourceDefinitionError(ResourceDefinitionError):
-    """Raised when an ``add`` or ``update`` violates the composite unique
-    constraint on ``(provider, id)``."""
+class UnknownResourceDefinitionError(_ResourceIdentityError):
+    """Raised when a resource definition does not exist in the store.
+
+    Raised by :meth:`ResourceRepository.require` and
+    :meth:`ResourceRepository.update`; ``get`` returns ``None`` instead
+    of raising.
+    """
+
+
+class DuplicateResourceDefinitionError(_ResourceIdentityError):
+    """Raised when ``add`` violates the composite unique constraint on
+    ``(provider, resource_id)``.  No write is performed."""
 
 
 class ResourceRepository(ABC):
@@ -75,7 +107,7 @@ class ResourceRepository(ABC):
         """Return the definition for the given composite key.
 
         Raises:
-            ResourceDefinitionNotFoundError: if no such definition exists.
+            UnknownResourceDefinitionError: if no such definition exists.
         """
 
     @abstractmethod
@@ -104,7 +136,7 @@ class ResourceRepository(ABC):
         need to distinguish between "replace existing" and "insert new".
 
         Raises:
-            ResourceDefinitionNotFoundError: if no definition with the same
+            UnknownResourceDefinitionError: if no definition with the same
                 ``(provider, id)`` composite key exists.
         """
 

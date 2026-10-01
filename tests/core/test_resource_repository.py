@@ -9,8 +9,8 @@ Contract under test (frozen semantics):
     add    -> duplicate (provider, id) raises
               DuplicateResourceDefinitionError
     get    -> None for unknown (provider, id)
-    require-> ResourceDefinitionNotFoundError for unknown
-    update -> ResourceDefinitionNotFoundError when missing; full replace
+    require-> UnknownResourceDefinitionError for unknown
+    update -> UnknownResourceDefinitionError when missing; full replace
     remove -> idempotent for unknown (provider, id)
     list   -> deterministic ascending (provider, id)
 """
@@ -28,9 +28,9 @@ from core.resource_definition import (
     ResourceDefinitionBase,
 )
 from core.resource_repository import (
-    ResourceDefinitionNotFoundError,
     DuplicateResourceDefinitionError,
     ResourceRepository,
+    UnknownResourceDefinitionError,
 )
 
 
@@ -80,8 +80,10 @@ class ResourceStore(ResourceRepository):
         key = (definition.provider, definition.id)
         if key in self._store:
             raise DuplicateResourceDefinitionError(
+                definition.provider,
+                definition.id,
                 f"duplicate resource definition: provider={definition.provider!r}, "
-                f"id={definition.id!r}"
+                f"id={definition.id!r}",
             )
         self._store[key] = definition
         return definition
@@ -96,9 +98,11 @@ class ResourceStore(ResourceRepository):
     ) -> ResourceDefinitionBase:
         key = (provider, resource_id)
         if key not in self._store:
-            raise ResourceDefinitionNotFoundError(
+            raise UnknownResourceDefinitionError(
+                provider,
+                resource_id,
                 f"resource definition not found: provider={provider!r}, "
-                f"id={resource_id!r}"
+                f"id={resource_id!r}",
             )
         return self._store[key]
 
@@ -122,9 +126,11 @@ class ResourceStore(ResourceRepository):
     ) -> ResourceDefinitionBase:
         key = (definition.provider, definition.id)
         if key not in self._store:
-            raise ResourceDefinitionNotFoundError(
+            raise UnknownResourceDefinitionError(
+                definition.provider,
+                definition.id,
                 f"resource definition not found: provider={definition.provider!r}, "
-                f"id={definition.id!r}"
+                f"id={definition.id!r}",
             )
         self._store[key] = definition
         return definition
@@ -156,10 +162,13 @@ async def test_add_duplicate_raises(repo: ResourceRepository) -> None:
     """Duplicate (provider, id) raises DuplicateResourceDefinitionError."""
     defn = antigravity_def()
     await repo.add(defn)
-    with pytest.raises(DuplicateResourceDefinitionError) as exc_info:
+    with pytest.raises(DuplicateResourceDefinitionError) as exc:
         await repo.add(defn)
-    assert "antigravity" in str(exc_info.value)
-    assert "r1" in str(exc_info.value)
+    # The error carries the composite identity as attributes.
+    assert exc.value.provider == "antigravity"
+    assert exc.value.resource_id == "r1"
+    assert "antigravity" in str(exc.value)
+    assert "r1" in str(exc.value)
 
 
 @pytest.mark.asyncio
@@ -171,20 +180,26 @@ async def test_get_missing_returns_none(repo: ResourceRepository) -> None:
 
 @pytest.mark.asyncio
 async def test_require_missing_raises(repo: ResourceRepository) -> None:
-    """require raises ResourceDefinitionNotFoundError for unknown key."""
-    with pytest.raises(ResourceDefinitionNotFoundError) as exc_info:
+    """require raises UnknownResourceDefinitionError for unknown key."""
+    with pytest.raises(UnknownResourceDefinitionError) as exc:
         await repo.require("antigravity", "nonexistent")
-    assert "antigravity" in str(exc_info.value)
-    assert "nonexistent" in str(exc_info.value)
+    # The error carries the composite identity as attributes.
+    assert exc.value.provider == "antigravity"
+    assert exc.value.resource_id == "nonexistent"
+    assert "antigravity" in str(exc.value)
+    assert "nonexistent" in str(exc.value)
 
 
 @pytest.mark.asyncio
 async def test_update_missing_raises(repo: ResourceRepository) -> None:
     """update raises for missing definition (not upsert)."""
     new_defn = antigravity_def(rid="r1", project_id="proj-new")
-    with pytest.raises(ResourceDefinitionNotFoundError) as exc_info:
+    with pytest.raises(UnknownResourceDefinitionError) as exc:
         await repo.update(new_defn)
-    assert "r1" in str(exc_info.value)
+    # The error carries the composite identity as attributes.
+    assert exc.value.provider == "antigravity"
+    assert exc.value.resource_id == "r1"
+    assert "r1" in str(exc.value)
 
 
 @pytest.mark.asyncio
