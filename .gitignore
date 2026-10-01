@@ -48,3 +48,8 @@ webui/node_modules/
 webui/dist/
 webui/*.local
 webui/npm-debug.log*
+
+# Temporary files from agent sessions
+.tmp_*
+test*.txt
+simple_test.txt

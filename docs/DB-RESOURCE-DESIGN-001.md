@@ -63,7 +63,7 @@ work is explicitly **out of scope**.
 | Re-validation on read | Select DTO by `provider` → strict validation → emit the raw definition dict the Factory already accepts → rebuild via `ProviderRegistry.create_resources()` (`core/provider_registry.py:140-152`). | Reuses the existing construction path. |
 | Unknown provider | Hard error (`UnknownResourceDefinitionError`), not skipped. | Silent skip loses definitions and hides drift. |
 | Unknown field | Hard error at DTO validation and at import. | Required by §3 rule 2. |
-| Missing required field / type error | Hard error; no partial write, no default-fill. | DB stays a faithful mirror of validated definitions. |
+| Missing required field / type error | Hard error; no partial write, no default-fill. | "Required" means Pydantic-required fields in the DTO schema only. Provider-specific optional/defaulted fields are not "required" for this rule; defaults are schema-level and apply before validation. The persistence layer cannot fill missing/invalid fields after DTO validation. |
 | Runtime-only fields | Excluded by construction: no `health`, `cooldown_until`, `in_flight`, `total_requests`, `total_failures`, `consecutive_failures`. DB reads always produce fresh runtime state. | `core/resource.py:60-84` |
 | Secret material | No secret field exists on any DTO; `credential_id` is the only credential reference. | §3 |
 | `serialize()` shape | **Unchanged.** Runtime-only display fields may appear in responses but are never written to the Repository. | `app/management.py:150-173` is a public contract. |
