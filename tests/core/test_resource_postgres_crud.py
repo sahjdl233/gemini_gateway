@@ -78,6 +78,7 @@ class FakeAsyncConnection:
         self.rollback_calls = 0
         self.closed = False
         self.fail_next_execute: Optional[Exception] = None
+        self.fail_on_commit: Optional[Exception] = None
 
     def _row(self, key: Key) -> Optional[Dict[str, Any]]:
         if key in self._pending:
@@ -174,6 +175,10 @@ class FakeAsyncConnection:
         return visible
 
     async def commit(self) -> None:
+        if self.fail_on_commit is not None:
+            exc = self.fail_on_commit
+            self.fail_on_commit = None
+            raise exc
         for key, row in self._pending.items():
             if row is None:
                 self._table.pop(key, None)

@@ -103,6 +103,21 @@ _DELETE_DEFINITION_SQL = (
 _UNIQUE_VIOLATION_SQLSTATE = "23505"
 
 
+class AsyncCursorProtocol(Protocol):
+    """Cursor surface the repository duck-types against.
+
+    Mirrors psycopg 3 ``AsyncCursor``: ``fetchone`` / ``fetchall`` are
+    awaitable; ``rowcount`` is a plain attribute.  Purely a typing aid —
+    no runtime isinstance checks, any object with this surface works.
+    """
+
+    rowcount: int
+
+    async def fetchone(self) -> Optional[Any]: ...
+
+    async def fetchall(self) -> List[Any]: ...
+
+
 class AsyncConnectionProtocol(Protocol):
     """Structural surface the repository duck-types against.
 
@@ -114,7 +129,7 @@ class AsyncConnectionProtocol(Protocol):
 
     async def execute(
         self, sql: str, params: Optional[tuple] = None
-    ) -> Any: ...
+    ) -> AsyncCursorProtocol: ...
 
     async def commit(self) -> None: ...
 
@@ -150,7 +165,11 @@ class PostgreSQLResourceRepository(ResourceRepository):
         try:
             yield connection
             await connection.commit()
-        except Exception:
+        except BaseException:
+            # BaseException, not Exception: asyncio cancellation delivers
+            # CancelledError (a BaseException) — the connection must still
+            # be rolled back and closed, or a cancelled request leaks its
+            # transaction.  Original exception always propagates.
             try:
                 await connection.rollback()
             except Exception:  # noqa: BLE001 - rollback must not mask
