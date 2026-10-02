@@ -157,10 +157,10 @@ def test_cross_provider_and_secret_payloads_raise(payload):
     """A payload for one provider is never silently parsed as another."""
     from core.resource_definition import parse_resource_definition
 
-    with pytest.raises(Exception) as exc:
+    # All five payloads name a valid provider, so rejection comes from
+    # extra="forbid" — always a pydantic ValidationError.
+    with pytest.raises(ValidationError):
         parse_resource_definition(payload)
-    # Unknown extra fields are pydantic ValidationErrors (extra="forbid").
-    assert isinstance(exc.value, (ValidationError, Exception))
 
 
 def test_wrong_provider_payload_parsed_as_own_type_only():
