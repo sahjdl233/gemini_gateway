@@ -83,7 +83,7 @@ class PostgreSQLResourceRepository:
         try:
             await connection.execute(RESOURCE_DEFINITIONS_SCHEMA_SQL)
             await connection.commit()
-        except BaseException:
+        except Exception:
             try:
                 await connection.rollback()
             except Exception:  # noqa: BLE001 - rollback must not mask

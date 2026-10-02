@@ -166,16 +166,19 @@ async def test_initialize_is_repeatable_and_non_destructive(repo, fake_db):
     await repo.initialize()
     await repo.initialize()
     await repo.initialize()
-    connection = fake_db.last_connection
-    # Every call executed exactly the CREATE TABLE IF NOT EXISTS statement
-    # and committed; no destructive SQL ever ran.
-    assert connection.executed == [normalize(RESOURCE_DEFINITIONS_SCHEMA_SQL)]
-    for c in fake_db.connections:
-        for statement in c.executed:
+    # Each call used its own connection and did the full
+    # execute schema -> commit -> close cycle, never a rollback,
+    # and never any destructive SQL.
+    assert len(fake_db.connections) == 3
+    for connection in fake_db.connections:
+        assert connection.executed == [normalize(RESOURCE_DEFINITIONS_SCHEMA_SQL)]
+        assert connection.commit_calls == 1
+        assert connection.rollback_calls == 0
+        assert connection.closed is True
+        for statement in connection.executed:
             assert not any(
                 kw in statement.upper() for kw in DESTRUCTIVE_KEYWORDS
             )
-        assert c.commit_calls == 1
 
 
 async def test_initialize_closes_connection_on_success(repo, fake_db):
