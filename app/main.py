@@ -29,10 +29,11 @@ from core.resource_definition_repository import (
     ResourceRepositoryDefinitionSource,
 )
 from core.resource_definition_repository_factory import (
+    create_config_definition_source,
     create_resource_definition_repository,
     resource_bootstrap_settings,
 )
-from core.resource_repository_memory import MemoryResourceRepository
+from core.resource_repository_factory import create_resource_repository
 from core.runtime_reconciliation import RuntimeReconciliationService
 from core.runtime_resource_factory import (
     create_config_resource_source,
@@ -295,7 +296,14 @@ def create_app(
     # Disabled bootstrap keeps the legacy YAML path.  Ordering is the
     # frozen ADR-002 §3 sequence: bootstrap apply → runtime
     # reconciliation → runtime build.
-    resource_sink = MemoryResourceRepository()
+    # DB-RESOURCE-011: the sink backend is now selectable —
+    # resource_store.backend: memory (default, no DB required) | postgres
+    # (DSN via GEMINI_GATEWAY_DATABASE_URL, fail-closed when missing).
+    # The bootstrap incoming seed stays config-backed in both cases
+    # (YAML → store import semantics, ADR-002 §2); the definition source
+    # of record is the durable store when postgres.
+    resource_sink = create_resource_repository(cfg)
+    incoming_source = create_config_definition_source(cfg)
     definition_repo = create_resource_definition_repository(cfg)
     bootstrap_enabled, bootstrap_mode = resource_bootstrap_settings(cfg)
 
@@ -306,7 +314,7 @@ def create_app(
     runtime_snapshot = None
     if bootstrap_enabled:
         bootstrap_result, runtime_snapshot = _apply_resource_bootstrap(
-            definition_repo, resource_sink, bootstrap_mode, registry
+            incoming_source, resource_sink, bootstrap_mode, registry
         )
         logger.info(
             "resource.bootstrap mode=%s added=%d unchanged=%d "

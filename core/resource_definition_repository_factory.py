@@ -29,10 +29,16 @@ from core.resource_definition_loader import ConfigResourceDefinitionRepository
 from core.resource_definition_repository import (
     MemoryResourceDefinitionRepository,
     ResourceDefinitionRepository,
+    ResourceRepositoryDefinitionSource,
+)
+from core.resource_repository_factory import (
+    create_resource_repository,
+    resource_store_backend,
 )
 
 __all__ = [
     "create_resource_definition_repository",
+    "create_config_definition_source",
     "resource_bootstrap_settings",
 ]
 
@@ -40,14 +46,39 @@ __all__ = [
 def create_resource_definition_repository(
     config: Mapping[str, Any],
 ) -> ResourceDefinitionRepository:
-    """Create the definition repository implied by the config mapping.
+    """Create the definition source of record implied by the config.
 
-    A non-empty ``providers`` section means the config is the definition
-    seed: its entries are strictly parsed once into DTOs and served
-    through a :class:`ConfigResourceDefinitionRepository`.  Without one
-    there is nothing to parse — an empty
-    :class:`MemoryResourceDefinitionRepository` is returned instead of
-    inventing definitions.
+    Dispatch (DB-RESOURCE-011, Part C):
+
+    * ``resource_store.backend: postgres`` — the durable store IS the
+      definition source of record: a
+      :class:`ResourceRepositoryDefinitionSource` over the PostgreSQL
+      repository (never a separate PG definition-repository class).
+    * ``backend: memory`` (default) — a non-empty ``providers`` section
+      makes the config the definition seed
+      (:class:`ConfigResourceDefinitionRepository`); without one, an
+      empty :class:`MemoryResourceDefinitionRepository` is returned
+      instead of inventing definitions.
+
+    NOTE: the bootstrap *incoming* seed is always the config, regardless
+    of backend — use :func:`create_config_definition_source` for that
+    role (YAML → database import semantics, ADR-002 §2).
+    """
+    if resource_store_backend(config) == "postgres":
+        return ResourceRepositoryDefinitionSource(
+            create_resource_repository(config)
+        )
+    return create_config_definition_source(config)
+
+
+def create_config_definition_source(
+    config: Mapping[str, Any],
+) -> ResourceDefinitionRepository:
+    """The config-backed definition source (the bootstrap incoming seed).
+
+    Always parses the config's resource entries — independent of the
+    backend — because importing the YAML seed into the durable store is
+    bootstrap's job no matter where the store lives.
     """
     providers = config.get("providers")
     if isinstance(providers, Mapping) and providers:

@@ -177,3 +177,10 @@ providers:
 #（fail-closed）。legacy 凭据字段（refresh_token 等）不是合法的
 # definition 字段——启用 bootstrap 前请先完成 AUTH-010 凭据迁移或改为
 # credential_id 引用。
+
+# ---- DB-RESOURCE-011: resource store backend ----------------------------
+# 选择 resource definitions 的持久 sink。缺省 memory（无需数据库，
+# 保持 011 之前的行为）；postgres 走 GEMINI_GATEWAY_DATABASE_URL 环境变量
+#（与 credential store 共用），缺失时启动失败（fail-closed，不回退内存）。
+# resource_store:
+#   backend: memory      # memory | postgres
