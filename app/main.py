@@ -338,7 +338,16 @@ def create_app(
         resource_snapshot=runtime_snapshot,
     )
     _migrate_legacy_credentials_if_durable(cfg, credential_store, scheduler)
-    resource_manager = ResourceManager(scheduler, cfg, config_path)
+    # DB-RESOURCE-013: when the runtime source is the repository
+    # (bootstrap enabled), Admin resource mutations write through the
+    # repository and reconcile; otherwise the legacy YAML path is kept.
+    resource_manager = ResourceManager(
+        scheduler,
+        cfg,
+        config_path,
+        repository=resource_sink if bootstrap_enabled else None,
+        runtime_builder=registry_runtime_builder(registry),
+    )
 
     @asynccontextmanager
     async def lifespan(app_: FastAPI) -> AsyncIterator[None]:
