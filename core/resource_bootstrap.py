@@ -56,6 +56,10 @@ from enum import Enum
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from core.resource_definition import ResourceDefinitionBase
+from core.resource_definition_repository import (
+    ResourceDefinitionRepository,
+    ResourceRepositoryDefinitionSource,
+)
 from core.resource_repository import ResourceRepository
 
 __all__ = [
@@ -180,15 +184,47 @@ class BootstrapResult:
 
 
 class ResourceBootstrapService:
-    """Diff-and-import engine over a :class:`ResourceRepository`.
+    """Diff-and-import engine over a
+    :class:`core.resource_definition_repository.ResourceDefinitionRepository`.
 
-    ``repository`` is any implementation of the DB-RESOURCE-001-2
-    contract (PostgreSQL or test doubles).  The service opens no
-    connections itself; per-operation transactions are the repository's.
+    Dependencies are injected by role (DB-RESOURCE-005):
+
+    * ``repository`` — the definition **source** the service diffs
+      against, via the read-only 004 Protocol.  The service knows YAML,
+      in-memory seeds and PostgreSQL only as interchangeable sources
+      behind this abstraction; use
+      :class:`~core.resource_definition_repository.ResourceRepositoryDefinitionSource`
+      to serve definitions from a durable CRUD repository, or
+      ``MemoryResourceDefinitionRepository`` /
+      ``ConfigResourceDefinitionRepository`` for seeds.
+    * ``sink`` — the **write target** for IMPORT/OVERWRITE, typed as the
+      DB-RESOURCE-001-2 CRUD ``ResourceRepository`` (add/update with
+      per-operation transactions).  CHECK mode never writes and may omit
+      it; a write mode without a sink is a plan-stage error.
+
+    The service opens no connections itself; per-operation transactions
+    are the sink's.
     """
 
-    def __init__(self, repository: ResourceRepository) -> None:
+    def __init__(
+        self,
+        repository: ResourceDefinitionRepository,
+        *,
+        sink: Optional[ResourceRepository] = None,
+    ) -> None:
         self._repository = repository
+        self._sink = sink
+
+    @classmethod
+    def over_repository(
+        cls, repository: ResourceRepository
+    ) -> "ResourceBootstrapService":
+        """Build a service that diffs against and writes to the same
+        durable CRUD repository (the common single-store deployment)."""
+        return cls(
+            ResourceRepositoryDefinitionSource(repository),
+            sink=repository,
+        )
 
     # -- plan ----------------------------------------------------------------
 
@@ -236,10 +272,10 @@ class ResourceBootstrapService:
         db_only)``, every list sorted by composite key.
         """
         incoming = self._validate_incoming(definitions)
-        # DB side: read through the repository (dict rows rebuilt into
-        # strict DTOs), then canonicalize.  DB rows are authoritative for
-        # "what is stored right now".
-        db_definitions = await self._repository.list()
+        # Source side: read through the injected definition repository,
+        # then canonicalize.  Its rows are authoritative for "what is
+        # stored right now" — wherever they came from.
+        db_definitions = await self._repository.list_definitions()
         db_payloads: Dict[Tuple[str, str], Dict[str, Any]] = {}
         for stored in db_definitions:
             db_payloads[(stored.provider, stored.id)] = canonical_payload(
@@ -337,9 +373,16 @@ class ResourceBootstrapService:
         if mode is BootstrapMode.CHECK:
             return result
 
+        if self._sink is None:
+            raise ResourceBootstrapError(
+                f"mode {mode.value!r} writes to the durable repository, "
+                "but no sink was provided — pass sink= (a CRUD "
+                "ResourceRepository) or use CHECK for plan-only runs"
+            )
+
         # IMPORT / OVERWRITE: additive inserts for missing keys.
         for record in added:
-            await self._repository.add(incoming[record.key])
+            await self._sink.add(incoming[record.key])
 
         if mode is BootstrapMode.IMPORT:
             # Conflicts are reported, never overwritten (DESIGN-002 §4).
@@ -347,5 +390,5 @@ class ResourceBootstrapService:
 
         # OVERWRITE: explicit operator decision to accept incoming over DB.
         for conflict in conflicts:
-            await self._repository.update(incoming[conflict.key])
+            await self._sink.update(incoming[conflict.key])
         return result

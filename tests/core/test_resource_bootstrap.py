@@ -54,7 +54,7 @@ def repo(fake_db: FakeAsyncPostgres) -> PostgreSQLResourceRepository:
 
 @pytest.fixture
 def service(repo: PostgreSQLResourceRepository) -> ResourceBootstrapService:
-    return ResourceBootstrapService(repo)
+    return ResourceBootstrapService.over_repository(repo)
 
 
 # -- CHECK mode -----------------------------------------------------------------
@@ -293,7 +293,9 @@ def test_canonical_payload_mirrors_persistence_semantics():
 # -- all providers enter the plan ----------------------------------------------------
 
 
-async def test_all_providers_bootstrap_through(service, fake_db):
+async def test_all_providers_bootstrap_through(
+    service, repo, fake_db,
+):
     definitions = [
         antigravity_def(rid="a1"),
         gemini_def(rid="g1"),
@@ -329,7 +331,7 @@ async def test_all_providers_bootstrap_through(service, fake_db):
     for original in definitions:
         stored_key = (original.provider, original.id)
         row = fake_db.raw_rows()[stored_key]
-        rebuilt = await service._repository.get(*stored_key)
+        rebuilt = await repo.get(*stored_key)
         assert rebuilt == original, stored_key
         assert json.loads(row["definition"]) == original.to_definition_json()
 
@@ -337,7 +339,9 @@ async def test_all_providers_bootstrap_through(service, fake_db):
 # -- repository errors propagate ------------------------------------------------------
 
 
-async def test_duplicate_race_error_propagates_unchanged(service, fake_db):
+async def test_duplicate_race_error_propagates_unchanged(
+    service, repo, fake_db,
+):
     """A row inserted after the plan was computed surfaces the
     repository's own DuplicateResourceDefinitionError — never translated,
     never swallowed."""
@@ -345,9 +349,6 @@ async def test_duplicate_race_error_propagates_unchanged(service, fake_db):
     class RacyRepository:
         def __init__(self, inner):
             self._inner = inner
-
-        async def list(self):
-            return await self._inner.list()
 
         async def add(self, definition):
             # Simulate another writer winning the race between the
@@ -362,18 +363,25 @@ async def test_duplicate_race_error_propagates_unchanged(service, fake_db):
         def __getattr__(self, name):
             return getattr(self._inner, name)
 
-    racy = ResourceBootstrapService(RacyRepository(service._repository))
+    # Reads go through the read-only source; the race fires on the sink.
+    from core.resource_definition_repository import (
+        ResourceRepositoryDefinitionSource,
+    )
+
+    racy = ResourceBootstrapService(
+        ResourceRepositoryDefinitionSource(repo),
+        sink=RacyRepository(repo),
+    )
     with pytest.raises(DuplicateResourceDefinitionError):
         await racy.run([antigravity_def(rid="r1")], BootstrapMode.IMPORT)
 
 
-async def test_unknown_error_from_update_propagates(service, fake_db):
+async def test_unknown_error_from_update_propagates(
+    service, repo, fake_db,
+):
     class VanishingRepository:
         def __init__(self, inner):
             self._inner = inner
-
-        async def list(self):
-            return await self._inner.list()
 
         async def update(self, definition):
             raise UnknownResourceDefinitionError(
@@ -384,7 +392,14 @@ async def test_unknown_error_from_update_propagates(service, fake_db):
             return getattr(self._inner, name)
 
     await service.run([antigravity_def(rid="r1")], BootstrapMode.IMPORT)
-    vanishing = ResourceBootstrapService(VanishingRepository(service._repository))
+    from core.resource_definition_repository import (
+        ResourceRepositoryDefinitionSource,
+    )
+
+    vanishing = ResourceBootstrapService(
+        ResourceRepositoryDefinitionSource(repo),
+        sink=VanishingRepository(repo),
+    )
     with pytest.raises(UnknownResourceDefinitionError):
         await vanishing.run(
             [antigravity_def(rid="r1", project_id="proj-new")],
@@ -407,3 +422,80 @@ async def test_result_notes_disclose_atomicity_limits(service):
         assert any(
             "per-operation atomicity" in note for note in result.notes
         ), mode
+
+
+# -- 005: source injection via ResourceDefinitionRepository --------------------------
+
+
+class FakeReadOnlySource:
+    """Minimal fake: implements ONLY the read-only 004 Protocol.  The
+    bootstrap service must not reach for anything else when planning."""
+
+    def __init__(self, definitions):
+        self._definitions = {
+            (d.provider, d.id): d for d in definitions
+        }
+
+    async def list_definitions(self):
+        return [
+            self._definitions[key] for key in sorted(self._definitions)
+        ]
+
+    async def get_definition(self, provider, id):
+        return self._definitions.get((provider, id))
+
+
+async def test_plan_against_fake_read_only_source():
+    """FakeRepository → BootstrapService → plan: the service diffs against
+    any ResourceDefinitionRepository without knowing Memory/PG/YAML."""
+    source = FakeReadOnlySource(
+        [antigravity_def(rid="existing"), gemini_def(rid="db-only")]
+    )
+    service = ResourceBootstrapService(source)  # no sink — plan only
+    result = await service.run(
+        [antigravity_def(rid="existing"), antigravity_def(rid="new")],
+        BootstrapMode.CHECK,
+    )
+    assert [r.key for r in result.unchanged] == [("antigravity", "existing")]
+    assert [r.key for r in result.added] == [("antigravity", "new")]
+    assert [r.key for r in result.db_only] == [("gemini_cli", "db-only")]
+
+
+async def test_write_mode_without_sink_rejected_at_plan_stage():
+    source = FakeReadOnlySource([])
+    service = ResourceBootstrapService(source)
+    with pytest.raises(ResourceBootstrapError, match="sink"):
+        await service.run([antigravity_def(rid="r1")], BootstrapMode.IMPORT)
+    with pytest.raises(ResourceBootstrapError, match="sink"):
+        await service.run([antigravity_def(rid="r1")], BootstrapMode.OVERWRITE)
+    # CHECK still works sink-less.
+    result = await service.run([antigravity_def(rid="r1")], BootstrapMode.CHECK)
+    assert [r.key for r in result.added] == [("antigravity", "r1")]
+
+
+async def test_injected_memory_source_is_plan_equivalent_to_durable_source():
+    """Same incoming definitions diffed against a memory seed vs. a
+    durable (fake-PG) store produce identical plans — the service cannot
+    tell the sources apart."""
+    from core.resource_definition_repository import (
+        MemoryResourceDefinitionRepository,
+        ResourceRepositoryDefinitionSource,
+    )
+
+    seed = MemoryResourceDefinitionRepository([antigravity_def(rid="r1")])
+    durable = PostgreSQLResourceRepository(
+        FakeAsyncPostgres().connection_factory()
+    )
+    await durable.add(antigravity_def(rid="r1"))
+
+    incoming = [antigravity_def(rid="r1"), antigravity_def(rid="new")]
+    from_seed = await ResourceBootstrapService(seed).run(
+        incoming, BootstrapMode.CHECK
+    )
+    from_durable = await ResourceBootstrapService(
+        ResourceRepositoryDefinitionSource(durable)
+    ).run(incoming, BootstrapMode.CHECK)
+    assert [r.key for r in from_seed.added] == [r.key for r in from_durable.added]
+    assert [r.key for r in from_seed.unchanged] == (
+        [r.key for r in from_durable.unchanged]
+    )

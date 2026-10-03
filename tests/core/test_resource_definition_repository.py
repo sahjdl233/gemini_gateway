@@ -24,6 +24,7 @@ from core.resource_definition_loader import ConfigResourceDefinitionRepository
 from core.resource_definition_repository import (
     MemoryResourceDefinitionRepository,
     ResourceDefinitionRepository,
+    ResourceRepositoryDefinitionSource,
 )
 from core.resource_postgres import PostgreSQLResourceRepository
 from core.resource_repository import DuplicateResourceDefinitionError
@@ -176,7 +177,9 @@ async def test_bootstrap_consumes_dtos_regardless_of_source():
             FakeAsyncPostgres().connection_factory()
         )
         results.append(
-            await ResourceBootstrapService(repo).run(defs, BootstrapMode.CHECK)
+            await ResourceBootstrapService(
+                ResourceRepositoryDefinitionSource(repo)
+            ).run(defs, BootstrapMode.CHECK)
         )
     assert [r.key for r in results[0].added] == [r.key for r in results[1].added]
     assert [(r.provider, r.resource_id) for r in results[0].added] == [
@@ -195,7 +198,7 @@ async def test_bootstrap_plan_uses_memory_repository_definitions():
     durable = PostgreSQLResourceRepository(
         FakeAsyncPostgres().connection_factory()
     )
-    service = ResourceBootstrapService(durable)
+    service = ResourceBootstrapService.over_repository(durable)
     result = await service.run(
         await repo.list_definitions(), BootstrapMode.IMPORT
     )

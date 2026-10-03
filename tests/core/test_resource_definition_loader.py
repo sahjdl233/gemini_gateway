@@ -335,7 +335,7 @@ async def test_loader_output_feeds_bootstrap_check():
     from core.resource_postgres import PostgreSQLResourceRepository
 
     repo = PostgreSQLResourceRepository(FakeAsyncPostgres().connection_factory())
-    service = ResourceBootstrapService(repo)
+    service = ResourceBootstrapService.over_repository(repo)
     result = await service.run(defs, BootstrapMode.CHECK)
     assert [r.key for r in result.added] == [
         ("antigravity", "r1"),

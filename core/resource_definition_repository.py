@@ -27,7 +27,7 @@ can enforce uniqueness).
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Protocol, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Protocol, Sequence, Tuple
 
 from core.resource_definition import ResourceDefinitionBase
 from core.resource_repository import DuplicateResourceDefinitionError
@@ -35,6 +35,7 @@ from core.resource_repository import DuplicateResourceDefinitionError
 __all__ = [
     "ResourceDefinitionRepository",
     "MemoryResourceDefinitionRepository",
+    "ResourceRepositoryDefinitionSource",
 ]
 
 
@@ -91,3 +92,25 @@ class MemoryResourceDefinitionRepository:
         self, provider: str, id: str
     ) -> Optional[ResourceDefinitionBase]:
         return self._definitions.get((provider, id))
+
+
+class ResourceRepositoryDefinitionSource:
+    """Adapt the durable CRUD ``ResourceRepository`` (DB-RESOURCE-001-2)
+    to the read-only definition-source Protocol.
+
+    A durable store can serve as a definition source without exposing its
+    write surface to read-only consumers: ``list_definitions`` maps to
+    ``list()``, ``get_definition`` to ``get()``.  Writes keep flowing
+    through the CRUD contract, which only write-capable consumers hold.
+    """
+
+    def __init__(self, repository: Any) -> None:
+        self._repository = repository
+
+    async def list_definitions(self) -> List[ResourceDefinitionBase]:
+        return await self._repository.list()
+
+    async def get_definition(
+        self, provider: str, id: str
+    ) -> Optional[ResourceDefinitionBase]:
+        return await self._repository.get(provider, id)
