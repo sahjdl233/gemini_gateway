@@ -1,10 +1,12 @@
-"""ResourceRepository contract compliance suite (DB-RESOURCE-001-5, Part C).
+"""ResourceRepository contract compliance suite (DB-RESOURCE-001-5/009).
 
 One shared, frozen-contract test suite, parameterized over every
 ``ResourceRepository`` implementation:
 
 * ``FakeResourceRepository`` — the in-memory store (alias of the
   ``ResourceStore`` from the DB-RESOURCE-001-2 contract tests);
+* ``MemoryResourceRepository`` — the production bootstrap sink
+  (``core/resource_repository_memory.py``, DB-RESOURCE-006);
 * ``PostgreSQLResourceRepository`` — over the in-memory async fake
   connection (no real PostgreSQL required).
 
@@ -19,6 +21,10 @@ Every implementation must satisfy the same error semantics:
 * ``update`` — full replacement only, never an upsert
 * ``delete`` — idempotent
 * ``list``  — deterministic ascending order by the composite key
+
+DB-RESOURCE-009 freezes this suite as the acceptance gate for ANY future
+durable implementation (the PostgreSQL definition store must pass it
+unmodified before it can be wired as a sink).
 """
 
 from __future__ import annotations
@@ -39,6 +45,7 @@ from core.resource_repository import (
     ResourceRepository,
     UnknownResourceDefinitionError,
 )
+from core.resource_repository_memory import MemoryResourceRepository
 from tests.core.test_resource_postgres_crud import (
     FakeAsyncPostgres,
     antigravity_def,
@@ -56,13 +63,17 @@ def make_fake() -> ResourceRepository:
     return FakeResourceRepository()
 
 
+def make_memory() -> ResourceRepository:
+    return MemoryResourceRepository()
+
+
 def make_postgres() -> ResourceRepository:
     return PostgreSQLResourceRepository(FakeAsyncPostgres().connection_factory())
 
 
 @pytest.fixture(
-    params=[make_fake, make_postgres],
-    ids=["fake", "postgres"],
+    params=[make_fake, make_memory, make_postgres],
+    ids=["fake", "memory", "postgres"],
 )
 def repo(request) -> ResourceRepository:
     return request.param()
@@ -202,3 +213,63 @@ async def test_provider_specific_fields_survive(repo: ResourceRepository):
     )
     await repo.add(fb)
     assert await repo.get("firebase", "f1") == fb
+
+
+# -- DB-RESOURCE-009: frozen persistence boundary ---------------------------------
+#
+# These assertions freeze decisions that must hold for ANY future durable
+# implementation (the PostgreSQL definition store).  If one of them ever
+# needs to change, that is an ADR revision — not an implementation detail.
+
+
+async def test_definitions_carry_no_persistence_metadata(repo):
+    """Frozen decision (ADR-003 §4): no version / updated_at / created_at
+    columns are exposed on the persisted shape.  A stored-then-retrieved
+    definition equals the original DTO exactly — the repository adds no
+    metadata and the DTO carries none."""
+    defn = antigravity_def(rid="r1")
+    await repo.add(defn)
+    stored = await repo.get("antigravity", "r1")
+    assert stored == defn
+    for metadata_field in ("updated_at", "created_at", "version", "revision",
+                           "etag"):
+        assert not hasattr(stored, metadata_field), metadata_field
+
+
+async def test_update_writes_no_hidden_metadata(repo):
+    """Full replacement is observable as exact DTO equality — an
+    implementation must not sneak in timestamps or revision counters."""
+    await repo.add(antigravity_def(rid="r1", project_id="proj-old"))
+    replacement = AntigravityResourceDefinition(
+        id="r1", enabled=False, credential_id=None, project_id="proj-new"
+    )
+    await repo.update(replacement)
+    stored = await repo.get("antigravity", "r1")
+    assert stored == replacement
+    assert not any(
+        hasattr(stored, f)
+        for f in ("updated_at", "created_at", "version", "revision")
+    )
+
+
+def test_read_side_protocol_surface_is_frozen():
+    """The 004 read-side implementations expose exactly the read Protocol
+    surface — never the CRUD verb set.  Reads go through
+    ResourceDefinitionRepository; writes through ResourceRepository; a
+    durable store connects the two via
+    ResourceRepositoryDefinitionSource, not by merging interfaces."""
+    from core.resource_definition_loader import (
+        ConfigResourceDefinitionRepository,
+    )
+    from core.resource_definition_repository import (
+        MemoryResourceDefinitionRepository,
+    )
+
+    for impl in (MemoryResourceDefinitionRepository,
+                 ConfigResourceDefinitionRepository):
+        for verb in ("add", "update", "delete", "require",
+                     "save", "upsert", "insert"):
+            assert not hasattr(impl, verb), (impl.__name__, verb)
+        # The read surface is exactly:
+        assert hasattr(impl, "list_definitions")
+        assert hasattr(impl, "get_definition")
