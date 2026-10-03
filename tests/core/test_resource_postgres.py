@@ -229,3 +229,28 @@ async def test_close_failure_does_not_mask_original_error(repo, fake_db):
     with pytest.raises(RuntimeError, match="original boom"):
         await repo.initialize()
     assert fake_db.last_connection.rollback_calls == 1
+
+
+# -- DB-RESOURCE-009/010: frozen schema boundary --------------------------------------
+
+
+def test_schema_has_no_persistence_metadata_columns():
+    """ADR-003 §3: no version / updated_at / created_at columns exist.
+    Re-introducing them requires reopening the ADR, not a stealth schema
+    change."""
+    sql = normalize(RESOURCE_DEFINITIONS_SCHEMA_SQL).upper()
+    for forbidden in ("UPDATED_AT", "CREATED_AT", "VERSION", "REVISION",
+                      "ETAG"):
+        assert forbidden not in sql, forbidden
+
+
+def test_schema_is_the_single_definition_store_shape():
+    """The durable definition store keeps the 001-3 shape exactly:
+    identity columns + JSONB body, composite PK, nothing else."""
+    sql = normalize(RESOURCE_DEFINITIONS_SCHEMA_SQL)
+    assert "provider TEXT NOT NULL" in sql
+    assert "resource_id TEXT NOT NULL" in sql
+    assert "enabled BOOLEAN NOT NULL" in sql
+    assert "credential_id TEXT NULL" in sql
+    assert "definition JSONB NOT NULL" in sql
+    assert "PRIMARY KEY (provider, resource_id)" in sql
