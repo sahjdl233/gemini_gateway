@@ -113,15 +113,30 @@ and opt-out-able.**
 * Fail-closed because the DTO layer's contract is "unknown field, runtime
   field, or secret field fails loudly" — the import must not downgrade that
   to warnings.
-* A config flag (`resource_bootstrap.import_yaml: false`, default `true`)
-  lets an operator decline the auto-import entirely (pure-DB deployments,
-  tests).
+* A config switch lets an operator decline the auto-import entirely
+  (pure-DB deployments, tests).
+
+**Config shape note (for 003):** implement the switch as an enum, not a
+boolean — `resource_bootstrap.mode: auto | disabled | required` (plus
+`check`, see §4). A boolean is sufficient for "import or not" today but
+known to accrete flags later (dry-run, validate-only, migration-only are
+all plausible future wants); an enum mode absorbs them without a config
+schema break. `auto` = empty-table import + optional drift check;
+`disabled` = never read YAML; `required` = startup fails if the table is
+empty and no import source succeeds.
 
 ### Subsequent startups (non-empty table)
 
-No YAML reading happens on the happy path at all. YAML is consulted only by
-the drift check (§4), which compares YAML definitions against DB rows and —
-in the default policy — fails loudly on any difference.
+DB is authoritative and YAML is no longer a runtime dependency — the happy
+path must not read YAML on every startup. The drift check of this section
+is therefore **opt-in**, expressed as `resource_bootstrap.mode: check` (or
+an explicit import command run), never a per-startup tax:
+
+* default (`mode: auto`, non-empty table): build runtime from DB, no YAML I/O;
+* `mode: check`: perform the §4 comparison and fail loudly on drift —
+  intended for operators who want startup-time verification that DB and
+  seed still agree (e.g. right after adopting DB-primary, or in CI);
+* drift resolution always goes through the explicit import command (§7).
 
 ### What is never automatic
 
