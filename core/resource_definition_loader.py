@@ -44,8 +44,15 @@ from core.resource_definition import (
     ResourceDefinitionBase,
     parse_resource_definition,
 )
+from core.resource_definition_repository import (
+    MemoryResourceDefinitionRepository,
+)
 
-__all__ = ["ResourceDefinitionLoadError", "load_resource_definitions"]
+__all__ = [
+    "ResourceDefinitionLoadError",
+    "load_resource_definitions",
+    "ConfigResourceDefinitionRepository",
+]
 
 
 class ResourceDefinitionLoadError(Exception):
@@ -187,3 +194,16 @@ def load_resource_definitions(
 
     loaded.sort(key=lambda d: (d.provider, d.id))
     return loaded
+
+
+class ConfigResourceDefinitionRepository(MemoryResourceDefinitionRepository):
+    """The config adapter as a :class:`ResourceDefinitionRepository`.
+
+    Parses the config mapping once (via :func:`load_resource_definitions`)
+    and serves the resulting DTOs through the source-agnostic read
+    interface.  Consumers of the repository see definitions identical to
+    the DB-backed implementation's — where they come from is invisible.
+    """
+
+    def __init__(self, config: Mapping[str, Any]) -> None:
+        super().__init__(load_resource_definitions(config))
