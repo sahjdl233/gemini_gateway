@@ -163,3 +163,17 @@ providers:
         #   3) 同一 Provider 下多个 Resource 写了不同的 proxy
         #      → 启动期直接报配置错误（不会静默走第一个）。
         # proxy: socks5://user:pass@host:port
+
+# ---- DB-RESOURCE-006: resource bootstrap --------------------------------
+# 将 config 中的 resource definitions 通过 bootstrap 流程应用到
+# ResourceRepository sink（当前为进程内内存实现；PostgreSQL 部署后续任务）。
+# 缺省（不配置本节）= 完全关闭，保持 DB-RESOURCE-006 之前的行为。
+# resource_bootstrap:
+#   enabled: true
+#   mode: check        # check = 只生成 plan，不写 sink
+#                      # import = sink 缺失的定义执行插入；冲突只报告不覆盖
+#                      # overwrite = 额外接受 config 覆盖 sink 中不同的定义
+# 注意：启用后 config 中的 resource definitions 会经过严格 DTO 校验
+#（fail-closed）。legacy 凭据字段（refresh_token 等）不是合法的
+# definition 字段——启用 bootstrap 前请先完成 AUTH-010 凭据迁移或改为
+# credential_id 引用。

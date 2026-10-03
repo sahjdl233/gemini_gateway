@@ -47,6 +47,7 @@ from core.resource_definition import (
 from core.resource_definition_repository import (
     MemoryResourceDefinitionRepository,
 )
+from core.resource_repository import DuplicateResourceDefinitionError
 
 __all__ = [
     "ResourceDefinitionLoadError",
@@ -199,11 +200,43 @@ def load_resource_definitions(
 class ConfigResourceDefinitionRepository(MemoryResourceDefinitionRepository):
     """The config adapter as a :class:`ResourceDefinitionRepository`.
 
-    Parses the config mapping once (via :func:`load_resource_definitions`)
-    and serves the resulting DTOs through the source-agnostic read
-    interface.  Consumers of the repository see definitions identical to
-    the DB-backed implementation's — where they come from is invisible.
+    Serves the config's resource entries through the source-agnostic read
+    interface.  Parsing is **lazy** (materialized on first access), so
+    constructing the repository — e.g. unconditionally at application
+    startup — carries no validation side effects; strict DTO validation
+    (and duplicate-identity rejection) fires exactly when the definitions
+    are actually consumed, such as by an enabled resource bootstrap.
+    Consumers of the repository see definitions identical to the
+    DB-backed implementation's — where they come from is invisible.
     """
 
     def __init__(self, config: Mapping[str, Any]) -> None:
-        super().__init__(load_resource_definitions(config))
+        self._config = config
+        self._materialized = False
+        super().__init__()
+
+    def _materialize(self) -> None:
+        if self._materialized:
+            return
+        self._materialized = True
+        for definition in load_resource_definitions(self._config):
+            key = (definition.provider, definition.id)
+            if key in self._definitions:
+                raise DuplicateResourceDefinitionError(
+                    definition.provider,
+                    definition.id,
+                    f"duplicate resource definition: "
+                    f"provider={definition.provider!r}, "
+                    f"id={definition.id!r}",
+                )
+            self._definitions[key] = definition
+
+    async def list_definitions(self) -> List[ResourceDefinitionBase]:
+        self._materialize()
+        return await super().list_definitions()
+
+    async def get_definition(
+        self, provider: str, id: str
+    ) -> Optional[ResourceDefinitionBase]:
+        self._materialize()
+        return await super().get_definition(provider, id)

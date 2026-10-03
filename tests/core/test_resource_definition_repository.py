@@ -141,9 +141,11 @@ async def test_config_adapter_rejects_duplicate_identity():
         }
     }
     # The loader passes duplicates through; the repository layer is where
-    # the policy bites.
+    # the policy bites.  The config adapter materializes lazily, so the
+    # rejection fires on first access, not on construction.
+    repo = ConfigResourceDefinitionRepository(config)
     with pytest.raises(DuplicateResourceDefinitionError):
-        ConfigResourceDefinitionRepository(config)
+        await repo.list_definitions()
 
 
 async def test_config_adapter_preserves_discriminator():

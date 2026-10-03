@@ -23,6 +23,15 @@ from app.routes.admin import router as admin_router
 from app.management import ResourceManager
 from config.loader import default_config, load_config
 from core.cooldown import CooldownManager
+from core.resource_bootstrap import ResourceBootstrapService
+from core.resource_definition_repository import (
+    ResourceRepositoryDefinitionSource,
+)
+from core.resource_definition_repository_factory import (
+    create_resource_definition_repository,
+    resource_bootstrap_settings,
+)
+from core.resource_repository_memory import MemoryResourceRepository
 from core.credential import (
     Credential,
     CredentialRepository,
@@ -213,8 +222,37 @@ def create_app(
     scheduler = build_runtime(cfg, credential_store)
     _migrate_legacy_credentials_if_durable(cfg, credential_store, scheduler)
     resource_manager = ResourceManager(scheduler, cfg, config_path)
+
+    # DB-RESOURCE-006: resource bootstrap wiring.  The definition
+    # repository (config-seeded) supplies the incoming definitions; the
+    # bootstrap service diffs them against the durable sink's current
+    # state and applies the plan to the sink.  main.py only composes —
+    # it never imports the DTO loader or touches ResourceDefinition
+    # parsing.  A bootstrap failure propagates out of the lifespan and
+    # aborts startup (fail-closed, ADR-002 §8).
+    resource_sink = MemoryResourceRepository()
+    definition_repo = create_resource_definition_repository(cfg)
+    bootstrap_enabled, bootstrap_mode = resource_bootstrap_settings(cfg)
+
     @asynccontextmanager
-    async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+    async def lifespan(app_: FastAPI) -> AsyncIterator[None]:
+        if bootstrap_enabled:
+            bootstrap = ResourceBootstrapService(
+                ResourceRepositoryDefinitionSource(resource_sink),
+                sink=resource_sink,
+            )
+            incoming = await definition_repo.list_definitions()
+            result = await bootstrap.run(incoming, bootstrap_mode)
+            logger.info(
+                "resource.bootstrap mode=%s added=%d unchanged=%d "
+                "conflicts=%d db_only=%d",
+                result.mode.value,
+                len(result.added),
+                len(result.unchanged),
+                len(result.conflicts),
+                len(result.db_only),
+            )
+            app_.state.resource_bootstrap_result = result
         try:
             yield
         finally:
@@ -232,6 +270,8 @@ def create_app(
     app.state.config = cfg
     app.state.resource_manager = resource_manager
     app.state.credential_store = credential_store
+    app.state.resource_sink = resource_sink
+    app.state.resource_definition_repository = definition_repo
     # WEBUI-002 §5: serve the compiled Vue SPA bundle from webui/dist. The
     # mount is applied here (not on the router) so it lands under /admin/, and
     # it is registered *before* the admin router so the SPA catch-all route
