@@ -11,7 +11,7 @@ import copy
 import os
 import tempfile
 from pathlib import Path
-from typing import Any, Dict, Iterable
+from typing import Any, Dict, Iterable, Optional
 
 import yaml
 
@@ -105,6 +105,10 @@ class ResourceManager:
         self.config_path = Path(config_path)
         self._repository = repository
         self._runtime_builder = runtime_builder
+        #: Latest reconciliation snapshot (updated on every repository
+        #: write); consumable by admin/health features without touching
+        #: the scheduler.
+        self.last_snapshot = None
         pools = getattr(scheduler, "pools", {})
         self.pool: InMemoryPool | None = pools.get("antigravity")
         self._lock = asyncio.Lock()
@@ -166,20 +170,67 @@ class ResourceManager:
             )
         return self.pool
 
-    def get_resource(self, resource_id: str) -> AntigravityResource:
-        pool = self._require_pool()
+    # -- DB-RESOURCE-014: provider-aware resource management -------------
+
+    #: Resource fields that are runtime/scheduling state and never part
+    #: of a persisted definition payload.
+    _RUNTIME_ONLY_FIELDS = frozenset(
+        {
+            "health",
+            "cooldown_until",
+            "in_flight",
+            "total_requests",
+            "total_failures",
+            "consecutive_failures",
+            "resource_key",
+        }
+    )
+    _COMMON_DEFINITION_FIELDS = frozenset(
+        {"id", "provider", "enabled", "credential_id"}
+    )
+
+    def _pool_for(self, provider_id: str) -> InMemoryPool:
+        pool = getattr(self.scheduler, "pools", {}).get(provider_id)
+        if pool is None:
+            raise ResourceManagementError(
+                f"unknown or unmanaged provider: {provider_id!r}"
+            )
+        return pool
+
+    def _legacy_provider_guard(self, provider_id: str) -> None:
+        """The YAML-persist path predates provider awareness: it manages
+        the Antigravity pool only (deprecated compatibility)."""
+        if provider_id != "antigravity":
+            raise ResourceManagementError(
+                f"provider {provider_id!r} requires resource bootstrap "
+                "to be enabled"
+            )
+
+    def get_resource(self, provider_id: str, resource_id: str) -> Any:
+        pool = self._pool_for(provider_id)
         for resource in pool.resources:
-            if (
-                isinstance(resource, AntigravityResource)
-                and resource.id == resource_id
-            ):
+            if resource.id == resource_id:
                 return resource
         raise ResourceManagementError("resource not found")
 
-    def list_resources(self) -> list[dict[str, Any]]:
-        return [self.serialize(resource) for resource in self._resources()]
+    def list_resources(
+        self, provider_id: Optional[str] = None
+    ) -> list[dict[str, Any]]:
+        pools = getattr(self.scheduler, "pools", {})
+        if provider_id is not None:
+            pool = pools.get(provider_id)
+            return [self.serialize(r) for r in (pool.resources if pool else [])]
+        serialized = []
+        for provider_id in sorted(pools):
+            serialized.extend(
+                self.serialize(r) for r in pools[provider_id].resources
+            )
+        return serialized
 
-    def serialize(self, resource: AntigravityResource) -> dict[str, Any]:
+    def serialize(self, resource: Any) -> dict[str, Any]:
+        """Generic runtime-resource serialization: common scheduling
+        fields plus the provider-specific config fields (minus legacy
+        credential material, which is never exposed)."""
         health = (
             resource.health.value
             if hasattr(resource.health, "value")
@@ -190,6 +241,17 @@ class ResourceManager:
             if resource.cooldown_until is not None
             else None
         )
+        excluded = (
+            self._RUNTIME_ONLY_FIELDS
+            | self._COMMON_DEFINITION_FIELDS
+            | set(_LEGACY_CREDENTIAL_FIELDS)
+            | {"token_expiry"}
+        )
+        body = {
+            key: value
+            for key, value in resource.model_dump().items()
+            if key not in excluded
+        }
         return {
             "id": resource.id,
             "provider": resource.provider,
@@ -200,8 +262,7 @@ class ResourceManager:
             "in_flight": resource.in_flight,
             "total_requests": resource.total_requests,
             "total_failures": resource.total_failures,
-            "project_id": resource.project_id,
-            "ide_type": resource.ide_type,
+            **body,
         }
 
     @staticmethod
@@ -261,6 +322,7 @@ class ResourceManager:
             runtime_builder=self._runtime_builder,
         )
         snapshot = await service.reconcile()
+        self.last_snapshot = snapshot
         try:
             for provider_id, pool in self.scheduler.pools.items():
                 await pool.reconcile_resources(
@@ -269,17 +331,14 @@ class ResourceManager:
         except RuntimeError as exc:
             raise ResourceManagementError(str(exc)) from exc
 
-    def _definition_payload_from_resource(
-        self, resource: AntigravityResource
-    ) -> Dict[str, Any]:
-        """Runtime resource → strict definition payload (Admin scope)."""
+    def _definition_payload_from_resource(self, resource: Any) -> Dict[str, Any]:
+        """Runtime resource → definition payload (generic, any provider):
+        everything except runtime state; the strict DTO parse decides
+        which fields the provider's definition actually allows."""
         return {
-            "provider": "antigravity",
-            "id": resource.id,
-            "enabled": resource.enabled,
-            "credential_id": resource.credential_id,
-            "project_id": resource.project_id,
-            "ide_type": resource.ide_type,
+            key: value
+            for key, value in resource.model_dump().items()
+            if key not in self._RUNTIME_ONLY_FIELDS
         }
 
     def _parse_definition(
@@ -296,10 +355,10 @@ class ResourceManager:
             ) from exc
 
     async def _repository_create(
-        self, payload: Dict[str, Any]
-    ) -> AntigravityResource:
+        self, payload: Dict[str, Any], provider_id: str
+    ) -> Any:
         values = dict(payload)
-        values["provider"] = "antigravity"
+        values["provider"] = provider_id
         definition = self._parse_definition(values)
         try:
             await self._repository.add(definition)
@@ -312,17 +371,17 @@ class ResourceManager:
             # the runtime stay consistent with each other.
             await self._repository.delete(definition.provider, definition.id)
             raise
-        return self.get_resource(definition.id)
+        return self.get_resource(provider_id, definition.id)
 
     async def _repository_update(
-        self, resource_id: str, payload: Dict[str, Any]
-    ) -> AntigravityResource:
-        current = await self._repository.get("antigravity", resource_id)
+        self, provider_id: str, resource_id: str, payload: Dict[str, Any]
+    ) -> Any:
+        current = await self._repository.get(provider_id, resource_id)
         if current is None:
             # Defensive: runtime resource exists but no stored definition
             # (should not happen on the repository path) — derive one
             # from the live resource so the write is still full-replacement.
-            resource = self.get_resource(resource_id)
+            resource = self.get_resource(provider_id, resource_id)
             base = self._definition_payload_from_resource(resource)
         else:
             base = current.to_runtime_definition()
@@ -330,7 +389,7 @@ class ResourceManager:
         if payload_resource_id is not None and payload_resource_id != resource_id:
             raise ResourceManagementError("resource id cannot be changed")
         base.update(payload)
-        base["provider"] = "antigravity"
+        base["provider"] = provider_id
         base["id"] = resource_id
         definition = self._parse_definition(base)
         try:
@@ -341,50 +400,69 @@ class ResourceManager:
             await self._reconcile_runtime()
         except ResourceManagementError:
             raise
-        return self.get_resource(resource_id)
+        return self.get_resource(provider_id, resource_id)
 
-    async def _repository_delete(self, resource_id: str) -> None:
+    async def _repository_delete(
+        self, provider_id: str, resource_id: str
+    ) -> None:
         # Existence check against the live pool for the friendly 404; the
         # repository delete itself is idempotent.
-        self.get_resource(resource_id)
-        await self._repository.delete("antigravity", resource_id)
+        self.get_resource(provider_id, resource_id)
+        await self._repository.delete(provider_id, resource_id)
         try:
             await self._reconcile_runtime()
         except ResourceManagementError:
             raise
 
     async def create_resource(
-        self, payload: Dict[str, Any]
-    ) -> AntigravityResource:
+        self, payload: Dict[str, Any], *, provider_id: str
+    ) -> Any:
+        """Create a resource definition for ``provider_id``.
+
+        ``provider_id`` must name a configured provider (Part C); the
+        payload is validated by the strict DTO boundary, which rejects
+        unknown providers and fields alike.
+        """
+        self._reject_secret_fields(payload)
         if self._repository_backed:
             if "id" not in payload:
                 raise ResourceManagementError("resource id is required")
-            self._reject_secret_fields(payload)
-            return await self._repository_create(payload)
+            return await self._repository_create(payload, provider_id)
+        self._legacy_provider_guard(provider_id)
         return await self._legacy_create(payload)
 
     async def update_resource(
-        self, resource_id: str, payload: Dict[str, Any]
-    ) -> AntigravityResource:
+        self, provider_id: str, resource_id: str, payload: Dict[str, Any]
+    ) -> Any:
         if self._repository_backed:
+            # Field allowlisting is the strict DTO parse (extra="forbid",
+            # per-provider) — no manager-level field list, so every
+            # provider's editable fields come from its own definition.
             self._reject_secret_fields(payload)
-            unknown = set(payload) - set(_EDITABLE_FIELDS)
-            if unknown:
-                raise ResourceManagementError(
-                    "resource contains unsupported fields"
-                )
-            self._validate_values(payload, creating=False)
-            return await self._repository_update(resource_id, payload)
+            return await self._repository_update(
+                provider_id, resource_id, payload
+            )
+        self._legacy_provider_guard(provider_id)
+        self._reject_secret_fields(payload)
+        unknown = set(payload) - set(_EDITABLE_FIELDS)
+        if unknown:
+            raise ResourceManagementError("resource contains unsupported fields")
+        self._validate_values(payload, creating=False)
         return await self._legacy_update(resource_id, payload)
 
     async def set_enabled(
-        self, resource_id: str, enabled: bool
-    ) -> AntigravityResource:
-        return await self.update_resource(resource_id, {"enabled": enabled})
+        self, provider_id: str, resource_id: str, enabled: bool
+    ) -> Any:
+        return await self.update_resource(
+            provider_id, resource_id, {"enabled": enabled}
+        )
 
-    async def delete_resource(self, resource_id: str) -> None:
+    async def delete_resource(
+        self, provider_id: str, resource_id: str
+    ) -> None:
         if self._repository_backed:
-            return await self._repository_delete(resource_id)
+            return await self._repository_delete(provider_id, resource_id)
+        self._legacy_provider_guard(provider_id)
         return await self._legacy_delete(resource_id)
 
     async def _legacy_create(
@@ -432,7 +510,7 @@ class ResourceManager:
         self._validate_values(payload, creating=False)
 
         async with self._lock:
-            resource = self.get_resource(resource_id)
+            resource = self.get_resource("antigravity", resource_id)
             before = self._resource_values(resource)
             for field, value in payload.items():
                 setattr(resource, field, value)
@@ -448,7 +526,7 @@ class ResourceManager:
     async def _legacy_delete(self, resource_id: str) -> None:
         async with self._lock:
             pool = self._require_pool()
-            resource = self.get_resource(resource_id)
+            resource = self.get_resource("antigravity", resource_id)
             try:
                 await pool.remove_resource(resource)
             except ValueError as exc:

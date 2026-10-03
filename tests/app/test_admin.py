@@ -387,7 +387,7 @@ async def test_disabled_resource_is_not_selected_or_discovered_until_enabled(
         manager = client.app.state.resource_manager
         pool = scheduler.pools["antigravity"]
         provider = scheduler.providers["antigravity"]
-        resource = manager.get_resource("account-a")
+        resource = manager.get_resource("antigravity", "account-a")
         discovery = AsyncMock(return_value=[])
         provider.discovery.fetch_models = discovery
         disabled = client.post("/admin/resources/account-a/disable", headers=ADMIN)

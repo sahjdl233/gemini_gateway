@@ -111,12 +111,92 @@ async def list_resources(request: Request):
     return _manager(request).list_resources()
 
 
-@router.get("/resources/{resource_id}")
-async def get_resource(resource_id: str, request: Request):
+# -- DB-RESOURCE-014: provider-scoped resource routes (canonical) -----------------
+
+
+@router.get("/resources/{provider_id}/{resource_id}")
+async def get_resource_scoped(
+    provider_id: str, resource_id: str, request: Request
+):
     _require_admin(request)
     try:
         return _manager(request).serialize(
-            _manager(request).get_resource(resource_id)
+            _manager(request).get_resource(provider_id, resource_id)
+        )
+    except ResourceManagementError as exc:
+        raise _not_found(exc) from exc
+
+
+@router.patch("/resources/{provider_id}/{resource_id}")
+async def update_resource_scoped(
+    provider_id: str, resource_id: str, request: Request
+):
+    _require_admin(request)
+    payload = await _json_object(request)
+    try:
+        resource = await _manager(request).update_resource(
+            provider_id, resource_id, payload
+        )
+        return _manager(request).serialize(resource)
+    except ResourceManagementError as exc:
+        raise _not_found(exc) from exc
+
+
+@router.post("/resources/{provider_id}/{resource_id}/enable")
+async def enable_resource_scoped(
+    provider_id: str, resource_id: str, request: Request
+):
+    _require_admin(request)
+    try:
+        resource = await _manager(request).set_enabled(
+            provider_id, resource_id, True
+        )
+        return _manager(request).serialize(resource)
+    except ResourceManagementError as exc:
+        raise _not_found(exc) from exc
+
+
+@router.post("/resources/{provider_id}/{resource_id}/disable")
+async def disable_resource_scoped(
+    provider_id: str, resource_id: str, request: Request
+):
+    _require_admin(request)
+    try:
+        resource = await _manager(request).set_enabled(
+            provider_id, resource_id, False
+        )
+        return _manager(request).serialize(resource)
+    except ResourceManagementError as exc:
+        raise _not_found(exc) from exc
+
+
+@router.delete(
+    "/resources/{provider_id}/{resource_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+async def delete_resource_scoped(
+    provider_id: str, resource_id: str, request: Request
+):
+    _require_admin(request)
+    try:
+        await _manager(request).delete_resource(provider_id, resource_id)
+    except ResourceManagementError as exc:
+        raise _not_found(exc) from exc
+
+
+# -- DEPRECATED compatibility routes (antigravity default, WEBUI-002 era) ---------
+#
+# These resolve the legacy implicit provider and must not be used by new
+# code; they exist so existing Admin WebUI builds and scripts keep working.
+
+
+@router.get("/resources/{resource_id}")
+async def get_resource(resource_id: str, request: Request):
+    """Deprecated: use ``/resources/{provider_id}/{resource_id}``."""
+    _require_admin(request)
+    try:
+        return _manager(request).serialize(
+            _manager(request).get_resource("antigravity", resource_id)
         )
     except ResourceManagementError as exc:
         raise _not_found(exc) from exc
@@ -124,10 +204,15 @@ async def get_resource(resource_id: str, request: Request):
 
 @router.post("/resources", status_code=status.HTTP_201_CREATED)
 async def create_resource(request: Request):
+    """Create a resource.  ``provider`` in the body is the canonical form;
+    when absent it resolves to the deprecated antigravity default."""
     _require_admin(request)
     payload = await _json_object(request)
+    provider_id = payload.get("provider", "antigravity")
     try:
-        resource = await _manager(request).create_resource(payload)
+        resource = await _manager(request).create_resource(
+            payload, provider_id=provider_id
+        )
         return _manager(request).serialize(resource)
     except ResourceManagementError as exc:
         raise _not_found(exc) from exc
@@ -135,10 +220,13 @@ async def create_resource(request: Request):
 
 @router.patch("/resources/{resource_id}")
 async def update_resource(resource_id: str, request: Request):
+    """Deprecated: use ``/resources/{provider_id}/{resource_id}``."""
     _require_admin(request)
     payload = await _json_object(request)
     try:
-        resource = await _manager(request).update_resource(resource_id, payload)
+        resource = await _manager(request).update_resource(
+            "antigravity", resource_id, payload
+        )
         return _manager(request).serialize(resource)
     except ResourceManagementError as exc:
         raise _not_found(exc) from exc
@@ -146,9 +234,12 @@ async def update_resource(resource_id: str, request: Request):
 
 @router.post("/resources/{resource_id}/enable")
 async def enable_resource(resource_id: str, request: Request):
+    """Deprecated: use the provider-scoped route."""
     _require_admin(request)
     try:
-        resource = await _manager(request).set_enabled(resource_id, True)
+        resource = await _manager(request).set_enabled(
+            "antigravity", resource_id, True
+        )
         return _manager(request).serialize(resource)
     except ResourceManagementError as exc:
         raise _not_found(exc) from exc
@@ -156,9 +247,12 @@ async def enable_resource(resource_id: str, request: Request):
 
 @router.post("/resources/{resource_id}/disable")
 async def disable_resource(resource_id: str, request: Request):
+    """Deprecated: use the provider-scoped route."""
     _require_admin(request)
     try:
-        resource = await _manager(request).set_enabled(resource_id, False)
+        resource = await _manager(request).set_enabled(
+            "antigravity", resource_id, False
+        )
         return _manager(request).serialize(resource)
     except ResourceManagementError as exc:
         raise _not_found(exc) from exc
@@ -166,9 +260,10 @@ async def disable_resource(resource_id: str, request: Request):
 
 @router.delete("/resources/{resource_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_resource(resource_id: str, request: Request):
+    """Deprecated: use ``/resources/{provider_id}/{resource_id}``."""
     _require_admin(request)
     try:
-        await _manager(request).delete_resource(resource_id)
+        await _manager(request).delete_resource("antigravity", resource_id)
     except ResourceManagementError as exc:
         raise _not_found(exc) from exc
 
