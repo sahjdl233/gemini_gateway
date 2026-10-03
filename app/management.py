@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import logging
 import os
 import tempfile
 from pathlib import Path
@@ -30,6 +31,8 @@ from core.resource_repository import (
 )
 from core.runtime_reconciliation import RuntimeReconciliationService
 from providers.antigravity.resource import AntigravityResource
+
+logger = logging.getLogger(__name__)
 
 
 # WEBUI-001: the Admin Resource surface manages *runtime* configuration
@@ -402,13 +405,18 @@ class ResourceManager:
     def _repository_backed(self) -> bool:
         return self._repository is not None
 
-    # -- DB-RESOURCE-013: repository-backed write path -------------------
+    # -- DB-RESOURCE-013 / CONTROL-004-FIX: repository write path --------
 
     async def _reconcile_runtime(self) -> None:
         """Rebuild runtime resources from the repository and apply them
         to every pool.  Runtime state is preserved per ResourceKey by
         ``pool.reconcile_resources``; in-flight violations propagate as
-        management errors."""
+        management errors.
+
+        NOTE (CONTROL-004 audit W3, accepted): the per-pool loop is not
+        atomic — a failure in a later pool leaves earlier pools updated.
+        The store is the source of truth; state converges on the next
+        successful write or restart."""
         service = RuntimeReconciliationService(
             ResourceRepositoryDefinitionSource(self._repository),
             runtime_builder=self._runtime_builder,
@@ -422,6 +430,51 @@ class ResourceManager:
                 )
         except RuntimeError as exc:
             raise ResourceManagementError(str(exc)) from exc
+
+    @staticmethod
+    def _handle_compensation_failure(
+        reconcile_exc: BaseException, rollback_exc: Exception
+    ) -> None:
+        """A rollback/compensation step failed after a reconcile failure.
+
+        Never swallowed, never silent: both failures are logged and the
+        raised error carries BOTH — the original reconcile failure in
+        the message (and as ``__context__`` /
+        ``.original_reconcile_error``), the compensation failure as
+        ``__cause__``.  ``BaseException`` originals (cancellation) are
+        re-raised unwrapped."""
+        logger.error(
+            "resource.write compensation failed: original=%s: %s | "
+            "rollback=%s: %s",
+            type(reconcile_exc).__name__,
+            reconcile_exc,
+            type(rollback_exc).__name__,
+            rollback_exc,
+        )
+        if not isinstance(reconcile_exc, Exception):
+            raise reconcile_exc
+        error = ResourceManagementError(
+            f"{reconcile_exc}; compensation failed: {rollback_exc}"
+        )
+        error.original_reconcile_error = reconcile_exc
+        raise error from rollback_exc
+
+    async def _rollback_update(
+        self,
+        provider_id: str,
+        resource_id: str,
+        previous: Optional[ResourceDefinitionBase],
+        reconcile_exc: BaseException,
+    ) -> None:
+        """Restore the pre-update store state: the previous definition
+        (full replacement) or, when none existed, no row at all."""
+        try:
+            if previous is not None:
+                await self._repository.update(previous)
+            else:
+                await self._repository.delete(provider_id, resource_id)
+        except Exception as rollback_exc:
+            self._attach_rollback_failure(reconcile_exc, rollback_exc)
 
     def _definition_payload_from_resource(self, resource: Any) -> Dict[str, Any]:
         """Runtime resource → definition payload (generic, any provider):
@@ -458,10 +511,17 @@ class ResourceManager:
             raise ResourceManagementError("resource already exists") from None
         try:
             await self._reconcile_runtime()
-        except ResourceManagementError:
+        except BaseException as reconcile_exc:
             # Compensate: the store write is rolled back so the store and
-            # the runtime stay consistent with each other.
-            await self._repository.delete(definition.provider, definition.id)
+            # the runtime stay consistent with each other.  A failing
+            # compensation never masks the original reconcile error —
+            # it is logged and chained as __cause__ (CONTROL-004-FIX 3).
+            try:
+                await self._repository.delete(
+                    definition.provider, definition.id
+                )
+            except Exception as rollback_exc:
+                self._handle_compensation_failure(reconcile_exc, rollback_exc)
             raise
         return self.get_resource(provider_id, definition.id)
 
@@ -490,7 +550,18 @@ class ResourceManager:
             raise ResourceManagementError("resource not found") from None
         try:
             await self._reconcile_runtime()
-        except ResourceManagementError:
+        except BaseException as reconcile_exc:
+            # CONTROL-004-FIX 1: restore the pre-update store state so DB
+            # and runtime stay consistent; the original reconcile error
+            # keeps its semantics and propagates.
+            try:
+                await self._rollback_update(
+                    provider_id, resource_id, current, reconcile_exc
+                )
+            except Exception as rollback_exc:
+                self._handle_compensation_failure(
+                    reconcile_exc, rollback_exc
+                )
             raise
         return self.get_resource(provider_id, resource_id)
 
@@ -500,10 +571,21 @@ class ResourceManager:
         # Existence check against the live pool for the friendly 404; the
         # repository delete itself is idempotent.
         self.get_resource(provider_id, resource_id)
+        previous = await self._repository.get(provider_id, resource_id)
         await self._repository.delete(provider_id, resource_id)
         try:
             await self._reconcile_runtime()
-        except ResourceManagementError:
+        except BaseException as reconcile_exc:
+            # CONTROL-004-FIX 2: restore the deleted definition (all
+            # fields) so the runtime does not become a ghost; the
+            # original reconcile error keeps its semantics.
+            if previous is not None:
+                try:
+                    await self._repository.add(previous)
+                except Exception as rollback_exc:
+                    self._handle_compensation_failure(
+                        reconcile_exc, rollback_exc
+                    )
             raise
 
     async def create_resource(

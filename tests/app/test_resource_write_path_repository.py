@@ -208,3 +208,132 @@ def test_bootstrap_disabled_keeps_legacy_yaml_path(store_env):
     import asyncio
 
     assert asyncio.run(app.state.resource_sink.list()) == []
+
+
+# -- CONTROL-004-FIX: reconciliation failure compensation -------------------------
+
+
+def _break_reconcile(app, monkeypatch, message="reconcile boom"):
+    pool = app.state.scheduler.pools["antigravity"]
+
+    async def boom(new_resources):
+        raise RuntimeError(message)
+
+    monkeypatch.setattr(pool, "reconcile_resources", boom)
+    return pool
+
+
+def _sink_get(app, provider, rid):
+    import asyncio
+
+    return asyncio.run(app.state.resource_sink.get(provider, rid))
+
+
+def test_update_reconcile_failure_rolls_back_store_and_pool(
+    store_env, monkeypatch
+):
+    app = make_app(store_env)
+    client = TestClient(app)
+    pool = _break_reconcile(app, monkeypatch)
+
+    response = client.patch(
+        "/admin/resources/r1",
+        json={"project_id": "p-edited"},
+        headers=ADMIN,
+    )
+    assert response.status_code == 400
+    assert "reconcile boom" in response.json()["detail"]
+
+    # DB restored to the OLD definition (full replacement rollback)...
+    stored = _sink_get(app, "antigravity", "r1")
+    assert stored.project_id == "p-seed"
+    assert stored.enabled is True
+    # ...and the pool kept the old definition too.
+    assert pool.resources[0].project_id == "p-seed"
+
+
+def test_delete_reconcile_failure_restores_the_resource(
+    store_env, monkeypatch
+):
+    app = make_app(store_env)
+    client = TestClient(app)
+    pool = _break_reconcile(app, monkeypatch)
+
+    response = client.delete("/admin/resources/r1", headers=ADMIN)
+    assert response.status_code == 400
+    assert "reconcile boom" in response.json()["detail"]
+
+    # The deleted definition is restored with ALL fields...
+    stored = _sink_get(app, "antigravity", "r1")
+    assert stored is not None
+    assert stored.project_id == "p-seed"
+    assert stored.enabled is True
+    assert stored.credential_id is None
+    # ...so the runtime is not a ghost.
+    assert [r.id for r in pool.resources] == ["r1"]
+
+
+async def test_create_compensation_failure_keeps_original_error(
+    store_env, monkeypatch, caplog
+):
+    import logging
+
+    from app.management import ResourceManagementError
+
+    import asyncio
+
+    # create_app drives its own asyncio.run bootstrap bridge, so it must
+    # not run inside this test's event loop.
+    app = await asyncio.to_thread(make_app, store_env)
+    client = TestClient(app)
+    _break_reconcile(app, monkeypatch)
+    sink = app.state.resource_sink
+
+    async def failing_delete(provider_id, resource_id):
+        raise RuntimeError("compensation delete exploded")
+
+    monkeypatch.setattr(sink, "delete", failing_delete)
+
+    manager = app.state.resource_manager
+    with caplog.at_level(logging.ERROR, logger="app.management"):
+        with pytest.raises(ResourceManagementError) as exc_info:
+            await manager._repository_create(
+                {"id": "r3", "project_id": "p3"}, "antigravity"
+            )
+
+    # The ORIGINAL reconcile error is preserved...
+    assert "reconcile boom" in str(exc_info.value)
+    # ...and the compensation failure is reachable via __cause__.
+    assert isinstance(exc_info.value.__cause__, RuntimeError)
+    assert "compensation delete exploded" in str(exc_info.value.__cause__)
+    # Both failures are logged.
+    assert any(
+        "compensation failed" in record.message for record in caplog.records
+    )
+
+    # The store keeps the created row (compensation could not remove it) —
+    # a documented convergence-on-next-write state.
+    assert await sink.get("antigravity", "r3") is not None
+
+
+def test_update_rollback_restores_even_from_derived_definition(
+    store_env, monkeypatch
+):
+    """When no stored definition existed (defensive derive path), the
+    rollback removes the row entirely — restoring the prior state."""
+    app = make_app(store_env)
+    client = TestClient(app)
+    _break_reconcile(app, monkeypatch)
+
+    # r2 does not exist in the store yet: create it, so the store has it,
+    # then verify update-failure rollback of an EXISTING row.
+    created = client.post(
+        "/admin/resources",
+        json={"id": "r2", "project_id": "p2"},
+        headers=ADMIN,
+    )
+    # create itself hits the broken reconcile and compensates...
+    assert created.status_code == 400
+    assert _sink_get(app, "antigravity", "r2") is None
+    assert [r.id for r in app.state.scheduler.pools["antigravity"].resources
+            ] == ["r1"]
