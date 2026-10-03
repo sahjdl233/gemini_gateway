@@ -17,6 +17,7 @@ import yaml
 
 from core.pool import InMemoryPool
 from core.resource_definition import (
+    PROVIDER_DEFINITION_TYPES,
     ResourceDefinitionBase,
     parse_resource_definition,
 )
@@ -207,25 +208,116 @@ class ResourceManager:
             )
 
     def get_resource(self, provider_id: str, resource_id: str) -> Any:
+        """Runtime instance lookup (pool view) — used by the write path
+        after reconciliation.  The READ path is
+        :meth:`get_definition_view` / :meth:`list_resources`."""
         pool = self._pool_for(provider_id)
         for resource in pool.resources:
             if resource.id == resource_id:
                 return resource
         raise ResourceManagementError("resource not found")
 
-    def list_resources(
-        self, provider_id: Optional[str] = None
-    ) -> list[dict[str, Any]]:
-        pools = getattr(self.scheduler, "pools", {})
-        if provider_id is not None:
-            pool = pools.get(provider_id)
-            return [self.serialize(r) for r in (pool.resources if pool else [])]
-        serialized = []
-        for provider_id in sorted(pools):
-            serialized.extend(
-                self.serialize(r) for r in pools[provider_id].resources
+    # -- DB-RESOURCE-014/CONTROL-002: definition-sourced read path -------
+
+    def _definition_source(self) -> Any:
+        return ResourceRepositoryDefinitionSource(self._repository)
+
+    def _runtime_lookup(
+        self, provider_id: str, resource_id: str
+    ) -> Optional[Any]:
+        """Best-effort live Resource for runtime observability fields;
+        absence never hides a definition (Part A)."""
+        pool = getattr(self.scheduler, "pools", {}).get(provider_id)
+        if pool is None:
+            return None
+        for resource in pool.resources:
+            if resource.id == resource_id:
+                return resource
+        return None
+
+    def serialize_definition(
+        self, definition: ResourceDefinitionBase, runtime_resource: Any = None
+    ) -> Dict[str, Any]:
+        """Definition state → response item (CONTROL-002 Part C).
+
+        Definition fields come from the repository DTO only; the
+        runtime observability block (health / counters) is merged
+        best-effort from the live pool and is therefore fully
+        independent of the definition values.  Secrets cannot enter:
+        the DTO layer rejects secret fields by construction and the
+        body is the provider's allowlisted definition body.
+        """
+        item = definition.to_runtime_definition()
+        if runtime_resource is not None:
+            item["health"] = (
+                runtime_resource.health.value
+                if hasattr(runtime_resource.health, "value")
+                else str(runtime_resource.health)
             )
-        return serialized
+            item["cooldown_until"] = (
+                runtime_resource.cooldown_until.isoformat()
+                if runtime_resource.cooldown_until is not None
+                else None
+            )
+            item["in_flight"] = runtime_resource.in_flight
+            item["total_requests"] = runtime_resource.total_requests
+            item["total_failures"] = runtime_resource.total_failures
+        else:
+            item["health"] = None
+            item["cooldown_until"] = None
+            item["in_flight"] = None
+            item["total_requests"] = None
+            item["total_failures"] = None
+        return item
+
+    async def list_resources(
+        self, provider_id: Optional[str] = None
+    ) -> list[Dict[str, Any]]:
+        """Definition-sourced listing (CONTROL-002 Part A).  Reads the
+        repository — never the pools — so a resource exists because the
+        store says so, not because a pool was built."""
+        if not self._repository_backed:
+            # Legacy deployments: YAML is the store, the pool is the view.
+            if provider_id is not None:
+                self._legacy_provider_guard(provider_id)
+            return [self.serialize(r) for r in self._resources()]
+        definitions = await self._definition_source().list_definitions()
+        items = [
+            self.serialize_definition(
+                definition,
+                self._runtime_lookup(definition.provider, definition.id),
+            )
+            for definition in definitions
+        ]
+        if provider_id is not None:
+            items = [i for i in items if i["provider"] == provider_id]
+        return items
+
+    async def get_definition_view(
+        self, provider_id: str, resource_id: str
+    ) -> Dict[str, Any]:
+        """Scoped read (CONTROL-002 Part B): repository-sourced, with the
+        legacy antigravity pool view for bootstrap-disabled deployments.
+
+        provider 未管理（unknown to the DTO layer, or unmanaged on the
+        legacy path）→ 400; known provider + missing resource → 404.
+        """
+        if not self._repository_backed:
+            self._legacy_provider_guard(provider_id)
+            return self.serialize(self.get_resource(provider_id, resource_id))
+        if provider_id not in PROVIDER_DEFINITION_TYPES:
+            raise ResourceManagementError(
+                f"unknown or unmanaged provider: {provider_id!r}"
+            )
+        definition = await self._definition_source().get_definition(
+            provider_id, resource_id
+        )
+        if definition is None:
+            raise ResourceManagementError("resource not found")
+        return self.serialize_definition(
+            definition, self._runtime_lookup(provider_id, resource_id)
+        )
+
 
     def serialize(self, resource: Any) -> dict[str, Any]:
         """Generic runtime-resource serialization: common scheduling

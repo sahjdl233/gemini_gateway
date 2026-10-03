@@ -258,6 +258,12 @@ def _apply_resource_bootstrap(
     """
 
     async def _run() -> Any:
+        # Schema init first (ADR-002 §3: repository init → bootstrap):
+        # repeatable CREATE TABLE IF NOT EXISTS on the durable store;
+        # the memory sink has no initialize.
+        initialize = getattr(sink, "initialize", None)
+        if initialize is not None:
+            await initialize()
         service = ResourceBootstrapService(
             ResourceRepositoryDefinitionSource(sink),
             sink=sink,

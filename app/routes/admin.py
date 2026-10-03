@@ -108,7 +108,11 @@ async def admin_page() -> FileResponse:
 @router.get("/resources")
 async def list_resources(request: Request):
     _require_admin(request)
-    return _manager(request).list_resources()
+    # CONTROL-002: definition-sourced listing; optional provider filter
+    # via query param (a {provider_id} path segment would collide with
+    # the deprecated GET /resources/{resource_id} compat route).
+    provider = request.query_params.get("provider")
+    return await _manager(request).list_resources(provider)
 
 
 # -- DB-RESOURCE-014: provider-scoped resource routes (canonical) -----------------
@@ -120,8 +124,8 @@ async def get_resource_scoped(
 ):
     _require_admin(request)
     try:
-        return _manager(request).serialize(
-            _manager(request).get_resource(provider_id, resource_id)
+        return await _manager(request).get_definition_view(
+            provider_id, resource_id
         )
     except ResourceManagementError as exc:
         raise _not_found(exc) from exc
@@ -195,8 +199,8 @@ async def get_resource(resource_id: str, request: Request):
     """Deprecated: use ``/resources/{provider_id}/{resource_id}``."""
     _require_admin(request)
     try:
-        return _manager(request).serialize(
-            _manager(request).get_resource("antigravity", resource_id)
+        return await _manager(request).get_definition_view(
+            "antigravity", resource_id
         )
     except ResourceManagementError as exc:
         raise _not_found(exc) from exc
