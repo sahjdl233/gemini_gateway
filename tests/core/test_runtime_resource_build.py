@@ -29,6 +29,8 @@ from core.resource_definition_repository import (
     MemoryResourceDefinitionRepository,
     ResourceRepositoryDefinitionSource,
 )
+from core.runtime_reconciliation import RuntimeReconciliationService
+from core.runtime_resource_factory import registry_runtime_builder
 from core.resource_repository_memory import MemoryResourceRepository
 from core.runtime_resource_factory import (
     create_runtime_resources,
@@ -93,6 +95,25 @@ def test_definition_converts_to_runtime_resource():
     assert definition.to_runtime_definition()["project_id"] == "p-x"
 
 
+async def _scheduler_from_definitions(config, definitions):
+    """DB-RESOURCE-008 path: reconcile definitions into a snapshot, then
+    build the scheduler from it (as create_app does)."""
+    registry = _fresh_registry()
+    service = RuntimeReconciliationService(
+        MemoryResourceDefinitionRepository(definitions),
+        runtime_builder=registry_runtime_builder(registry),
+    )
+    snapshot = await service.reconcile()
+    return build_runtime(config, CredentialStore(), registry=registry,
+                         resource_snapshot=snapshot)
+
+
+def _sync(coro):
+    import asyncio
+
+    return asyncio.run(coro)
+
+
 def _fresh_registry():
     from app.bootstrap import register_builtin_providers
     from core.provider_registry import ProviderRegistry
@@ -125,11 +146,7 @@ def test_bootstrap_enabled_builds_resources_from_definitions():
     definitions = [
         antigravity_definition(rid="r1", project_id="p-from-sink"),
     ]
-    scheduler = build_runtime(
-        base_config(),
-        CredentialStore(),
-        resource_definitions=definitions,
-    )
+    scheduler = _sync(_scheduler_from_definitions(base_config(), definitions))
     pool = scheduler.pools["antigravity"]
     assert [r.id for r in pool.resources] == ["r1"]
     # Sink wins over YAML: the runtime field comes from the DTO.
@@ -150,10 +167,8 @@ def test_enabled_build_ignores_extra_yaml_resources():
     config["providers"]["antigravity"]["resources"].append(
         {"id": "yaml-only", "project_id": "p-yaml"}
     )
-    scheduler = build_runtime(
-        config,
-        CredentialStore(),
-        resource_definitions=[antigravity_definition(rid="r1")],
+    scheduler = _sync(
+        _scheduler_from_definitions(config, [antigravity_definition(rid="r1")])
     )
     assert [r.id for r in scheduler.pools["antigravity"].resources] == ["r1"]
 
@@ -179,10 +194,8 @@ async def test_end_to_end_startup_composition_feeds_build():
     final_definitions = await ResourceRepositoryDefinitionSource(
         sink
     ).list_definitions()
-    scheduler = build_runtime(
-        base_config(),
-        CredentialStore(),
-        resource_definitions=final_definitions,
+    scheduler = await _scheduler_from_definitions(
+        base_config(), final_definitions
     )
     pool = scheduler.pools["antigravity"]
     assert [(r.provider, r.id) for r in pool.resources] == [
@@ -194,18 +207,19 @@ async def test_end_to_end_startup_composition_feeds_build():
 def test_sink_definitions_split_across_providers():
     """One sink listing drives multiple providers, each consuming only
     its own definitions."""
-    scheduler = build_runtime(
-        {
-            "providers": {
-                "antigravity": {"enabled": True, "resources": []},
-                "fake": {"enabled": True, "resources": []},
-            }
-        },
-        CredentialStore(),
-        resource_definitions=[
-            antigravity_definition(rid="r1"),
-            GeminiCliResourceDefinition(id="g1"),
-        ],
+    scheduler = _sync(
+        _scheduler_from_definitions(
+            {
+                "providers": {
+                    "antigravity": {"enabled": True, "resources": []},
+                    "fake": {"enabled": True, "resources": []},
+                }
+            },
+            [
+                antigravity_definition(rid="r1"),
+                GeminiCliResourceDefinition(id="g1"),
+            ],
+        )
     )
     assert [r.id for r in scheduler.pools["antigravity"].resources] == ["r1"]
     # gemini_cli definition belongs to a provider section that does not
