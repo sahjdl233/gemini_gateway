@@ -9,6 +9,7 @@ their resources.  main.py stays agnostic to provider-specific types.
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+import asyncio
 import logging
 from pathlib import Path
 from typing import Any, AsyncIterator, Dict, Optional
@@ -32,6 +33,7 @@ from core.resource_definition_repository_factory import (
     resource_bootstrap_settings,
 )
 from core.resource_repository_memory import MemoryResourceRepository
+from core.runtime_resource_factory import create_runtime_resources
 from core.credential import (
     Credential,
     CredentialRepository,
@@ -107,7 +109,18 @@ def _build_postgres_credential_repository(
 def build_runtime(
     config: Dict[str, Any],
     credential_store: Optional[CredentialRepository] = None,
+    *,
+    resource_definitions: Optional[List[Any]] = None,
 ) -> Scheduler:
+    """Build the scheduler from config.
+
+    ``resource_definitions`` (DB-RESOURCE-007) switches the runtime
+    resource source: when provided (bootstrap enabled and applied), each
+    provider's resources are built from the sink's ResourceDefinition
+    DTOs via the runtime conversion layer, and the YAML
+    ``providers.*.resources`` entries are ignored.  ``None`` keeps the
+    legacy YAML path unchanged (bootstrap disabled / no-DB deployments).
+    """
     registry = ProviderRegistry()
     register_builtin_providers(registry)
 
@@ -131,9 +144,14 @@ def build_runtime(
         set_credential_store = getattr(provider, "set_credential_store", None)
         if set_credential_store is not None:
             set_credential_store(credential_store)
-        resources = registry.create_resources(
-            provider_id, pcfg.get("resources", [])
-        )
+        if resource_definitions is not None:
+            resources = create_runtime_resources(
+                registry, resource_definitions, provider_id=provider_id
+            )
+        else:
+            resources = registry.create_resources(
+                provider_id, pcfg.get("resources", [])
+            )
         for resource in resources:
             if resource.credential_id and resource.credential_id not in credential_store:
                 logger.warning(
@@ -208,6 +226,37 @@ def _migrate_legacy_credentials_if_durable(
     )
 
 
+def _apply_resource_bootstrap(
+    definition_repo: Any,
+    sink: Any,
+    mode: Any,
+) -> Any:
+    """Apply the resource bootstrap plan and return the sink's final
+    definitions plus the structured result.
+
+    Synchronous bridge for the sync ``create_app`` path (ADR-002 §3):
+    the repository contract is async, so the apply step drives one
+    ``asyncio.run`` here — before ``build_runtime``, because the sink's
+    definitions are the runtime build's input (bootstrap apply → runtime
+    build, per the frozen startup ordering).  Failures propagate and
+    abort startup (fail-closed, ADR-002 §8).
+    """
+
+    async def _run() -> Any:
+        service = ResourceBootstrapService(
+            ResourceRepositoryDefinitionSource(sink),
+            sink=sink,
+        )
+        incoming = await definition_repo.list_definitions()
+        result = await service.run(incoming, mode)
+        final_definitions = await ResourceRepositoryDefinitionSource(
+            sink
+        ).list_definitions()
+        return result, final_definitions
+
+    return asyncio.run(_run())
+
+
 def create_app(
     config: Optional[Dict[str, Any]] = None,
     *,
@@ -219,40 +268,46 @@ def create_app(
     else:
         cfg = config
     credential_store = build_credential_store(cfg)
-    scheduler = build_runtime(cfg, credential_store)
-    _migrate_legacy_credentials_if_durable(cfg, credential_store, scheduler)
-    resource_manager = ResourceManager(scheduler, cfg, config_path)
 
-    # DB-RESOURCE-006: resource bootstrap wiring.  The definition
+    # DB-RESOURCE-006/007: resource bootstrap wiring.  The definition
     # repository (config-seeded) supplies the incoming definitions; the
     # bootstrap service diffs them against the durable sink's current
     # state and applies the plan to the sink.  main.py only composes —
     # it never imports the DTO loader or touches ResourceDefinition
-    # parsing.  A bootstrap failure propagates out of the lifespan and
-    # aborts startup (fail-closed, ADR-002 §8).
+    # parsing.  With bootstrap enabled, the runtime resources are built
+    # from the sink's DTOs (not from YAML); disabled keeps the legacy
+    # YAML path.  Ordering is the frozen ADR-002 §3 sequence: bootstrap
+    # apply → runtime build.
     resource_sink = MemoryResourceRepository()
     definition_repo = create_resource_definition_repository(cfg)
     bootstrap_enabled, bootstrap_mode = resource_bootstrap_settings(cfg)
 
+    bootstrap_result = None
+    sink_definitions: Optional[List[Any]] = None
+    if bootstrap_enabled:
+        bootstrap_result, sink_definitions = _apply_resource_bootstrap(
+            definition_repo, resource_sink, bootstrap_mode
+        )
+        logger.info(
+            "resource.bootstrap mode=%s added=%d unchanged=%d "
+            "conflicts=%d db_only=%d",
+            bootstrap_result.mode.value,
+            len(bootstrap_result.added),
+            len(bootstrap_result.unchanged),
+            len(bootstrap_result.conflicts),
+            len(bootstrap_result.db_only),
+        )
+
+    scheduler = build_runtime(
+        cfg,
+        credential_store,
+        resource_definitions=sink_definitions,
+    )
+    _migrate_legacy_credentials_if_durable(cfg, credential_store, scheduler)
+    resource_manager = ResourceManager(scheduler, cfg, config_path)
+
     @asynccontextmanager
     async def lifespan(app_: FastAPI) -> AsyncIterator[None]:
-        if bootstrap_enabled:
-            bootstrap = ResourceBootstrapService(
-                ResourceRepositoryDefinitionSource(resource_sink),
-                sink=resource_sink,
-            )
-            incoming = await definition_repo.list_definitions()
-            result = await bootstrap.run(incoming, bootstrap_mode)
-            logger.info(
-                "resource.bootstrap mode=%s added=%d unchanged=%d "
-                "conflicts=%d db_only=%d",
-                result.mode.value,
-                len(result.added),
-                len(result.unchanged),
-                len(result.conflicts),
-                len(result.db_only),
-            )
-            app_.state.resource_bootstrap_result = result
         try:
             yield
         finally:
@@ -272,6 +327,7 @@ def create_app(
     app.state.credential_store = credential_store
     app.state.resource_sink = resource_sink
     app.state.resource_definition_repository = definition_repo
+    app.state.resource_bootstrap_result = bootstrap_result
     # WEBUI-002 §5: serve the compiled Vue SPA bundle from webui/dist. The
     # mount is applied here (not on the router) so it lands under /admin/, and
     # it is registered *before* the admin router so the SPA catch-all route

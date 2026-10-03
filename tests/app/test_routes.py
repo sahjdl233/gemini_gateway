@@ -92,9 +92,11 @@ def test_app_shutdown_closes_provider_backends(monkeypatch):
         providers = {"fake": provider}
 
     # build_runtime now also receives the application credential store
-    # (AUTH-002); the stub ignores both arguments.
+    # (AUTH-002) and, when bootstrap is enabled, the sink definitions
+    # (DB-RESOURCE-007); the stub ignores all of them.
     monkeypatch.setattr(
-        "app.main.build_runtime", lambda config, credential_store=None: Scheduler()
+        "app.main.build_runtime",
+        lambda config, credential_store=None, **kwargs: Scheduler(),
     )
     with TestClient(create_app({})) as client:
         assert client.get("/").status_code == 200
