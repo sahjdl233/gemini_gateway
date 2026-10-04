@@ -106,6 +106,7 @@ class ResourceManager:
         repository: Any = None,
         runtime_builder: Any = None,
         credential_store: Any = None,
+        model_registry: Any = None,
     ) -> None:
         self.scheduler = scheduler
         self.config = config
@@ -117,6 +118,14 @@ class ResourceManager:
         #: resolve at mutation time — strict reference integrity carried
         #: from the request path into the control plane).
         self._credential_store = credential_store
+        #: CONFIG/R-2-C: optional discovery-cache hook.  After a
+        #: definition mutation reaches the runtime (reconcile success on
+        #: the repository path, pool+persist success on the legacy
+        #: path), the model index is invalidated so the next discovery
+        #: reflects the new definitions.  Optional for backward
+        #: compatibility; the registry contract is
+        #: docs/CONFIG-R2B-MODEL-REGISTRY-INVALIDATION.md.
+        self._model_registry = model_registry
         #: Latest reconciliation snapshot (updated on every repository
         #: write); consumable by admin/health features without touching
         #: the scheduler.
@@ -544,6 +553,22 @@ class ResourceManager:
         for provider_id, stale in stale_by_provider.items():
             if stale:
                 self._invalidate_provider_adapters(provider_id, stale)
+        # CONFIG/R-2-C: the definitions are live in the runtime — the
+        # discovery cache must not keep serving the old index.  Only
+        # this SUCCESS point invalidates; a reconcile failure is rolled
+        # back above and leaves the cache untouched.
+        self._invalidate_model_registry()
+
+    def _invalidate_model_registry(self) -> None:
+        """Notify the optional ModelRegistry that definitions changed.
+
+        CONFIG/R-2-C: called strictly AFTER a definition mutation has
+        taken effect in the runtime.  Registry contract:
+        docs/CONFIG-R2B-MODEL-REGISTRY-INVALIDATION.md — invalidate is
+        lazy, state-preserving and never called for runtime scheduling
+        state.  No-op when no registry was provided."""
+        if self._model_registry is not None:
+            self._model_registry.invalidate()
 
     @staticmethod
     def _handle_compensation_failure(
@@ -812,6 +837,8 @@ class ResourceManager:
                 await pool.remove_resource(resource)
                 self._original_values.pop(resource.id, None)
                 raise
+            # CONFIG/R-2-C: the definition is live — invalidate discovery.
+            self._invalidate_model_registry()
         return resource
 
     async def _legacy_update(
@@ -853,6 +880,8 @@ class ResourceManager:
                 self._invalidate_provider_adapters(
                     "antigravity", (resource_id,)
                 )
+            # CONFIG/R-2-C: the definition is live — invalidate discovery.
+            self._invalidate_model_registry()
             return resource
 
     async def _legacy_delete(self, resource_id: str) -> None:
@@ -878,6 +907,8 @@ class ResourceManager:
             # CONTROL-006-FIX-1: the resource is gone — its provider
             # auth-adapter OAuth state must not survive a same-id recreate.
             self._invalidate_provider_adapters("antigravity", (resource_id,))
+            # CONFIG/R-2-C: the definition is gone — invalidate discovery.
+            self._invalidate_model_registry()
 
     def _persist(self) -> None:
         """Persist live resources without expanding environment markers."""

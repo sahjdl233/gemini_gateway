@@ -393,6 +393,10 @@ def create_app(
         repository=resource_sink if bootstrap_enabled else None,
         runtime_builder=registry_runtime_builder(registry),
         credential_store=credential_store,
+        # The real scheduler always exposes its registry; getattr keeps
+        # minimal scheduler stand-ins (tests) working — the manager's
+        # dependency is optional by contract (CONFIG/R-2-C).
+        model_registry=getattr(scheduler, "model_registry", None),
     )
 
     @asynccontextmanager
