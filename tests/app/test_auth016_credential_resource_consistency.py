@@ -87,6 +87,7 @@ def test_patch_credential_invalidates_bound_adapters(tmp_path, monkeypatch):
     # OAuth runtime state from the pre-PATCH session.
     adapter.auth._access_token = "token-old"
     adapter.auth._rotated_refresh_token = "rotated-old"
+    captured: dict = {}
 
     response = client.patch(
         "/admin/credentials/cred-a",
@@ -102,14 +103,23 @@ def test_patch_credential_invalidates_bound_adapters(tmp_path, monkeypatch):
         new_adapter = await provider._adapter_for(created)
         assert new_adapter is not adapter
         assert new_adapter.auth._rotated_refresh_token is None
-        # First refresh after the payload replacement presents the NEW
-        # refresh token — the old rotated token cannot win anymore.
+        # First refresh after the payload replacement must present the
+        # NEW refresh token to the token endpoint — assert the grant
+        # itself, not just the (necessary) absence of the old rotated
+        # token: a future material-resolver change could otherwise
+        # silently keep serving stale material behind a green test.
 
         async def fake_exchange(resource, refresh_token, material):
+            captured["refresh_token"] = refresh_token
+            captured["material"] = dict(material)
             return "access-token", 3600, None
 
         new_adapter.auth._exchange = fake_exchange
-        return await new_adapter.auth.get_access_token(created)
+        token = await new_adapter.auth.get_access_token(created)
+        assert token == "access-token"
+        assert captured["refresh_token"] == "rt-new"
+        assert captured["refresh_token"] != "rotated-old"
+        return token
 
     assert asyncio.run(first_refresh()) == "access-token"
     assert created.credential_id == "cred-a"
