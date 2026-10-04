@@ -353,40 +353,71 @@ async def _manager_app(store_env):
     return await asyncio.to_thread(make_app, store_env)
 
 
-def _first_call_fails(pool, message="reconcile boom"):
-    """Fail the FIRST reconcile call only — later calls delegate to the
-    real reconcile.  Under the mutation lock the calls are serialized, so
-    call order == request order."""
-    real = pool.reconcile_resources
-    calls = {"n": 0}
-
-    async def stub(new_resources):
-        calls["n"] += 1
-        if calls["n"] == 1:
-            raise RuntimeError(message)
-        return await real(new_resources)
-
-    pool.reconcile_resources = stub
-    return calls
-
-
 async def test_concurrent_update_rollback_does_not_clobber_newer_write(
     store_env, monkeypatch
 ):
-    """CONTROL-005-FIX Test 1.
+    """CONTROL-005-FIX Test 1 — rollback clobber, deterministically staged.
 
-    Request A: update succeeds on the store, reconcile fails, rollback
-    runs.  Request B: update the SAME resource concurrently.
+    Choreography (event-gated, not scheduling-dependent):
 
-    Serialized by the mutation lock, whichever request runs first
-    completes its ENTIRE lifecycle (including A's rollback) before the
-    other starts — so the stale pre-A value can never land on top of B's
-    committed write.  Final state: DB and pool agree on B's value."""
+    * A: reads C0 ("p-seed"), writes "p-A" to the store, then parks inside
+      its reconcile (the snapshot has already been read from the store).
+    * B: held back from its store write until A is parked, then writes
+      "p-B", reconciles successfully and COMPLETES while A is parked.
+    * A: resumes, its reconcile fails ("reconcile boom") and its rollback
+      writes the stale C0 back with a full-replacement UPDATE.
+
+    Without the mutation lock this lands the classic clobber: the store
+    ends at C0 while the pool holds B's "p-B" (and the flag records that
+    B's lifecycle ran inside A's window).  With the lock, B cannot start
+    inside A's window (the gate times out), A fails and rolls back to C0
+    first, and B then commits "p-B" — final state: store AND pool hold
+    B's value."""
     app = await _manager_app(store_env)
     pool = app.state.scheduler.pools["antigravity"]
-    _first_call_fails(pool)
     sink = app.state.resource_sink
     manager = app.state.resource_manager
+
+    flags = {"interleaved": False}
+    a_reconciling = asyncio.Event()  # A is parked inside its reconcile
+    b_done = asyncio.Event()  # B committed its full lifecycle
+
+    real_reconcile = pool.reconcile_resources
+
+    async def gated_reconcile(new_resources):
+        # Only A's reconcile snapshot contains "p-A" (B's write is held
+        # back until A is parked, and B's own snapshot shows "p-B"), so
+        # the park-and-fail applies to A's reconcile only; B passes
+        # straight through to the real reconcile.
+        if not any(
+            getattr(resource, "project_id", None) == "p-A"
+            for resource in new_resources
+        ):
+            return await real_reconcile(new_resources)
+        # Park A here: its reconcile snapshot is already read, so every
+        # store write B does from now on lands inside A's
+        # reconcile→rollback window.
+        a_reconciling.set()
+        try:
+            await asyncio.wait_for(b_done.wait(), timeout=2.0)
+        except asyncio.TimeoutError:
+            pass  # serialized: B never made progress inside A's window
+        else:
+            flags["interleaved"] = True
+        raise RuntimeError("reconcile boom")
+
+    monkeypatch.setattr(pool, "reconcile_resources", gated_reconcile)
+
+    real_update = sink.update
+
+    async def gated_update(definition):
+        # Hold B's store write back until A is parked in its reconcile,
+        # so the write provably lands inside A's window.
+        if definition.project_id == "p-B":
+            await a_reconciling.wait()
+        return await real_update(definition)
+
+    monkeypatch.setattr(sink, "update", gated_update)
 
     async def request_a():
         return await manager.update_resource(
@@ -394,16 +425,20 @@ async def test_concurrent_update_rollback_does_not_clobber_newer_write(
         )
 
     async def request_b():
-        return await manager.update_resource(
-            "antigravity", "r1", {"project_id": "p-B"}
-        )
+        try:
+            return await manager.update_resource(
+                "antigravity", "r1", {"project_id": "p-B"}
+            )
+        finally:
+            b_done.set()
 
-    # A is scheduled first, so the FIFO asyncio.Lock hands it the
-    # mutation lock first: A fails and rolls back, then B commits.
-    results = await asyncio.gather(
+    error_a, ok_b = await asyncio.gather(
         request_a(), request_b(), return_exceptions=True
     )
-    error_a, ok_b = results
+
+    # The lock must make B's write land AFTER A's whole lifecycle: no
+    # interleaving was observed through the gate.
+    assert not flags["interleaved"]
     assert isinstance(error_a, ResourceManagementError)
     assert "reconcile boom" in str(error_a)
     assert not isinstance(ok_b, BaseException), ok_b
@@ -420,54 +455,80 @@ async def test_concurrent_update_rollback_does_not_clobber_newer_write(
 async def test_concurrent_delete_update_serialize_without_silent_loss(
     store_env, monkeypatch
 ):
-    """CONTROL-005-FIX Test 2.
+    """CONTROL-005-FIX Test 2 — DELETE/PATCH mid-flight destruction,
+    deterministically staged.
 
-    DELETE and PATCH run concurrently on the same resource.  Allowed:
-    either one wins and the other sees a clean success-or-error.  Not
-    allowed: a mutation whose request returned success being silently
-    destroyed by the other's mid-flight interleaving.
+    Choreography (event-gated, not scheduling-dependent):
 
-    The sink operation log proves the two lifecycles never interleave:
-    each request's read/write/reconcile block completes before the other
-    starts."""
+    * DELETE: passes its existence checks, captures ``previous``, then
+      parks immediately BEFORE its store delete.
+    * PATCH: held back from its store write until DELETE is parked, then
+      writes "p-patched", reconciles and COMPLETES with a success while
+      DELETE is parked.
+    * DELETE: resumes and deletes — destroying PATCH's committed write.
+
+    Without the mutation lock this is exactly the forbidden outcome: a
+    request whose response was success has its write silently destroyed
+    (flag records PATCH's lifecycle ran inside DELETE's window).  With
+    the lock, PATCH cannot start inside DELETE's window (the gate times
+    out), DELETE finishes the removal first, and PATCH then fails with a
+    clean "resource not found" against the already-deleted state."""
     app = await _manager_app(store_env)
     pool = app.state.scheduler.pools["antigravity"]
     sink = app.state.resource_sink
     manager = app.state.resource_manager
 
-    op_log: list[str] = []
-    for op in ("get", "update", "delete", "add", "list"):
-        real = getattr(sink, op)
+    flags = {"interleaved": False}
+    delete_parked = asyncio.Event()  # DELETE parked before its delete
+    patch_done = asyncio.Event()  # PATCH committed its full lifecycle
 
-        def wrap(real=real, op=op):
-            async def traced(*args, **kwargs):
-                op_log.append(op)
-                return await real(*args, **kwargs)
+    real_delete = sink.delete
 
-            return traced
+    async def gated_delete(provider, resource_id):
+        # Park DELETE between the previous-read and the store delete.
+        delete_parked.set()
+        try:
+            await asyncio.wait_for(patch_done.wait(), timeout=2.0)
+        except asyncio.TimeoutError:
+            pass  # serialized: PATCH never made progress in the window
+        else:
+            flags["interleaved"] = True
+        return await real_delete(provider, resource_id)
 
-        monkeypatch.setattr(sink, op, wrap())
+    monkeypatch.setattr(sink, "delete", gated_delete)
+
+    real_update = sink.update
+
+    async def gated_update(definition):
+        # Hold PATCH's store write back until DELETE is parked, so the
+        # write provably lands inside DELETE's uncommitted window.
+        await delete_parked.wait()
+        return await real_update(definition)
+
+    monkeypatch.setattr(sink, "update", gated_update)
 
     async def patch_request():
-        return await manager.update_resource(
-            "antigravity", "r1", {"project_id": "p-patched"}
-        )
+        try:
+            return await manager.update_resource(
+                "antigravity", "r1", {"project_id": "p-patched"}
+            )
+        finally:
+            patch_done.set()
 
     async def delete_request():
         return await manager.delete_resource("antigravity", "r1")
 
-    # PATCH is scheduled first: it completes its whole lifecycle, then
-    # DELETE removes the resource — the classic sequential outcome.
-    patch_result, _ = await asyncio.gather(
-        patch_request(), delete_request(), return_exceptions=True
+    _, patch_error = await asyncio.gather(
+        delete_request(), patch_request(), return_exceptions=True
     )
-    assert not isinstance(patch_result, BaseException), patch_result
 
-    # The PATCH was NOT silently destroyed mid-flight: its lifecycle
-    # (get → update → reconcile's list) fully precedes DELETE's
-    # (get → delete → reconcile's list).
-    assert op_log[:3] == ["get", "update", "list"]
-    assert op_log[3:6] == ["get", "delete", "list"]
+    # The lock must keep PATCH entirely outside DELETE's window.
+    assert not flags["interleaved"]
+    # PATCH therefore never reports success: DELETE (scheduled first)
+    # completed the removal before PATCH started, and PATCH fails with a
+    # clean not-found instead of succeeding and being silently destroyed.
+    assert isinstance(patch_error, ResourceManagementError)
+    assert "not found" in str(patch_error)
     # Final state is the sequential result: deleted everywhere.
     assert await sink.get("antigravity", "r1") is None
     assert [r.id for r in pool.resources] == []
