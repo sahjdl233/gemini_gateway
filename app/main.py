@@ -33,7 +33,10 @@ from core.resource_definition_repository_factory import (
     create_resource_definition_repository,
     resource_bootstrap_settings,
 )
-from core.resource_repository_factory import create_resource_repository
+from core.resource_repository_factory import (
+    create_resource_repository,
+    resource_store_backend,
+)
 from core.runtime_reconciliation import RuntimeReconciliationService
 from core.runtime_resource_factory import (
     create_config_resource_source,
@@ -245,6 +248,8 @@ def _apply_resource_bootstrap(
     sink: Any,
     mode: Any,
     registry: ProviderRegistry,
+    *,
+    reconciliation_repository: Any = None,
 ) -> Any:
     """Apply the resource bootstrap plan, then reconcile the runtime from
     the sink; return ``(bootstrap_result, runtime_snapshot)``.
@@ -270,8 +275,14 @@ def _apply_resource_bootstrap(
         )
         incoming = await definition_repo.list_definitions()
         result = await service.run(incoming, mode)
+        # CONFIG/R-7: the reconciliation source is the persistence-layer
+        # ResourceDefinitionRepository (postgres) when provided; memory
+        # deployments keep the legacy sink-backed read source.  Bootstrap
+        # diff/apply above stays on the write-side repository.
         reconciliation = RuntimeReconciliationService(
-            ResourceRepositoryDefinitionSource(sink),
+            reconciliation_repository
+            if reconciliation_repository is not None
+            else ResourceRepositoryDefinitionSource(sink),
             runtime_builder=registry_runtime_builder(registry),
         )
         snapshot = await reconciliation.reconcile()
@@ -366,8 +377,20 @@ def create_app(
     bootstrap_result = None
     runtime_snapshot = None
     if bootstrap_enabled:
+        # CONFIG/R-7: postgres production wiring hands the reconciliation
+        # service the new-protocol repository (the source of record);
+        # memory deployments reconcile from their imported sink.
+        reconciliation_repository = (
+            definition_repo
+            if resource_store_backend(cfg) == "postgres"
+            else None
+        )
         bootstrap_result, runtime_snapshot = _apply_resource_bootstrap(
-            incoming_source, resource_sink, bootstrap_mode, registry
+            incoming_source,
+            resource_sink,
+            bootstrap_mode,
+            registry,
+            reconciliation_repository=reconciliation_repository,
         )
         _log_bootstrap_outcome(bootstrap_result, runtime_snapshot)
         logger.info(

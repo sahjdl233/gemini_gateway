@@ -137,3 +137,36 @@ adapter invalidation + ModelRegistry.invalidate()（CONFIG/R-2-C）
 * Admin 写路径的存在性校验（AUTH-016）已闭合引用完整性；
 * legacy YAML 路径（Part C）保留其明文 legacy 字段（AUTH-010 兼容，
   见 roadmap 冻结决策），不在本 ADR 范围内收窄。
+
+## 7. Production wiring（CONFIG/R-7 追加）
+
+```
+Application (create_app)
+    |
+    v
+Repository abstraction（ResourceDefinitionRepository protocol，
+                        core/repositories/resource_definition.py）
+    |
+    ├── memory 后端：config seed source（legacy read protocol，未变）
+    └── postgres 后端：PostgresResourceDefinitionRepository
+                            |
+                            v
+                    Storage adapter（标准 PostgreSQL，三表见 CONFIG/R-6）
+                            |
+                            v
+        RuntimeReconciliationService（只认识 Protocol，不认识 DB）
+```
+
+冻结规则（CONFIG/R-7 起）：
+
+1. **postgres 后端的 definition source of record 是
+   `PostgresResourceDefinitionRepository`**——`create_resource_definition_repository`
+   直接返回它；启动 reconciliation 从它读取（`list_all()`）。
+2. `PostgreSQLResourceRepository` **deprecated 但保留**（DeprecationWarning）：
+   它仍是 bootstrap apply 与 `ResourceManager` 的 WRITE sink；读侧已切换。
+   直到最后写路径迁移完成前，不得删除。
+3. **单一 source of record**：bootstrap diff 读、bootstrap 写、reconciliation
+   读全部落在同一张 `resource_definitions` 表；config seed 只作为 bootstrap
+   incoming 输入，永不直接进入 runtime。
+4. memory 后端维持 legacy source（`ResourceRepositoryDefinitionSource`
+   over 其 sink）——该部署没有持久层可切换。

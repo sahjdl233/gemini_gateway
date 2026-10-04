@@ -24,6 +24,8 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
+import os
+
 from core.resource_bootstrap import BootstrapMode, ResourceBootstrapError
 from core.resource_definition_loader import ConfigResourceDefinitionRepository
 from core.resource_definition_repository import (
@@ -32,7 +34,10 @@ from core.resource_definition_repository import (
     ResourceRepositoryDefinitionSource,
 )
 from core.resource_repository_factory import (
+    DATABASE_URL_ENV,
+    ResourceStoreConfigurationError,
     create_resource_repository,
+    resource_store_backend,
     resource_store_backend,
 )
 
@@ -65,8 +70,23 @@ def create_resource_definition_repository(
     role (YAML → database import semantics, ADR-002 §2).
     """
     if resource_store_backend(config) == "postgres":
-        return ResourceRepositoryDefinitionSource(
-            create_resource_repository(config)
+        # CONFIG/R-7 cutover: the source of record for postgres is the
+        # new persistence-layer adapter (ResourceDefinitionRepository
+        # protocol) — reads no longer route through the deprecated
+        # PostgreSQLResourceRepository read adapter.
+        from core.repositories.postgres import (
+            PostgresResourceDefinitionRepository,
+        )
+        from core.resource_postgres import psycopg_async_connection_factory
+
+        dsn = os.environ.get(DATABASE_URL_ENV)
+        if not dsn:
+            raise ResourceStoreConfigurationError(
+                f"resource_store.backend=postgres requires the "
+                f"{DATABASE_URL_ENV} environment variable"
+            )
+        return PostgresResourceDefinitionRepository(
+            psycopg_async_connection_factory(dsn)
         )
     return create_config_definition_source(config)
 

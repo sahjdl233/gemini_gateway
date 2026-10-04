@@ -46,6 +46,7 @@ Design baseline: ``docs/DB-RESOURCE-DESIGN-001.md`` §2.3, §4, §6, §8.
 from __future__ import annotations
 
 import json
+import warnings
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, Callable, List, Optional, Protocol
 
@@ -149,6 +150,20 @@ class PostgreSQLResourceRepository(ResourceRepository):
     """
 
     def __init__(self, connection_factory: Callable[[], Any]) -> None:
+        # CONFIG/R-7 Part B: deprecated for NEW read-side use — reads go
+        # through core.repositories.postgres.PostgresResourceDefinition-
+        # Repository (the ResourceDefinitionRepository protocol).  The
+        # class is retained as the bootstrap/ResourceManager WRITE sink
+        # until that migration lands (never deleted outright; existing
+        # tests and migration paths depend on it).
+        warnings.warn(
+            "PostgreSQLResourceRepository is deprecated for new read-side "
+            "use; use core.repositories.postgres."
+            "PostgresResourceDefinitionRepository instead (CONFIG/R-7). "
+            "It remains the bootstrap/ResourceManager write sink for now.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self._connection_factory = connection_factory
 
     # -- connection handling -------------------------------------------------

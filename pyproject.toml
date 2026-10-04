@@ -24,3 +24,9 @@ dev = [
 asyncio_mode = "auto"
 testpaths = ["tests"]
 pythonpath = ["."]
+filterwarnings = [
+  # CONFIG/R-7: the legacy write sink is deprecated; its warning is
+  # contract-verified in tests/app/test_persistence_wiring.py via
+  # pytest.warns (which catches it regardless of this filter).
+  "ignore:PostgreSQLResourceRepository is deprecated:DeprecationWarning",
+]

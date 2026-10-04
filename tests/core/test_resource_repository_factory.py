@@ -119,12 +119,20 @@ def test_definition_source_memory_backend_unchanged():
 
 
 def test_definition_source_postgres_backend_is_durable_adapter(dsn_env):
+    """CONFIG/R-7 cutover: the postgres source of record is the new
+    persistence-layer adapter (ResourceDefinitionRepository protocol),
+    not the deprecated PostgreSQLResourceRepository read adapter."""
+    from core.repositories import ResourceDefinitionRepository
+    from core.repositories.postgres import (
+        PostgresResourceDefinitionRepository,
+    )
+
     repo = create_resource_definition_repository(
         {"resource_store": {"backend": "postgres"}}
     )
-    assert type(repo) is ResourceRepositoryDefinitionSource
-    # The adapter wraps the real PG repository.
-    assert type(repo._repository) is PostgreSQLResourceRepository
+    assert type(repo) is PostgresResourceDefinitionRepository
+    assert isinstance(repo, ResourceDefinitionRepository)
+    assert not isinstance(repo, ResourceRepositoryDefinitionSource)
 
 
 def test_no_postgres_resource_definition_repository_class_exists():
