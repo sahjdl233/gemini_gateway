@@ -5,6 +5,9 @@ Supports:
   - Manual refresh via model_registry.refresh()
   - TTL auto-refresh (configurable refresh_interval, default 300 s)
   - Concurrent refresh collapses into a single active refresh (single-flight)
+  - Explicit invalidation via model_registry.invalidate() — control-plane
+    hook point for definition changes; runtime scheduling state is never
+    a trigger (CONFIG-R-2-B)
 
 Discovery failure semantics (TASK-MODEL-001):
   A provider whose Discovery fails is never allowed to empty itself out of
@@ -158,6 +161,27 @@ class ModelRegistry:
         async with self._lock:
             await self._do_refresh()
         return dict(self._index)
+
+    def invalidate(self) -> None:
+        """Mark the whole index stale: the next query performs Discovery.
+
+        CONFIG-R-2-B contract (docs/CONFIG-R2B-MODEL-REGISTRY-INVALIDATION.md):
+
+        * Lazy — invalidation itself never calls any provider; it only
+          resets the freshness marker, so the next ``_ensure_fresh`` /
+          ``refresh`` rebuilds the index once (single-flight still holds).
+        * State-preserving — per-provider last-known-good Discovery state
+          is untouched; failure tracking and fallback semantics are
+          unaffected.
+        * Legitimate triggers are CONTROL-PLANE definition changes only:
+          provider definitions, resource definitions (including
+          enabled/credential binding changes), credentials or
+          capabilities affecting what discovery can return.
+        * Runtime scheduling state (health, cooldown, retries, in-flight
+          counters) must NEVER trigger invalidation — the scheduler's
+          runtime state is not part of the model index.
+        """
+        self._last_refresh = None
 
     async def _ensure_fresh(self) -> None:
         """Called before every query; triggers refresh only once per TTL."""
