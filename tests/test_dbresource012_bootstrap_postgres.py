@@ -3,7 +3,8 @@
 Freezes the deployment import path (Part A) as executable behaviour:
 
     config.yaml definitions
-        →  bootstrap apply (mode: import | overwrite | check)
+        →  bootstrap apply (mode: import | check; overwrite rejected at
+          startup per CONFIG-001-ADR)
         →  PostgreSQLResourceRepository        (resource_store.backend: postgres)
         →  runtime reconcile
         →  Resource pool / scheduler
@@ -18,8 +19,8 @@ not repository-level units):
 3. existing PG + drifted YAML + import     → conflict reported, DB NOT
                                              overwritten, runtime keeps
                                              the DB value (DB primary);
-4. drifted YAML + overwrite                → DB updated to YAML value,
-                                             runtime reflects it.
+4. drifted YAML + overwrite                → startup rejected, DB
+                                             untouched (CONFIG-003).
 
 Part C (startup order) is exercised implicitly by every scenario:
 ``create_app`` runs  create sink → bootstrap apply → runtime reconcile →
@@ -40,6 +41,7 @@ import os
 import pytest
 
 from app.main import create_app
+from core.resource_bootstrap import ResourceBootstrapError
 from core.resource_definition import (
     AntigravityResourceDefinition,
     GeminiCliResourceDefinition,
@@ -253,10 +255,15 @@ def test_conflict_import_never_overwrites_database(app_env):
     }
 
 
-# -- 4. conflict + overwrite → DB updated ----------------------------------------------
+# -- 4. conflict + overwrite → rejected as a startup mode -------------------------------
 
 
-def test_conflict_overwrite_updates_database_and_runtime(app_env):
+def test_overwrite_startup_mode_rejected_database_untouched(app_env):
+    """CONFIG-003 / CONFIG-001-ADR §2: `mode: overwrite` is no longer a
+    legal persistent startup policy — startup fails closed and the
+    repository is NOT touched.  (The OVERWRITE service capability itself
+    remains, reserved for the explicit one-shot import command; its
+    semantics are covered by tests/core/test_resource_bootstrap.py.)"""
     _clear_table(app_env)
 
     async def _seed():
@@ -270,17 +277,16 @@ def test_conflict_overwrite_updates_database_and_runtime(app_env):
 
     asyncio.run(_seed())
 
-    app = create_app(config=yaml_config("overwrite", project_id="p-yaml"))
-    result = app.state.resource_bootstrap_result
-    assert [c.key for c in result.conflicts] == [("antigravity", "r1")]
+    with pytest.raises(
+        ResourceBootstrapError,
+        match="no longer supported as a startup policy",
+    ):
+        create_app(config=yaml_config("overwrite", project_id="p-yaml"))
 
-    # The operator explicitly accepted YAML over DB.
+    # Fail-closed: the DB row survived untouched.
     stored = _pg_definition(app_env, "antigravity", "r1")
-    assert stored.project_id == "p-yaml"
-    assert stored.enabled is True
-    # Runtime reflects the overwritten store.
-    pool = app.state.scheduler.pools["antigravity"]
-    assert pool.resources[0].project_id == "p-yaml"
+    assert stored.project_id == "p-db"
+    assert stored.enabled is False
 
 
 # -- check mode: plan only, no writes ---------------------------------------------------

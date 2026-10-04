@@ -113,12 +113,28 @@ def test_settings_default_disabled_without_section():
 
 
 def test_settings_parse_enabled_modes():
-    for raw in ("check", "import", "overwrite"):
+    """CONFIG-003: only check/import are legal persistent startup modes."""
+    for raw in ("check", "import"):
         enabled, mode = resource_bootstrap_settings(
             {"resource_bootstrap": {"enabled": True, "mode": raw}}
         )
         assert enabled is True
         assert mode is BootstrapMode(raw)
+
+
+def test_bootstrap_overwrite_mode_rejected():
+    """CONFIG-001-ADR §2/§3: `overwrite` is a mutation operation, not a
+    lifecycle policy — as a persistent startup config it is rejected
+    outright (fail-closed), pointing operators at the explicit one-shot
+    import command.  The service-level OVERWRITE capability itself stays
+    available to that tooling (tests/core/test_resource_bootstrap.py)."""
+    with pytest.raises(ResourceBootstrapError) as exc_info:
+        resource_bootstrap_settings(
+            {"resource_bootstrap": {"enabled": True, "mode": "overwrite"}}
+        )
+    message = str(exc_info.value)
+    assert "no longer supported as a startup policy" in message
+    assert "explicit resource import command" in message
 
 
 def test_settings_reject_invalid_values():
@@ -254,27 +270,43 @@ async def test_startup_import_is_idempotent_across_restarts():
     assert sink.updated == []
 
 
-async def test_startup_overwrite_updates_changed_definitions():
+async def test_startup_overwrite_mode_is_rejected_fail_closed():
+    """CONFIG-003: the startup composition refuses `mode: overwrite`
+    outright — no plan, no sink write — even when the sink already
+    holds conflicting rows.  (Service-level OVERWRITE semantics remain
+    covered in tests/core/test_resource_bootstrap.py, reserved for the
+    one-shot import command.)"""
     sink = SpySink()
-    old_config = {
-        "providers": {"antigravity": {"resources": [
-            {"id": "r1", "project_id": "p-old"},
-        ]}},
-        "resource_bootstrap": {"enabled": True, "mode": "overwrite"},
-    }
-    await run_startup(old_config, sink)
-    new_config = {
-        "providers": {"antigravity": {"resources": [
-            {"id": "r1", "project_id": "p-new", "enabled": False},
-        ]}},
-        "resource_bootstrap": {"enabled": True, "mode": "overwrite"},
-    }
-    result = await run_startup(new_config, sink)
-    assert sink.updated == ["antigravity/r1"]
+    await run_startup(
+        {
+            "providers": {"antigravity": {"resources": [
+                {"id": "r1", "project_id": "p-old"},
+            ]}},
+            "resource_bootstrap": {"enabled": True, "mode": "import"},
+        },
+        sink,
+    )
+    assert sink.added == ["antigravity/r1"]
+
+    with pytest.raises(
+        ResourceBootstrapError,
+        match="no longer supported as a startup policy",
+    ):
+        await run_startup(
+            {
+                "providers": {"antigravity": {"resources": [
+                    {"id": "r1", "project_id": "p-new", "enabled": False},
+                ]}},
+                "resource_bootstrap": {
+                    "enabled": True, "mode": "overwrite"
+                },
+            },
+            sink,
+        )
+    # Fail-closed: the sink holds the original import, nothing updated.
+    assert sink.updated == []
     stored = await sink.get("antigravity", "r1")
-    assert stored.project_id == "p-new"
-    assert stored.enabled is False
-    assert [c.key for c in result.conflicts] == [("antigravity", "r1")]
+    assert stored.project_id == "p-old"
 
 
 async def test_startup_missing_providers_is_a_noop_plan():

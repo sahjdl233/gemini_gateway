@@ -86,10 +86,16 @@ def create_config_definition_source(
     return MemoryResourceDefinitionRepository()
 
 
+#: Startup-legal bootstrap modes (CONFIG-001-ADR §2): ``overwrite`` is
+#: deliberately absent — it is a mutation operation, not a lifecycle
+#: policy, and as a persistent startup config it would re-apply a stale
+#: YAML seed over a newer repository on every unattended restart.
+#: Destructive synchronization belongs to explicit one-shot import
+#: tooling (``resource import-yaml --overwrite``, planned), which keeps
+#: driving the bootstrap service's OVERWRITE capability directly.
 _ALLOWED_MODES = (
     BootstrapMode.CHECK,
     BootstrapMode.IMPORT,
-    BootstrapMode.OVERWRITE,
 )
 
 
@@ -100,11 +106,13 @@ def resource_bootstrap_settings(
 
     Returns ``(enabled, mode)``.  A missing/empty section disables
     bootstrap entirely (preserving pre-006 startup behavior); when
-    enabled, ``mode`` must be one of ``check`` / ``import`` /
-    ``overwrite`` — anything else is a startup-class configuration error
-    (fail-closed, never a silent default).  ``source`` is deliberately
-    not a config key: choosing the definition repository is this
-    factory's job.
+    enabled, ``mode`` must be ``check`` or ``import`` — anything else is
+    a startup-class configuration error (fail-closed, never a silent
+    default).  ``overwrite`` is rejected outright as a startup policy
+    (CONFIG-001-ADR §2/§3): it remains available only to explicit
+    one-shot import tooling driving the service directly.  ``source`` is
+    deliberately not a config key: choosing the definition repository is
+    this factory's job.
     """
     section = config.get("resource_bootstrap")
     if section is None:
@@ -120,6 +128,11 @@ def resource_bootstrap_settings(
             f"resource_bootstrap.enabled must be a boolean, got {enabled!r}"
         )
     raw_mode = section.get("mode", BootstrapMode.CHECK.value)
+    if raw_mode == BootstrapMode.OVERWRITE.value:
+        raise ResourceBootstrapError(
+            "bootstrap mode 'overwrite' is no longer supported as a "
+            "startup policy. Use explicit resource import command instead."
+        )
     try:
         mode = BootstrapMode(raw_mode)
     except ValueError:

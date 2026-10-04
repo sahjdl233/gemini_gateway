@@ -172,7 +172,8 @@ providers:
 #   enabled: true
 #   mode: check        # check = 只生成 plan，不写 sink
 #                      # import = sink 缺失的定义执行插入；冲突只报告不覆盖
-#                      # overwrite = 额外接受 config 覆盖 sink 中不同的定义
+#                      # overwrite 已不再支持作为启动模式（CONFIG-001-ADR）：
+#                      #   破坏性同步请使用一次性 resource import 工具。
 # 注意：启用后 config 中的 resource definitions 会经过严格 DTO 校验
 #（fail-closed）。legacy 凭据字段（refresh_token 等）不是合法的
 # definition 字段——启用 bootstrap 前请先完成 AUTH-010 凭据迁移或改为
