@@ -30,6 +30,9 @@ class _RuntimeState:
     in-flight count is never inherited, and a resource that still has active
     requests can never be reconciled at all (see
     :meth:`InMemoryPool.reconcile_resources`).
+
+    CONTROL-007-DECISION-001: credential rebind is a state-boundary —
+    see :meth:`apply_to`.
     """
 
     health: HealthState
@@ -48,12 +51,31 @@ class _RuntimeState:
             total_failures=resource.total_failures,
         )
 
-    def apply_to(self, resource: Resource) -> None:
+    def apply_to(
+        self, resource: Resource, *, credential_changed: bool = False
+    ) -> None:
+        """Apply captured state to a replacement Resource.
+
+        Observability counters (total_requests / total_failures) always
+        carry over — they describe traffic through the resource id.
+
+        Scheduling state (health, cooldown_until, consecutive_failures)
+        carries over only when the credential identity is unchanged.
+        Rate limits, bans and degraded upstream identity belong to the
+        CREDENTIAL (the upstream account), not the resource id: a rebind
+        must not have the new credential serve the old credential's
+        penalty (docs/CONTROL-007-RUNTIME-STATE-POLICY.md).
+        """
+        resource.total_requests = self.total_requests
+        resource.total_failures = self.total_failures
+        if credential_changed:
+            resource.health = HealthState.HEALTHY
+            resource.cooldown_until = None
+            resource.consecutive_failures = 0
+            return
         resource.health = self.health
         resource.cooldown_until = self.cooldown_until
         resource.consecutive_failures = self.consecutive_failures
-        resource.total_requests = self.total_requests
-        resource.total_failures = self.total_failures
 
 
 class ResourcePool(ABC):
@@ -210,6 +232,14 @@ class InMemoryPool(ResourcePool):
           resource; otherwise the operation fails.
         - The cursor tie-breaker is advanced as little as reasonably possible.
 
+        CONTROL-007-DECISION-001: a credential rebind (old vs new
+        ``credential_id`` on the same key) is a state boundary — the
+        scheduling state (health, cooldown_until, consecutive_failures)
+        resets instead of being preserved, because rate limits and
+        degraded upstream identity belong to the credential; the
+        observability counters still carry over.
+        See ``docs/CONTROL-007-RUNTIME-STATE-POLICY.md``.
+
         The method is atomic: on any validation error the pool state is left
         untouched.
         """
@@ -248,9 +278,18 @@ class InMemoryPool(ResourcePool):
                 # caller's object.
                 nr_copy = nr.model_copy(deep=True)
 
-                # Apply runtime state if it existed
+                # Apply runtime state if it existed.  CONTROL-007-DECISION-001:
+                # a credential rebind resets the scheduling state (health,
+                # cooldown, consecutive failures) — rate limits belong to the
+                # credential identity — while observability counters always
+                # carry over.
                 if key in old_by_key:
-                    old_by_key[key].apply_to(nr_copy)
+                    old_by_key[key].apply_to(
+                        nr_copy,
+                        credential_changed=(
+                            old_res.credential_id != nr.credential_id
+                        ),
+                    )
                 
                 new_list.append(nr_copy)
 

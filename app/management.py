@@ -16,6 +16,7 @@ from typing import Any, Dict, Iterable, Optional
 
 import yaml
 
+from core.health import HealthState
 from core.pool import InMemoryPool
 from core.resource_definition import (
     PROVIDER_DEFINITION_TYPES,
@@ -786,9 +787,15 @@ class ResourceManager:
             # CONTROL-006-FIX-1: a legacy credential rebind happens in
             # place — the provider's per-resource OAuth state must not
             # survive it (same semantics as the repository path).
+            # CONTROL-007-DECISION-001: the same boundary resets the
+            # scheduling state — rate limits belong to the credential —
+            # while the observability counters keep accumulating.
             if "credential_id" in payload and (
                 before.get("credential_id") != payload["credential_id"]
             ):
+                resource.health = HealthState.HEALTHY
+                resource.cooldown_until = None
+                resource.consecutive_failures = 0
                 self._invalidate_provider_adapters(
                     "antigravity", (resource_id,)
                 )

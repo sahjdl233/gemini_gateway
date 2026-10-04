@@ -559,3 +559,53 @@ async def test_delete_first_update_fails_clean(store_env):
     assert await sink.get("antigravity", "r1") is None
     assert [r.id for r in app.state.scheduler.pools["antigravity"].resources
             ] == []
+
+
+# -- CONTROL-007-DECISION-001: credential rebind resets scheduling state ----------
+
+from core.credential import Credential, CredentialType  # noqa: E402
+from core.health import HealthState  # noqa: E402
+
+
+async def test_credential_rebind_resets_scheduling_state_keeps_counters(
+    store_env,
+):
+    """Integration through the manager: PATCH credential_id A→B on the
+    repository path replaces the pool resource via reconcile_resources —
+    the scheduling state (health / cooldown / consecutive failures, which
+    belonged to credential A) resets, the observability counters carry
+    over (docs/CONTROL-007-RUNTIME-STATE-POLICY.md)."""
+    app = await _manager_app(store_env)
+    pool = app.state.scheduler.pools["antigravity"]
+    credential_store = app.state.credential_store
+    credential_store.add(
+        Credential(
+            id="cred-b",
+            type=CredentialType.OAUTH,
+            payload={"refresh_token": "rt", "client_id": "ci", "client_secret": "cs"},
+        )
+    )
+
+    manager = app.state.resource_manager
+    # Simulate a cooled-down, failure-loaded resource under credential A
+    # (credential_id=None here means legacy binding — still an identity
+    # transition when it becomes cred-b).
+    resource = pool.resources[0]
+    resource.health = HealthState.COOLDOWN
+    resource.consecutive_failures = 4
+    resource.total_requests = 17
+    resource.total_failures = 5
+
+    await manager.update_resource(
+        "antigravity", resource.id, {"credential_id": "cred-b"}
+    )
+
+    merged = next(r for r in pool.resources if r.id == resource.id)
+    assert merged.credential_id == "cred-b"
+    # Scheduling state: reset — cred-b does not serve cred(None)-A's penalty.
+    assert merged.health is HealthState.HEALTHY
+    assert merged.cooldown_until is None
+    assert merged.consecutive_failures == 0
+    # Observability counters: preserved.
+    assert merged.total_requests == 17
+    assert merged.total_failures == 5

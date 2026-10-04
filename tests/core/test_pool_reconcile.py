@@ -351,3 +351,113 @@ async def test_reconcile_does_not_share_mutable_provider_fields(fake_clock):
     assert new.labels == ["new-a"]
     new.labels.append("caller-side")
     assert merged.labels == ["new-a", "mutated-after-reconcile"]
+
+
+# -- CONTROL-007-DECISION-001: credential rebind is a state boundary -------------
+
+
+async def test_reconcile_credential_rebind_resets_scheduling_state_keeps_counters(
+    fake_clock,
+):
+    """Rate limits belong to the credential, not the resource id: a rebind
+    A→B resets health / cooldown_until / consecutive_failures, while the
+    observability counters carry over (docs/CONTROL-007-RUNTIME-STATE-POLICY.md)."""
+    pool = make_pool(fake_clock, make_resources([{"id": "r1"}]))
+    old_r1 = pool.resources[0]
+    old_r1.credential_id = "cred-a"
+    deadline = _cooldown_until(fake_clock)
+    old_r1.health = HealthState.COOLDOWN
+    old_r1.cooldown_until = deadline
+    old_r1.consecutive_failures = 4
+    old_r1.total_requests = 17
+    old_r1.total_failures = 5
+
+    new_r1 = _make("r1")
+    new_r1.credential_id = "cred-b"
+    await pool.reconcile_resources([new_r1])
+
+    merged = pool.resources[0]
+    # Scheduling state: reset — the new credential starts clean.
+    assert merged.health is HealthState.HEALTHY
+    assert merged.cooldown_until is None
+    assert merged.consecutive_failures == 0
+    # Observability counters: preserved across the rebind.
+    assert merged.total_requests == 17
+    assert merged.total_failures == 5
+
+
+async def test_reconcile_same_credential_change_keeps_scheduling_state(
+    fake_clock,
+):
+    """The reset trigger is EXACTLY the credential transition: a definition
+    change with an unchanged credential keeps the full TASK-STATE-001
+    semantics (same key → full preservation)."""
+    pool = make_pool(fake_clock, make_resources([{"id": "r1"}]))
+    old_r1 = pool.resources[0]
+    old_r1.credential_id = "cred-a"
+    deadline = _cooldown_until(fake_clock)
+    old_r1.health = HealthState.DEGRADED
+    old_r1.cooldown_until = deadline
+    old_r1.consecutive_failures = 4
+    old_r1.total_requests = 17
+    old_r1.total_failures = 5
+
+    new_r1 = _make("r1", reply_text="edited")
+    new_r1.credential_id = "cred-a"
+    await pool.reconcile_resources([new_r1])
+
+    merged = pool.resources[0]
+    assert merged.reply_text == "edited"
+    assert merged.health is HealthState.DEGRADED
+    assert merged.cooldown_until == deadline
+    assert merged.consecutive_failures == 4
+    assert merged.total_requests == 17
+    assert merged.total_failures == 5
+
+
+async def test_reconcile_unbind_to_legacy_resets_scheduling_state(fake_clock):
+    """A → None is also a credential identity transition (unbind to the
+    legacy compat fields): the scheduling state resets."""
+    pool = make_pool(fake_clock, make_resources([{"id": "r1"}]))
+    old_r1 = pool.resources[0]
+    old_r1.credential_id = "cred-a"
+    old_r1.health = HealthState.COOLDOWN
+    old_r1.cooldown_until = _cooldown_until(fake_clock)
+    old_r1.consecutive_failures = 2
+
+    new_r1 = _make("r1")
+    assert new_r1.credential_id is None
+    await pool.reconcile_resources([new_r1])
+
+    merged = pool.resources[0]
+    assert merged.health is HealthState.HEALTHY
+    assert merged.cooldown_until is None
+    assert merged.consecutive_failures == 0
+
+
+async def test_reconcile_delete_recreate_same_id_gets_fresh_state(fake_clock):
+    """Delete then recreate the same id (two reconciles, as the Admin API
+    does it): the recreated resource inherits NO runtime state — the old
+    object's counters/health die with the removal."""
+    pool = make_pool(fake_clock, make_resources([{"id": "r1"}]))
+    old_r1 = pool.resources[0]
+    old_r1.health = HealthState.DEGRADED
+    old_r1.cooldown_until = _cooldown_until(fake_clock)
+    old_r1.consecutive_failures = 3
+    old_r1.total_requests = 11
+    old_r1.total_failures = 4
+
+    # Delete: the resource (and its state) leaves the pool.
+    await pool.reconcile_resources([])
+
+    # Recreate the same id against a new credential.
+    recreated = _make("r1")
+    recreated.credential_id = "cred-b"
+    await pool.reconcile_resources([recreated])
+
+    merged = pool.resources[0]
+    assert merged.health is HealthState.HEALTHY
+    assert merged.cooldown_until is None
+    assert merged.consecutive_failures == 0
+    assert merged.total_requests == 0
+    assert merged.total_failures == 0
