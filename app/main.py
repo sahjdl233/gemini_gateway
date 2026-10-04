@@ -392,6 +392,7 @@ def create_app(
         config_path,
         repository=resource_sink if bootstrap_enabled else None,
         runtime_builder=registry_runtime_builder(registry),
+        credential_store=credential_store,
     )
 
     @asynccontextmanager

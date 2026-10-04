@@ -370,12 +370,26 @@ async def update_credential_payload(credential_id: str, request: Request):
         raise HTTPException(
             status_code=400, detail="body must contain a 'payload' object"
         )
-    try:
-        credential = _credential_repository(request).update_payload(
-            credential_id, payload
-        )
-    except UnknownCredentialError as exc:
-        raise _credential_http_error(exc) from exc
+    manager = _manager(request)
+    # AUTH-016 B: serialized against resource mutations — a concurrent
+    # resource write must not bind this credential while its payload is
+    # being replaced (or removed).
+    async with manager.mutation_lock():
+        try:
+            credential = _credential_repository(request).update_payload(
+                credential_id, payload
+            )
+        except UnknownCredentialError as exc:
+            raise _credential_http_error(exc) from exc
+        # AUTH-016 A: the per-resource adapters hold OAuth runtime state
+        # (notably the rotated refresh token, which wins over store
+        # material on the next refresh).  An operator's payload
+        # replacement must take effect on the NEXT request, so every
+        # resource bound to this credential gets its adapter dropped;
+        # the fresh adapter re-resolves material from the new payload.
+        # Rotation (AUTH-014) is unaffected: it persists through the
+        # listener inside the refresh flow, never through this route.
+        _invalidate_credential_adapters(request, credential_id)
     return _credential_view(request, credential)
 
 
@@ -394,20 +408,49 @@ def _credential_is_referenced(request: Request, credential_id: str) -> bool:
     return False
 
 
+def _invalidate_credential_adapters(request: Request, credential_id: str) -> int:
+    """Drop the per-resource auth adapter of every resource bound to a
+    credential whose payload was just mutated (AUTH-016 A).
+
+    Uses the same optional ``provider.invalidate_resource`` capability as
+    the resource-mutation path (CONTROL-006-FIX-1).  Returns the number
+    of invalidated adapters."""
+    scheduler = getattr(request.app.state, "scheduler", None)
+    invalidated = 0
+    for provider_id, pool in getattr(scheduler, "pools", {}).items():
+        provider = getattr(scheduler, "providers", {}).get(provider_id)
+        invalidate = getattr(provider, "invalidate_resource", None)
+        if invalidate is None:
+            continue
+        for resource in pool.resources:
+            if resource.credential_id == credential_id:
+                invalidate(resource.id)
+                invalidated += 1
+    return invalidated
+
+
 @router.delete(
     "/credentials/{credential_id}", status_code=status.HTTP_204_NO_CONTENT
 )
 async def delete_credential(credential_id: str, request: Request):
     _require_admin(request)
-    # Delete protection (AUTH-013): a credential still referenced by any
-    # Resource must not be removed (identical for memory and postgres).
-    if _credential_is_referenced(request, credential_id):
-        raise HTTPException(
-            status_code=409,
-            detail="credential is still referenced by one or more resources",
-        )
-    # Idempotent per the repository contract: unknown ids are a no-op.
-    _credential_repository(request).remove(credential_id)
+    manager = _manager(request)
+    # AUTH-016 B: the reference check and the removal happen under the
+    # same lock that serializes resource mutations — a concurrent
+    # resource write can neither bind this credential between check and
+    # remove (binding a deleted credential), nor have its own existence
+    # validation pass against a credential this route is about to
+    # remove.
+    async with manager.mutation_lock():
+        # Delete protection (AUTH-013): a credential still referenced by any
+        # Resource must not be removed (identical for memory and postgres).
+        if _credential_is_referenced(request, credential_id):
+            raise HTTPException(
+                status_code=409,
+                detail="credential is still referenced by one or more resources",
+            )
+        # Idempotent per the repository contract: unknown ids are a no-op.
+        _credential_repository(request).remove(credential_id)
 
 
 @router.post("/credentials/rotate-key")

@@ -19,6 +19,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.main import create_app
+from core.credential import Credential, CredentialType
 from core.credential_encryption import CredentialEncryptor
 from core.credential_postgres import PostgreSQLCredentialRepository
 from tests.core._fake_postgres import FakePostgres
@@ -314,7 +315,17 @@ def test_postgres_resource_mutation_rejects_secrets_and_keeps_yaml_clean(
     tmp_path, monkeypatch
 ):
     path = tmp_path / "config.yaml"
-    client, _ = _durable_client(tmp_path, monkeypatch)
+    client, harness = _durable_client(tmp_path, monkeypatch)
+    # AUTH-016 B: resource writes validate credential existence — the
+    # referenced credential must exist before the resource binds it.
+    client.app.state.credential_store.add(
+        Credential(
+            id="durable-cred",
+            type=CredentialType.OAUTH,
+            payload={"refresh_token": "rt", "client_id": "ci",
+                     "client_secret": "cs"},
+        )
+    )
     with client:
         rejected = client.post(
             "/admin/resources",
@@ -363,7 +374,17 @@ def test_postgres_mode_preserves_legacy_config_fields_but_adds_no_new_ones(
 def test_resource_persistence_round_trip(tmp_path, monkeypatch):
     config = make_config(tmp_path, monkeypatch)
     path = tmp_path / "config.yaml"
-    with TestClient(create_app(config, config_path=path)) as client:
+    app = create_app(config, config_path=path)
+    # AUTH-016 B: the bound credential must exist before the write.
+    app.state.credential_store.add(
+        Credential(
+            id="cred-1",
+            type=CredentialType.OAUTH,
+            payload={"refresh_token": "rt", "client_id": "ci",
+                     "client_secret": "cs"},
+        )
+    )
+    with TestClient(app) as client:
         response = client.post(
             "/admin/resources",
             headers=ADMIN,

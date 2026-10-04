@@ -11,6 +11,7 @@ import copy
 import logging
 import os
 import tempfile
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
 
@@ -104,12 +105,18 @@ class ResourceManager:
         *,
         repository: Any = None,
         runtime_builder: Any = None,
+        credential_store: Any = None,
     ) -> None:
         self.scheduler = scheduler
         self.config = config
         self.config_path = Path(config_path)
         self._repository = repository
         self._runtime_builder = runtime_builder
+        #: AUTH-016: the credential store backs resource-write-time
+        #: credential existence validation (a bound credential_id must
+        #: resolve at mutation time — strict reference integrity carried
+        #: from the request path into the control plane).
+        self._credential_store = credential_store
         #: Latest reconciliation snapshot (updated on every repository
         #: write); consumable by admin/health features without touching
         #: the scheduler.
@@ -415,6 +422,47 @@ class ResourceManager:
     def _repository_backed(self) -> bool:
         return self._repository is not None
 
+    @asynccontextmanager
+    async def mutation_lock(self):
+        """Serialize a control-plane mutation against resource writes.
+
+        AUTH-016 B: credential DELETE/PATCH must not interleave with
+        resource mutations — otherwise a credential could be removed
+        between a resource write's existence check and its store write,
+        or a concurrent bind could resurrect a reference the delete just
+        verified absent.  Both write paths are covered: repository
+        mutations hold ``_repository_lock`` (CONTROL-005-FIX), legacy
+        mutations hold ``_lock``; credential mutations take both, in a
+        fixed order (no cycle → no deadlock).  Exposed for the Admin
+        credential routes.
+        """
+        async with self._repository_lock:
+            async with self._lock:
+                yield
+
+    def _validate_credential_reference(self, payload: Dict[str, Any]) -> None:
+        """AUTH-016 B: a set ``credential_id`` must resolve at write time.
+
+        Carries the request-path strict reference integrity (AUTH-013)
+        into the control plane: an Admin resource mutation may never
+        create the ``enabled=true, credential_id missing`` half-broken
+        state that only surfaces as request-time 401s.  Bootstrap import
+        keeps its documented warn-only semantics (ADR-002 §5) — this is
+        the Admin write boundary, not the import path.
+        """
+        credential_id = payload.get("credential_id")
+        if credential_id is None:
+            return
+        if self._credential_store is None:
+            raise ResourceManagementError(
+                "credential store is unavailable; cannot validate "
+                f"credential_id {credential_id!r}"
+            )
+        if self._credential_store.get(credential_id) is None:
+            raise ResourceManagementError(
+                f"credential {credential_id!r} not found"
+            )
+
     # -- DB-RESOURCE-013 / CONTROL-004-FIX: repository write path --------
 
     def _invalidate_provider_adapters(
@@ -575,6 +623,7 @@ class ResourceManager:
             values = dict(payload)
             values["provider"] = provider_id
             definition = self._parse_definition(values)
+            self._validate_credential_reference(values)
             try:
                 await self._repository.add(definition)
             except DuplicateResourceDefinitionError:
@@ -627,6 +676,7 @@ class ResourceManager:
             base["provider"] = provider_id
             base["id"] = resource_id
             definition = self._parse_definition(base)
+            self._validate_credential_reference(base)
             try:
                 await self._repository.update(definition)
             except UnknownResourceDefinitionError:
@@ -750,6 +800,7 @@ class ResourceManager:
             pool = self._require_pool()
             if any(item.id == resource.id for item in pool.resources):
                 raise ResourceManagementError("resource already exists")
+            self._validate_credential_reference(values)
             try:
                 await pool.add_resource(resource)
             except ValueError as exc:
@@ -775,6 +826,9 @@ class ResourceManager:
         async with self._lock:
             resource = self.get_resource("antigravity", resource_id)
             before = self._resource_values(resource)
+            # AUTH-016 B: the legacy in-place bind validates too —
+            # before any mutation, so a failure leaves no residue.
+            self._validate_credential_reference(payload)
             for field, value in payload.items():
                 setattr(resource, field, value)
             try:
