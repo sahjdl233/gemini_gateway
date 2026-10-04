@@ -52,12 +52,22 @@ def make_app(config_path):
     )
 
 
-def add_credential(store, credential_id, refresh_token="rt-a"):
+def add_credential(
+    store,
+    credential_id,
+    refresh_token="rt-a",
+    client_id="client-id",
+    client_secret="client-secret",
+):
     store.add(
         Credential(
             id=credential_id,
             type=CredentialType.OAUTH,
-            payload={**OAUTH_PAYLOAD, "refresh_token": refresh_token},
+            payload={
+                "refresh_token": refresh_token,
+                "client_id": client_id,
+                "client_secret": client_secret,
+            },
         )
     )
 
@@ -69,7 +79,16 @@ def test_patch_credential_invalidates_bound_adapters(tmp_path, monkeypatch):
     monkeypatch.setenv("ADMIN_TOKEN", "test-token")
     app = make_app(tmp_path / "config.yaml")
     store = app.state.credential_store
-    add_credential(store, "cred-a")
+    # The pre-PATCH credential carries a DISTINCT client identity, so a
+    # mixed-credential refresh (new refresh_token + old client material)
+    # would be detectable.
+    add_credential(
+        store,
+        "cred-a",
+        refresh_token="rt-old",
+        client_id="client-old",
+        client_secret="secret-old",
+    )
 
     client = TestClient(app)
 
@@ -91,7 +110,13 @@ def test_patch_credential_invalidates_bound_adapters(tmp_path, monkeypatch):
 
     response = client.patch(
         "/admin/credentials/cred-a",
-        json={"payload": {**OAUTH_PAYLOAD, "refresh_token": "rt-new"}},
+        json={
+            "payload": {
+                "refresh_token": "rt-new",
+                "client_id": "client-new",
+                "client_secret": "secret-new",
+            }
+        },
         headers=ADMIN,
     )
     assert response.status_code == 200, response.text
@@ -122,6 +147,13 @@ def test_patch_credential_invalidates_bound_adapters(tmp_path, monkeypatch):
         return token
 
     assert asyncio.run(first_refresh()) == "access-token"
+    # The client material comes from the NEW payload as one coherent
+    # identity: no mixing (new refresh_token + old client_secret would
+    # be a mixed credential — more dangerous than a stale token alone).
+    assert captured["material"]["client_id"] == "client-new"
+    assert captured["material"]["client_secret"] == "secret-new"
+    assert captured["material"]["client_id"] != "client-old"
+    assert captured["material"]["client_secret"] != "secret-old"
     assert created.credential_id == "cred-a"
 
 
