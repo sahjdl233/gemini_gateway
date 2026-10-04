@@ -34,6 +34,7 @@ when absent); the operator DSN's database is never written.  Opt-in via
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 
 import pytest
@@ -285,9 +286,10 @@ def test_conflict_overwrite_updates_database_and_runtime(app_env):
 # -- check mode: plan only, no writes ---------------------------------------------------
 
 
-def test_check_mode_writes_nothing(app_env):
+def test_check_mode_writes_nothing(app_env, caplog):
     _clear_table(app_env)
-    app = create_app(config=yaml_config("check"))
+    with caplog.at_level(logging.WARNING):
+        app = create_app(config=yaml_config("check"))
     result = app.state.resource_bootstrap_result
     assert result.mode.value == "check"
     assert [r.key for r in result.added] == [
@@ -297,3 +299,9 @@ def test_check_mode_writes_nothing(app_env):
     assert _pg_definitions(app_env) == []
     # Runtime is still built (empty snapshot → empty pools).
     assert list(app.state.scheduler.pools["antigravity"].resources) == []
+    # TASK-CONFIG-002 Part D: check + empty repository + non-empty seed
+    # is a deployment footgun — the guidance warning must fire.
+    assert any(
+        "check mode did not import resources" in record.getMessage()
+        for record in caplog.records
+    )

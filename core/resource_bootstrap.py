@@ -71,6 +71,7 @@ __all__ = [
     "ResourceBootstrapConflictError",
     "ResourceBootstrapService",
     "canonical_payload",
+    "canonical_diff",
 ]
 
 
@@ -130,6 +131,54 @@ def canonical_payload(definition: ResourceDefinitionBase) -> Dict[str, Any]:
     }
 
 
+#: Field-name markers whose values must never appear in logs or diff
+#: reports (CONFIG-001 P2 / TASK-CONFIG-002 Part B).  Matched as
+#: case-insensitive substrings at any payload depth, so future
+#: secret-shaped fields stay covered by default.  Definitions are not
+#: supposed to carry secrets at all (the strict DTO boundary rejects
+#: them) — this is defence in depth for reporting, not a validation
+#: change.
+_SECRET_FIELD_MARKERS = ("secret", "token", "password", "api_key")
+
+_REDACTED = "<redacted>"
+
+
+def _is_secret_field(key: str) -> bool:
+    lowered = key.lower()
+    return any(marker in lowered for marker in _SECRET_FIELD_MARKERS)
+
+
+def canonical_diff(
+    existing: Dict[str, Any],
+    incoming: Dict[str, Any],
+    *,
+    _prefix: str = "",
+) -> Dict[str, Dict[str, Any]]:
+    """Secret-free per-field diff between two canonical payloads.
+
+    Returns ``{field_path: {"existing": ..., "incoming": ...}}`` for
+    every differing leaf, nested dict bodies flattened to dotted paths
+    (e.g. ``definition.project_id``).  Values under secret-shaped field
+    names are replaced with ``<redacted>`` — the diff is meant for logs
+    and operator reports.  ``credential_id`` is NOT secret (it is the
+    loose reference, not material) and is shown as-is.
+    """
+    diff: Dict[str, Dict[str, Any]] = {}
+    for key in sorted(set(existing) | set(incoming)):
+        path = f"{_prefix}{key}"
+        old = existing.get(key)
+        new = incoming.get(key)
+        if _is_secret_field(key):
+            if old != new:
+                diff[path] = {"existing": _REDACTED, "incoming": _REDACTED}
+            continue
+        if isinstance(old, dict) and isinstance(new, dict):
+            diff.update(canonical_diff(old, new, _prefix=f"{path}."))
+        elif old != new:
+            diff[path] = {"existing": old, "incoming": new}
+    return diff
+
+
 @dataclass(frozen=True)
 class BootstrapRecord:
     """One non-conflicting classification outcome, with its canonical
@@ -156,6 +205,12 @@ class BootstrapConflict:
     @property
     def key(self) -> Tuple[str, str]:
         return (self.provider, self.resource_id)
+
+    def diff(self) -> Dict[str, Dict[str, Any]]:
+        """Secret-free per-field diff (existing vs incoming canonical
+        payloads) — the reportable form of a conflict
+        (docs/CONFIG-001-BOOTSTRAP-SOURCE-OF-TRUTH.md §4)."""
+        return canonical_diff(self.existing, self.incoming)
 
 
 @dataclass

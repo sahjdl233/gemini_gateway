@@ -24,7 +24,7 @@ from app.routes.admin import router as admin_router
 from app.management import ResourceManager
 from config.loader import default_config, load_config
 from core.cooldown import CooldownManager
-from core.resource_bootstrap import ResourceBootstrapService
+from core.resource_bootstrap import BootstrapMode, ResourceBootstrapService
 from core.resource_definition_repository import (
     ResourceRepositoryDefinitionSource,
 )
@@ -280,6 +280,53 @@ def _apply_resource_bootstrap(
     return asyncio.run(_run())
 
 
+def _log_bootstrap_outcome(bootstrap_result: Any, runtime_snapshot: Any) -> None:
+    """Emit the bootstrap outcome at the right severities (CONFIG-001 P2/P4).
+
+    Summary counts stay INFO.  Per-key conflicts and db_only records are
+    WARNING with a secret-free canonical diff — a stale seed facing a
+    newer repository must be impossible to miss, because the drift is the
+    input to every future import decision
+    (docs/CONFIG-001-BOOTSTRAP-SOURCE-OF-TRUTH.md §4).
+    """
+    logger.info(
+        "resource.bootstrap mode=%s added=%d unchanged=%d conflicts=%d "
+        "db_only=%d",
+        bootstrap_result.mode.value,
+        len(bootstrap_result.added),
+        len(bootstrap_result.unchanged),
+        len(bootstrap_result.conflicts),
+        len(bootstrap_result.db_only),
+    )
+    for conflict in bootstrap_result.conflicts:
+        logger.warning(
+            "bootstrap resource conflict: provider=%s resource_id=%s "
+            "existing != incoming, keeping repository value; diff=%s",
+            conflict.provider,
+            conflict.resource_id,
+            conflict.diff(),
+        )
+    for record in bootstrap_result.db_only:
+        logger.warning(
+            "bootstrap db_only resource: provider=%s resource_id=%s "
+            "database contains resources absent from bootstrap seed; "
+            "resources preserved",
+            record.provider,
+            record.resource_id,
+        )
+    if (
+        bootstrap_result.mode is BootstrapMode.CHECK
+        and runtime_snapshot.source_count == 0
+        and bootstrap_result.added
+    ):
+        logger.warning(
+            "bootstrap check mode did not import resources: repository is "
+            "empty and runtime will start without resources (seed offers "
+            "%d). Use import mode for initial deployment.",
+            len(bootstrap_result.added),
+        )
+
+
 def create_app(
     config: Optional[Dict[str, Any]] = None,
     *,
@@ -322,15 +369,7 @@ def create_app(
         bootstrap_result, runtime_snapshot = _apply_resource_bootstrap(
             incoming_source, resource_sink, bootstrap_mode, registry
         )
-        logger.info(
-            "resource.bootstrap mode=%s added=%d unchanged=%d "
-            "conflicts=%d db_only=%d",
-            bootstrap_result.mode.value,
-            len(bootstrap_result.added),
-            len(bootstrap_result.unchanged),
-            len(bootstrap_result.conflicts),
-            len(bootstrap_result.db_only),
-        )
+        _log_bootstrap_outcome(bootstrap_result, runtime_snapshot)
         logger.info(
             "runtime.reconciled source_count=%d resources=%d",
             runtime_snapshot.source_count,
