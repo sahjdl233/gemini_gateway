@@ -223,6 +223,18 @@ class GeminiCliProvider(Provider):
         await self._client_for(resource)
         return self._adapters[resource.id]
 
+    def invalidate_resource(self, resource_id: str) -> None:
+        """Drop the cached client + auth adapter of one resource.
+
+        CONTROL-006-FIX-1: called by the management layer when a resource
+        definition is replaced or removed.  Both caches are keyed by
+        ``resource.id`` and the client binds the adapter's auth, so both
+        must go together — otherwise the popped adapter would stay
+        reachable through the cached client.
+        """
+        self._adapters.pop(resource_id, None)
+        self._clients.pop(resource_id, None)
+
     @staticmethod
     def proxy_config_for(resource: GeminiCliResource) -> Optional[ProxyConfig]:
         """Translate a Resource's proxy string into a ``ProxyConfig``.

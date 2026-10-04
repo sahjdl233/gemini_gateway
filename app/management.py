@@ -416,6 +416,45 @@ class ResourceManager:
 
     # -- DB-RESOURCE-013 / CONTROL-004-FIX: repository write path --------
 
+    def _invalidate_provider_adapters(
+        self, provider_id: str, resource_ids: Iterable[str]
+    ) -> None:
+        """Notify a provider that per-resource auth state must be dropped.
+
+        CONTROL-006-FIX-1: the provider's auth-adapter cache is keyed by
+        ``resource.id`` and survives resource replacement/removal — a
+        re-bound or deleted-and-recreated resource would inherit the old
+        OAuth lifecycle (rotated refresh token included).  The capability
+        is optional: providers without adapter caches simply don't
+        implement it (duck-typed, like ``set_discovery_resource_source``).
+        """
+        provider = getattr(self.scheduler, "providers", {}).get(provider_id)
+        invalidate = getattr(provider, "invalidate_resource", None)
+        if invalidate is None:
+            return
+        for resource_id in resource_ids:
+            invalidate(resource_id)
+
+    def _stale_adapter_ids(
+        self, old_resources: Iterable[Any], new_resources: List[Any]
+    ) -> set:
+        """Resource ids whose definition was replaced or removed.
+
+        A resource qualifies when it disappeared from the new snapshot
+        (delete) or its definition payload changed (credential rebind,
+        disable, any editable field) — i.e. exactly the cases where the
+        old adapter's OAuth lifecycle state must not outlive the
+        definition it was created for.
+        """
+        new_by_id = {resource.id: resource for resource in new_resources}
+        return {
+            old.id
+            for old in old_resources
+            if old.id not in new_by_id
+            or self._definition_payload_from_resource(old)
+            != self._definition_payload_from_resource(new_by_id[old.id])
+        }
+
     async def _reconcile_runtime(self) -> None:
         """Rebuild runtime resources from the repository and apply them
         to every pool.  Runtime state is preserved per ResourceKey by
@@ -432,6 +471,17 @@ class ResourceManager:
         )
         snapshot = await service.reconcile()
         self.last_snapshot = snapshot
+        # CONTROL-006-FIX-1: capture which resource definitions were
+        # replaced or removed BEFORE the pools are applied (reconcile
+        # mutates them) — their provider auth-adapter OAuth state must
+        # not outlive the definition it was created for.
+        stale_by_provider = {
+            provider_id: self._stale_adapter_ids(
+                pool.resources,
+                snapshot.resources_by_provider.get(provider_id, []),
+            )
+            for provider_id, pool in self.scheduler.pools.items()
+        }
         try:
             for provider_id, pool in self.scheduler.pools.items():
                 await pool.reconcile_resources(
@@ -439,6 +489,12 @@ class ResourceManager:
                 )
         except RuntimeError as exc:
             raise ResourceManagementError(str(exc)) from exc
+        # The pool application succeeded, so the replacement/removal is
+        # committed — only now drop the adapters (a failed reconcile is
+        # rolled back and must leave the providers untouched).
+        for provider_id, stale in stale_by_provider.items():
+            if stale:
+                self._invalidate_provider_adapters(provider_id, stale)
 
     @staticmethod
     def _handle_compensation_failure(
@@ -727,6 +783,15 @@ class ResourceManager:
                     setattr(resource, field, value)
                 raise
             self._original_values[resource.id] = self._resource_values(resource)
+            # CONTROL-006-FIX-1: a legacy credential rebind happens in
+            # place — the provider's per-resource OAuth state must not
+            # survive it (same semantics as the repository path).
+            if "credential_id" in payload and (
+                before.get("credential_id") != payload["credential_id"]
+            ):
+                self._invalidate_provider_adapters(
+                    "antigravity", (resource_id,)
+                )
             return resource
 
     async def _legacy_delete(self, resource_id: str) -> None:
@@ -749,6 +814,9 @@ class ResourceManager:
                 if original is not None:
                     self._original_values[resource.id] = original
                 raise
+            # CONTROL-006-FIX-1: the resource is gone — its provider
+            # auth-adapter OAuth state must not survive a same-id recreate.
+            self._invalidate_provider_adapters("antigravity", (resource_id,))
 
     def _persist(self) -> None:
         """Persist live resources without expanding environment markers."""

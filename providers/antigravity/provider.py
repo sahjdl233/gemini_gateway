@@ -179,6 +179,26 @@ class AntigravityProvider(Provider):
     async def _update_cached_resource(self, resource: AntigravityResource) -> None:
         self._last_resource = resource
 
+    def invalidate_resource(self, resource_id: str) -> None:
+        """Drop the auth adapter (OAuth lifecycle state) of one resource.
+
+        CONTROL-006-FIX-1: called by the management layer when a resource
+        definition is replaced (credential rebind, disable, any definition
+        change) or removed.  The adapter cache is keyed by ``resource.id``,
+        so without this a re-bound or deleted-and-recreated resource would
+        inherit the previous OAuth state — notably the rotated refresh
+        token, which would then win over the new credential's material.
+
+        Safe with respect to rotation (AUTH-014): a rotated refresh token
+        is durably persisted through the rotation listener before it
+        becomes runtime state, so dropping the adapter never loses valid
+        refresh material — the next request rebuilds the adapter and
+        resolves material afresh from the current definition.
+        """
+        self._adapters.pop(resource_id, None)
+        if self._last_resource is not None and self._last_resource.id == resource_id:
+            self._last_resource = None
+
     async def close(self) -> None:
         await self.backend.close()
 
