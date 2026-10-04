@@ -116,6 +116,15 @@ class ResourceManager:
         pools = getattr(scheduler, "pools", {})
         self.pool: InMemoryPool | None = pools.get("antigravity")
         self._lock = asyncio.Lock()
+        #: CONTROL-005-FIX: serializes the full repository mutation
+        #: lifecycle (read current → repository write → reconcile →
+        #: rollback/compensation → return).  The legacy ``_lock`` above
+        #: only guards the YAML/Pool-first path; repository writes have
+        #: their own lock so the two write paths never interact.  A
+        #: single-process asyncio lock: multi-worker / multi-instance
+        #: deployments remain a future concern (distributed lock or
+        #: version CAS), deliberately out of scope here.
+        self._repository_lock = asyncio.Lock()
         self._source_config = self._read_source()
         self._original_values: Dict[str, Dict[str, Any]] = {
             resource.id: self._resource_values(resource)
@@ -502,91 +511,114 @@ class ResourceManager:
     async def _repository_create(
         self, payload: Dict[str, Any], provider_id: str
     ) -> Any:
-        values = dict(payload)
-        values["provider"] = provider_id
-        definition = self._parse_definition(values)
-        try:
-            await self._repository.add(definition)
-        except DuplicateResourceDefinitionError:
-            raise ResourceManagementError("resource already exists") from None
-        try:
-            await self._reconcile_runtime()
-        except BaseException as reconcile_exc:
-            # Compensate: the store write is rolled back so the store and
-            # the runtime stay consistent with each other.  A failing
-            # compensation never masks the original reconcile error —
-            # it is logged and chained as __cause__ (CONTROL-004-FIX 3).
+        # CONTROL-005-FIX: the lock spans the whole mutation lifecycle —
+        # validation, store write, reconcile and compensation — so a
+        # concurrent write can never interleave between them.
+        async with self._repository_lock:
+            values = dict(payload)
+            values["provider"] = provider_id
+            definition = self._parse_definition(values)
             try:
-                await self._repository.delete(
-                    definition.provider, definition.id
-                )
-            except Exception as rollback_exc:
-                self._handle_compensation_failure(reconcile_exc, rollback_exc)
-            raise
-        return self.get_resource(provider_id, definition.id)
-
-    async def _repository_update(
-        self, provider_id: str, resource_id: str, payload: Dict[str, Any]
-    ) -> Any:
-        current = await self._repository.get(provider_id, resource_id)
-        if current is None:
-            # Defensive: runtime resource exists but no stored definition
-            # (should not happen on the repository path) — derive one
-            # from the live resource so the write is still full-replacement.
-            resource = self.get_resource(provider_id, resource_id)
-            base = self._definition_payload_from_resource(resource)
-        else:
-            base = current.to_runtime_definition()
-        payload_resource_id = payload.get("id")
-        if payload_resource_id is not None and payload_resource_id != resource_id:
-            raise ResourceManagementError("resource id cannot be changed")
-        base.update(payload)
-        base["provider"] = provider_id
-        base["id"] = resource_id
-        definition = self._parse_definition(base)
-        try:
-            await self._repository.update(definition)
-        except UnknownResourceDefinitionError:
-            raise ResourceManagementError("resource not found") from None
-        try:
-            await self._reconcile_runtime()
-        except BaseException as reconcile_exc:
-            # CONTROL-004-FIX 1: restore the pre-update store state so DB
-            # and runtime stay consistent; the original reconcile error
-            # keeps its semantics and propagates.
+                await self._repository.add(definition)
+            except DuplicateResourceDefinitionError:
+                raise ResourceManagementError(
+                    "resource already exists"
+                ) from None
             try:
-                await self._rollback_update(
-                    provider_id, resource_id, current, reconcile_exc
-                )
-            except Exception as rollback_exc:
-                self._handle_compensation_failure(
-                    reconcile_exc, rollback_exc
-                )
-            raise
-        return self.get_resource(provider_id, resource_id)
-
-    async def _repository_delete(
-        self, provider_id: str, resource_id: str
-    ) -> None:
-        # Existence check against the live pool for the friendly 404; the
-        # repository delete itself is idempotent.
-        self.get_resource(provider_id, resource_id)
-        previous = await self._repository.get(provider_id, resource_id)
-        await self._repository.delete(provider_id, resource_id)
-        try:
-            await self._reconcile_runtime()
-        except BaseException as reconcile_exc:
-            # CONTROL-004-FIX 2: restore the deleted definition (all
-            # fields) so the runtime does not become a ghost; the
-            # original reconcile error keeps its semantics.
-            if previous is not None:
+                await self._reconcile_runtime()
+            except BaseException as reconcile_exc:
+                # Compensate: the store write is rolled back so the store and
+                # the runtime stay consistent with each other.  A failing
+                # compensation never masks the original reconcile error —
+                # it is logged and chained as __cause__ (CONTROL-004-FIX 3).
                 try:
-                    await self._repository.add(previous)
+                    await self._repository.delete(
+                        definition.provider, definition.id
+                    )
                 except Exception as rollback_exc:
                     self._handle_compensation_failure(
                         reconcile_exc, rollback_exc
                     )
-            raise
+                raise
+            return self.get_resource(provider_id, definition.id)
+
+    async def _repository_update(
+        self, provider_id: str, resource_id: str, payload: Dict[str, Any]
+    ) -> Any:
+        # CONTROL-005-FIX: full lifecycle under the lock — without it a
+        # concurrent writer could commit between this request's store
+        # write and its reconcile (runtime stale), or its failure
+        # rollback could replace a newer committed definition with the
+        # stale one captured below (rollback clobber).
+        async with self._repository_lock:
+            current = await self._repository.get(provider_id, resource_id)
+            if current is None:
+                # Defensive: runtime resource exists but no stored definition
+                # (should not happen on the repository path) — derive one
+                # from the live resource so the write is still full-replacement.
+                resource = self.get_resource(provider_id, resource_id)
+                base = self._definition_payload_from_resource(resource)
+            else:
+                base = current.to_runtime_definition()
+            payload_resource_id = payload.get("id")
+            if (
+                payload_resource_id is not None
+                and payload_resource_id != resource_id
+            ):
+                raise ResourceManagementError("resource id cannot be changed")
+            base.update(payload)
+            base["provider"] = provider_id
+            base["id"] = resource_id
+            definition = self._parse_definition(base)
+            try:
+                await self._repository.update(definition)
+            except UnknownResourceDefinitionError:
+                raise ResourceManagementError(
+                    "resource not found"
+                ) from None
+            try:
+                await self._reconcile_runtime()
+            except BaseException as reconcile_exc:
+                # CONTROL-004-FIX 1: restore the pre-update store state so DB
+                # and runtime stay consistent; the original reconcile error
+                # keeps its semantics and propagates.
+                try:
+                    await self._rollback_update(
+                        provider_id, resource_id, current, reconcile_exc
+                    )
+                except Exception as rollback_exc:
+                    self._handle_compensation_failure(
+                        reconcile_exc, rollback_exc
+                    )
+                raise
+            return self.get_resource(provider_id, resource_id)
+
+    async def _repository_delete(
+        self, provider_id: str, resource_id: str
+    ) -> None:
+        # CONTROL-005-FIX: full lifecycle under the lock — otherwise a
+        # concurrent update committing between the existence checks and
+        # the delete would be silently destroyed by this delete.
+        async with self._repository_lock:
+            # Existence check against the live pool for the friendly 404; the
+            # repository delete itself is idempotent.
+            self.get_resource(provider_id, resource_id)
+            previous = await self._repository.get(provider_id, resource_id)
+            await self._repository.delete(provider_id, resource_id)
+            try:
+                await self._reconcile_runtime()
+            except BaseException as reconcile_exc:
+                # CONTROL-004-FIX 2: restore the deleted definition (all
+                # fields) so the runtime does not become a ghost; the
+                # original reconcile error keeps its semantics.
+                if previous is not None:
+                    try:
+                        await self._repository.add(previous)
+                    except Exception as rollback_exc:
+                        self._handle_compensation_failure(
+                            reconcile_exc, rollback_exc
+                        )
+                raise
 
     async def create_resource(
         self, payload: Dict[str, Any], *, provider_id: str

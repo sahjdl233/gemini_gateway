@@ -14,6 +14,8 @@ the PostgreSQL variant lives in
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -337,3 +339,162 @@ def test_update_rollback_restores_even_from_derived_definition(
     assert _sink_get(app, "antigravity", "r2") is None
     assert [r.id for r in app.state.scheduler.pools["antigravity"].resources
             ] == ["r1"]
+
+
+# -- CONTROL-005-FIX: repository mutation serialization ----------------------------
+
+from app.management import ResourceManagementError  # noqa: E402
+
+
+async def _manager_app(store_env):
+    """Bootstrapped app whose manager can be driven directly inside the
+    test's event loop (create_app bridges its own bootstrap via
+    asyncio.run, so the app object is built in a worker thread)."""
+    return await asyncio.to_thread(make_app, store_env)
+
+
+def _first_call_fails(pool, message="reconcile boom"):
+    """Fail the FIRST reconcile call only — later calls delegate to the
+    real reconcile.  Under the mutation lock the calls are serialized, so
+    call order == request order."""
+    real = pool.reconcile_resources
+    calls = {"n": 0}
+
+    async def stub(new_resources):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError(message)
+        return await real(new_resources)
+
+    pool.reconcile_resources = stub
+    return calls
+
+
+async def test_concurrent_update_rollback_does_not_clobber_newer_write(
+    store_env, monkeypatch
+):
+    """CONTROL-005-FIX Test 1.
+
+    Request A: update succeeds on the store, reconcile fails, rollback
+    runs.  Request B: update the SAME resource concurrently.
+
+    Serialized by the mutation lock, whichever request runs first
+    completes its ENTIRE lifecycle (including A's rollback) before the
+    other starts — so the stale pre-A value can never land on top of B's
+    committed write.  Final state: DB and pool agree on B's value."""
+    app = await _manager_app(store_env)
+    pool = app.state.scheduler.pools["antigravity"]
+    _first_call_fails(pool)
+    sink = app.state.resource_sink
+    manager = app.state.resource_manager
+
+    async def request_a():
+        return await manager.update_resource(
+            "antigravity", "r1", {"project_id": "p-A"}
+        )
+
+    async def request_b():
+        return await manager.update_resource(
+            "antigravity", "r1", {"project_id": "p-B"}
+        )
+
+    # A is scheduled first, so the FIFO asyncio.Lock hands it the
+    # mutation lock first: A fails and rolls back, then B commits.
+    results = await asyncio.gather(
+        request_a(), request_b(), return_exceptions=True
+    )
+    error_a, ok_b = results
+    assert isinstance(error_a, ResourceManagementError)
+    assert "reconcile boom" in str(error_a)
+    assert not isinstance(ok_b, BaseException), ok_b
+
+    # No stale overwrite: the store holds B's value — not the pre-update
+    # "p-seed" A's rollback captured, and not A's "p-A".
+    stored = await sink.get("antigravity", "r1")
+    assert stored.project_id == "p-B"
+    # DB and pool are consistent with each other.
+    resource = next(r for r in pool.resources if r.id == "r1")
+    assert resource.project_id == "p-B"
+
+
+async def test_concurrent_delete_update_serialize_without_silent_loss(
+    store_env, monkeypatch
+):
+    """CONTROL-005-FIX Test 2.
+
+    DELETE and PATCH run concurrently on the same resource.  Allowed:
+    either one wins and the other sees a clean success-or-error.  Not
+    allowed: a mutation whose request returned success being silently
+    destroyed by the other's mid-flight interleaving.
+
+    The sink operation log proves the two lifecycles never interleave:
+    each request's read/write/reconcile block completes before the other
+    starts."""
+    app = await _manager_app(store_env)
+    pool = app.state.scheduler.pools["antigravity"]
+    sink = app.state.resource_sink
+    manager = app.state.resource_manager
+
+    op_log: list[str] = []
+    for op in ("get", "update", "delete", "add", "list"):
+        real = getattr(sink, op)
+
+        def wrap(real=real, op=op):
+            async def traced(*args, **kwargs):
+                op_log.append(op)
+                return await real(*args, **kwargs)
+
+            return traced
+
+        monkeypatch.setattr(sink, op, wrap())
+
+    async def patch_request():
+        return await manager.update_resource(
+            "antigravity", "r1", {"project_id": "p-patched"}
+        )
+
+    async def delete_request():
+        return await manager.delete_resource("antigravity", "r1")
+
+    # PATCH is scheduled first: it completes its whole lifecycle, then
+    # DELETE removes the resource — the classic sequential outcome.
+    patch_result, _ = await asyncio.gather(
+        patch_request(), delete_request(), return_exceptions=True
+    )
+    assert not isinstance(patch_result, BaseException), patch_result
+
+    # The PATCH was NOT silently destroyed mid-flight: its lifecycle
+    # (get → update → reconcile's list) fully precedes DELETE's
+    # (get → delete → reconcile's list).
+    assert op_log[:3] == ["get", "update", "list"]
+    assert op_log[3:6] == ["get", "delete", "list"]
+    # Final state is the sequential result: deleted everywhere.
+    assert await sink.get("antigravity", "r1") is None
+    assert [r.id for r in pool.resources] == []
+
+
+async def test_delete_first_update_fails_clean(store_env):
+    """Companion ordering: when DELETE runs first, the concurrent PATCH
+    fails with a clean not-found — it never resurrects the deleted row
+    and never reports success against a gone resource."""
+    app = await _manager_app(store_env)
+    sink = app.state.resource_sink
+    manager = app.state.resource_manager
+
+    async def delete_request():
+        return await manager.delete_resource("antigravity", "r1")
+
+    async def patch_request():
+        return await manager.update_resource(
+            "antigravity", "r1", {"project_id": "p-late"}
+        )
+
+    _, patch_error = await asyncio.gather(
+        delete_request(), patch_request(), return_exceptions=True
+    )
+    assert isinstance(patch_error, ResourceManagementError)
+    assert "not found" in str(patch_error)
+    # The deleted resource stays deleted in store and pool.
+    assert await sink.get("antigravity", "r1") is None
+    assert [r.id for r in app.state.scheduler.pools["antigravity"].resources
+            ] == []
