@@ -485,3 +485,50 @@ def test_factory_parses_node_pool_config():
 # 12. streaming regression is covered by tests/providers/test_anonymous_vertex.py
 #     (all ANON-002 streaming tests run against the node-aware provider).
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# ANON-004-FIX-01: NodeLease.release is idempotent
+# ---------------------------------------------------------------------------
+async def test_double_release_is_idempotent():
+    node = _node("only")
+    pool = _pool(node)
+    lease = await pool.acquire()
+    assert node.current_in_flight == 1
+    await lease.release()
+    assert node.current_in_flight == 0
+    await lease.release()  # second release: no-op
+    assert node.current_in_flight == 0
+    await pool.release(lease)  # even a third path through pool.release
+    assert node.current_in_flight == 0
+    assert lease.released is True
+
+
+async def test_release_via_cm_and_finally_overlap_counts_once():
+    """A lease released both inside an ``async with`` body (as a finally
+    would do) and again by the CM exit must decrement exactly once."""
+    node = _node("only")
+    pool = _pool(node)
+    lease = await pool.acquire()
+    async with lease:
+        assert node.current_in_flight == 1
+        await lease.release()  # e.g. provider's finally runs first
+        assert node.current_in_flight == 0
+    assert node.current_in_flight == 0  # CM exit is a no-op now
+
+    # the node is fully available again
+    lease2 = await pool.acquire()
+    assert lease2 is not None
+    await lease2.release()
+    assert node.current_in_flight == 0
+
+
+async def test_concurrent_double_release_counts_once():
+    """Two racing release() calls decrement in_flight exactly once."""
+    import asyncio as _asyncio
+
+    node = _node("only")
+    pool = _pool(node)
+    lease = await pool.acquire()
+    await _asyncio.gather(lease.release(), lease.release())
+    assert node.current_in_flight == 0

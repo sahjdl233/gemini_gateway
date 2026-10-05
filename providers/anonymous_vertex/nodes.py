@@ -392,10 +392,18 @@ class AnonymousVertexNodePool:
             return NodeLease(self, node)
 
     async def release(self, lease: NodeLease) -> None:
+        """Release a lease exactly once (idempotent).
+
+        The ``released`` flag is checked and flipped under the pool lock,
+        so a double release — explicit + async-context-manager exit, or a
+        race between two callers — decrements ``in_flight`` only once.
+        """
         async with self._lock:
+            if lease.released:
+                return
+            lease.released = True
             node = lease._node
             node.current_in_flight = max(0, node.current_in_flight - 1)
-            lease.released = True
 
     # -- outcome recording --
 
