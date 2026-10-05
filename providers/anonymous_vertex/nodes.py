@@ -38,12 +38,22 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
 from providers.anonymous_vertex.client import AnonymousVertexClient
+from providers.anonymous_vertex.node_definitions import (
+    NodeDefinition,
+    NodeRuntimeState,
+)
 from providers.anonymous_vertex.transport import HttpxTransport
 
 
 @dataclass
 class NodeSpec:
-    """Static configuration of one execution node."""
+    """Compatibility / construction DTO for one execution node.
+
+    ``NodeSpec`` is how the factory and tests hand static configuration to
+    an ExecutionNode; it is NOT runtime state (no counters live here) and
+    NOT the persistable boundary object — that is
+    :class:`providers.anonymous_vertex.node_definitions.NodeDefinition`.
+    """
 
     node_id: str
     proxy: Dict[str, Any] = field(default_factory=dict)
@@ -156,6 +166,9 @@ class ExecutionNode:
         self._injected_http: Any = None
         self._http: Any = None
         self._client: Optional[AnonymousVertexClient] = None
+        # Persistable identity (ANON-006), present when the node was built
+        # from a NodeDefinition; runtime code never mutates it.
+        self.definition: Optional["NodeDefinition"] = None
 
     # -- transport lifecycle (per node; never shared) --
 
@@ -213,6 +226,45 @@ class ExecutionNode:
                     pass
 
     # -- state helpers --
+
+    # -- definition / runtime-state boundary (ANON-006) --
+
+    @classmethod
+    def from_definition(
+        cls,
+        definition: "NodeDefinition",
+        *,
+        api_key: str = "",
+        client_factory: Optional[Callable[[], Any]] = None,
+        runtime_state: Optional["NodeRuntimeState"] = None,
+    ) -> "ExecutionNode":
+        """Build a node from a persistable NodeDefinition.
+
+        ``runtime_state`` is an explicit inheritance decision by the
+        caller: pass one to carry counters over (e.g. an in-process
+        reload), omit it for a fresh node.  The definition itself is kept
+        by reference and is frozen — runtime mutations never touch it.
+        """
+        spec = NodeSpec(
+            node_id=definition.node_id,
+            proxy=dict(definition.proxy),
+            weight=definition.weight,
+            max_concurrency=definition.max_concurrency,
+            enabled=definition.enabled,
+        )
+        node = cls(spec, api_key=api_key, client_factory=client_factory)
+        node.definition = definition
+        if runtime_state is not None:
+            runtime_state.apply_to(node)
+        return node
+
+    def capture_runtime_state(self) -> "NodeRuntimeState":
+        """Snapshot this node's discardable runtime state."""
+        return NodeRuntimeState.capture(self)
+
+    def restore_runtime_state(self, state: "NodeRuntimeState") -> None:
+        """Apply a runtime-state snapshot (caller decides inheritance)."""
+        state.apply_to(self)
 
     def in_cooldown(self, now: float) -> bool:
         return now < self.cooldown_until
