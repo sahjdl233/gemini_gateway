@@ -780,3 +780,95 @@ async def test_provider_request_waits_for_node_capacity():
     assert _FRAME1_TEXT in result_b.text
     assert node.current_in_flight == 0
     assert node.total_requests == 2
+
+
+# ---------------------------------------------------------------------------
+# ANON-005-FIX-01: enable/disable wakes capacity waiters
+# ---------------------------------------------------------------------------
+async def test_enable_wakes_waiter_and_node_is_acquired():
+    """1: a disabled node becomes schedulable mid-wait; the waiter is
+    woken by set_node_enabled and acquires the enabled node."""
+    a = _node("a", enabled=False)
+    b = _node("b", max_concurrency=1)
+    pool = _pool(a, b)
+    held_b = await pool.acquire()  # -> b (a is disabled)
+    assert held_b.node_id == "b"
+
+    waiter = asyncio.create_task(pool.acquire(wait_for_capacity=True))
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert not waiter.done(), "only b exists and is full: waiter must wait"
+
+    await pool.set_node_enabled("a", True)  # eligibility change -> notify
+    lease = await asyncio.wait_for(waiter, timeout=1.0)
+    assert lease.node_id == "a"  # woken and re-checked eligibility
+    await lease.release()
+    await held_b.release()
+
+
+async def test_disable_wakes_waiter_and_reselects():
+    """2: A enabled+full, B enabled+full, waiter waiting.  Disabling A and
+    releasing A must NOT hand A to the waiter — it re-evaluates the full
+    candidate set and only acquires B after B is released."""
+    a = _node("a", max_concurrency=1)
+    b = _node("b", max_concurrency=1)
+    pool = _pool(a, b)
+    held_a = await pool.acquire()  # -> a
+    held_b = await pool.acquire()  # -> b
+
+    waiter = asyncio.create_task(pool.acquire(wait_for_capacity=True))
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert not waiter.done()
+
+    await pool.set_node_enabled("a", False)  # wake: candidates changed
+    await held_a.release()                   # wake: capacity on a freed
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert not waiter.done(), "disabled a must not be acquired even idle"
+
+    await held_b.release()  # only now is a healthy candidate free
+    lease = await asyncio.wait_for(waiter, timeout=1.0)
+    assert lease.node_id == "b"
+    assert a.current_in_flight == 0  # released but stayed disabled
+
+
+async def test_enable_disable_concurrent_with_cancellation_is_safe():
+    """3: set_node_enabled racing a waiter cancellation must not deadlock
+    or corrupt the pool; later acquires keep working."""
+    a = _node("a", enabled=False)
+    b = _node("b", max_concurrency=1)
+    pool = _pool(a, b)
+    held = await pool.acquire()  # -> b
+
+    waiter = asyncio.create_task(pool.acquire(wait_for_capacity=True))
+    await asyncio.sleep(0)
+    assert not waiter.done()
+
+    results = await asyncio.gather(
+        pool.set_node_enabled("a", True),
+        pool.set_node_enabled("a", False),
+        pool.set_node_enabled("a", True),
+        _cancel_later(waiter),
+        return_exceptions=True,
+    )
+    assert not any(isinstance(r, RuntimeError) for r in results), results
+
+    # pool lock released cleanly: capacity still occupied until we release
+    await held.release()
+    assert b.current_in_flight == 0
+    lease = await asyncio.wait_for(
+        pool.acquire(wait_for_capacity=True), timeout=1.0
+    )
+    assert lease is not None
+    await lease.release()
+
+
+async def _cancel_later(task, delay: float = 0.01):
+    await asyncio.sleep(delay)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        return "cancelled"
+    return "not-cancelled"

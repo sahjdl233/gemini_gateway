@@ -339,8 +339,16 @@ class AnonymousVertexNodePool:
     def snapshot(self) -> List[Dict[str, Any]]:
         return [n.snapshot() for n in self._nodes]
 
-    def set_node_enabled(self, node_id: str, enabled: bool) -> None:
-        self.node(node_id).enabled = enabled
+    async def set_node_enabled(self, node_id: str, enabled: bool) -> None:
+        """Enable/disable a node under the pool lock (ANON-005-FIX-01).
+
+        Enable/disable changes scheduler-visible eligibility, so it shares
+        the pool lock with acquire/release and wakes capacity waiters via
+        ``notify_all()`` — no lost notifications from concurrent
+        modifications, and waiters re-check the full candidate set."""
+        async with self._lock:
+            self.node(node_id).enabled = enabled
+            self._notify_state_change()
 
     # -- acquire / release --
 
