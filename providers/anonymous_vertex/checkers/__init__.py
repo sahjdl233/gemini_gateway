@@ -7,6 +7,9 @@ token (``timeout`` / ``network_error`` / ``http_status_500`` / ...) for the
 ANON-008-C FailureClassifier — checkers never decide quarantine themselves.
 """
 
+from providers.anonymous_vertex.checkers.auth import (
+    AnonymousVertexAuthChecker,
+)
 from providers.anonymous_vertex.checkers.capability import (
     AnonymousVertexCapabilityChecker,
 )
@@ -17,4 +20,5 @@ from providers.anonymous_vertex.checkers.connectivity import (
 __all__ = [
     "AnonymousVertexConnectivityChecker",
     "AnonymousVertexCapabilityChecker",
+    "AnonymousVertexAuthChecker",
 ]
