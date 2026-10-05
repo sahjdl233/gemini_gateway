@@ -119,3 +119,39 @@ def build_xhr_headers(
         headers["content-type"] = content_type
     return headers
 
+
+def build_anchor_headers() -> Dict[str, str]:
+    """Navigation (iframe) headers for the recaptcha anchor GET.
+
+    Mirrors the reference AnchorHeaders(): the anchor is requested as a
+    cross-site iframe navigation by the console page, NOT as an XHR —
+    sec-fetch-mode: navigate, sec-fetch-dest: iframe, an HTML accept list
+    and no origin/referer.  Bare/missing fingerprint headers here produce
+    tokens whose upstream assessment fails ("Failed to verify action").
+    """
+    return {
+        "sec-ch-ua": CH_UA,
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"Windows"',
+        "sec-ch-ua-arch": '"x86"',
+        "sec-ch-ua-bitness": '"64"',
+        "sec-ch-ua-full-version": '"150.0.7871.13"',
+        "sec-ch-ua-full-version-list": CH_UA_FULL_VERSION_LIST,
+        "sec-ch-ua-platform-version": '"19.0.0"',
+        "sec-ch-ua-model": '""',
+        "sec-ch-ua-wow64": "?0",
+        "sec-ch-ua-form-factors": '"Desktop"',
+        "upgrade-insecure-requests": "1",
+        "user-agent": USER_AGENT,
+        "accept": (
+            "text/html,application/xhtml+xml,application/xml;q=0.9,"
+            "image/avif,image/webp,image/apng,*/*;q=0.8,"
+            "application/signed-exchange;v=b3;q=0.7"
+        ),
+        "sec-fetch-site": "cross-site",
+        "sec-fetch-mode": "navigate",
+        "sec-fetch-dest": "iframe",
+        "accept-encoding": "gzip, deflate, br",
+        "accept-language": "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6",
+    }
+
