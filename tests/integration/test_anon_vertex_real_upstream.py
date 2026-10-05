@@ -66,7 +66,7 @@ def _safe_headers(headers) -> dict:
     return out
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture()
 def real_app():
     from app.main import create_app
 

@@ -1,9 +1,15 @@
-"""AnonymousVertexProvider — the first real Google upstream adapter.
+"""AnonymousVertexProvider — node-aware Google upstream adapter (ANON-004).
 
 Implements the Anonymous Vertex / Agent Platform batchGraphql protocol
 through a layered protocol stack:
 
     AnonymousVertexProvider
+            |
+            v
+    AnonymousVertexNodePool      (nodes.py: acquire / lease / record_*)
+            |
+            v
+    ExecutionNode (per node: own transport + recaptcha + client)
             |
             v
     AnonymousVertexClient   (client.py)
@@ -14,37 +20,62 @@ through a layered protocol stack:
             v
     HTTP Transport          (transport.py)
 
-The Provider ONLY orchestrates: it converts the Gateway ChatRequest into
-the internal AnonymousVertexRequest (request.py), asks the AnonymousVertexClient
-to talk to upstream, and converts the returned Gemini frames into Gateway
-chunks (response.py).  It never builds GraphQL payloads or Google headers
-itself (TASK-002-A section 18).
+Attempt model (one request = one attempt = ONE node):
+
+    chat request
+      -> NodePool.acquire()          (lease)
+      -> reCAPTCHA token via THE SAME node
+      -> batchGraphql via THE SAME node
+      -> record success / 429 / transport failure (node-level)
+      -> lease release (finally; also on cancellation / mid-stream death)
+
+A failing attempt never switches node mid-flight: the node is recorded and
+released, and the next attempt re-acquires (a different) node.  Once a
+stream has yielded a chunk to the gateway, an error is raised immediately
+— never retried transparently (no duplicate output).
+
+The Provider never builds GraphQL payloads or Google headers itself
+(TASK-002-A section 18); node-level 429s and reCAPTCHA failures never
+touch the core ResourcePool / scheduler health.
 """
 
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any, AsyncIterator, List, Optional
 
-from core.errors import UpstreamUnavailableError
+from core.errors import (
+    ProviderError,
+    RateLimitError,
+    UpstreamUnavailableError,
+)
 from core.health import HealthResult, HealthState
 from core.models import ChatChunk, ChatRequest, ChatResponse, ModelInfo
 from core.provider import Provider
 from core.resource import Resource
 
-from providers.anonymous_vertex.client import AnonymousVertexClient
+from providers.anonymous_vertex.nodes import (
+    AnonymousVertexNodePool,
+    CooldownPolicy,
+    ExecutionNode,
+    NodeLease,
+    NodeSpec,
+)
 from providers.anonymous_vertex.request import chat_to_vertex_request
+
+# Compat re-export (historical: tests import the resource type from here).
+from providers.anonymous_vertex.resource import AnonymousVertexResource  # noqa: F401
+
 from providers.anonymous_vertex.response import (
     map_finish_reason,
     vertex_chunk_to_chat_chunk,
     vertex_response_to_chat_response,
 )
-from providers.anonymous_vertex.resource import AnonymousVertexResource
 from providers.anonymous_vertex.streaming import (
     chunk_finish_reason,
     normalize_chunk,
 )
-from providers.anonymous_vertex.transport import HttpxTransport
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +97,17 @@ TEXT_MODELS = [
     "gemini-3.8-flash",
 ]
 
+#: Per-request node-attempt budget (each attempt binds exactly one node).
+DEFAULT_MAX_NODE_ATTEMPTS = 3
+
+
+class _RecaptchaAttemptFailure(Exception):
+    """Internal: the reCAPTCHA step of this attempt failed (node recorded)."""
+
+    def __init__(self, provider_error: UpstreamUnavailableError) -> None:
+        self.provider_error = provider_error
+        super().__init__(str(provider_error))
+
 
 class AnonymousVertexProvider(Provider):
     """Adapter for the Anonymous Vertex batchGraphql endpoint."""
@@ -77,62 +119,40 @@ class AnonymousVertexProvider(Provider):
         http_client: Optional[Any] = None,
         token_fetcher=None,
         models: Optional[List[str]] = None,
+        node_specs: Optional[List[NodeSpec]] = None,
+        node_pool: Optional[AnonymousVertexNodePool] = None,
+        cooldown_policy: Optional[CooldownPolicy] = None,
+        max_node_attempts: int = DEFAULT_MAX_NODE_ATTEMPTS,
     ) -> None:
         self.api_key = api_key or ANON_API_KEY
-        self._http = http_client
         self._token_fetcher = token_fetcher
         self._models = list(models) if models else list(TEXT_MODELS)
-        self._client: Optional[AnonymousVertexClient] = None
+        self._max_node_attempts = max(1, int(max_node_attempts))
+        if node_pool is not None:
+            self.node_pool = node_pool
+        else:
+            self.node_pool = AnonymousVertexNodePool.from_specs(
+                node_specs or [NodeSpec(node_id="default")],
+                api_key=self.api_key,
+                policy=cooldown_policy,
+                default_http_client=http_client,
+            )
 
-    # -- lifecycle / resource wiring --
+    # -- lifecycle / compat wiring (tests) --
 
     def set_http_client(self, client: Any) -> None:
-        """Inject an httpx.AsyncClient-compatible object (tests)."""
-        self._http = client
-        self._client = None
+        """Inject an httpx.AsyncClient-compatible object as the default
+        node's transport (tests)."""
+        self.node_pool.nodes[0].set_http_client(client)
 
     def set_token_fetcher(self, fetcher) -> None:
-        """Inject a recaptcha token fetcher (tests)."""
+        """Inject a recaptcha token fetcher (tests); takes precedence over
+        the per-node real flow."""
         self._token_fetcher = fetcher
 
-    async def _ensure_http(self):
-        """Return the raw HTTP client, building one if needed."""
-        if self._http is not None:
-            return self._http
-        from transport.http import build_client
-        from transport.proxy import TransportConfig
-
-        self._http = build_client(TransportConfig(timeout_seconds=180.0))
-        return self._http
-
-    async def _ensure_client(self) -> AnonymousVertexClient:
-        """Return (and cache) the protocol client for this provider."""
-        if self._client is None:
-            http = await self._ensure_http()
-            self._client = AnonymousVertexClient(
-                transport=HttpxTransport(http),
-                api_key=self.api_key,
-            )
-        return self._client
-
-    async def _get_token(self, resource: Resource) -> str:
-        """Fetch a fresh recaptcha token for this request."""
-        if self._token_fetcher is not None:
-            return await self._token_fetcher(resource)
-        from providers.anonymous_vertex.recaptcha import fetch_recaptcha_token
-
-        http = await self._ensure_http()
-        try:
-            return await fetch_recaptcha_token(client=http)
-        except Exception as exc:
-            # A failed anchor/reload flow is a transient upstream-side
-            # failure; surface it as a retryable ProviderError so the
-            # Scheduler cools the resource down and falls back instead of
-            # leaking a raw RuntimeError (which is not a ProviderError and
-            # would skip failure bookkeeping entirely).
-            raise UpstreamUnavailableError(
-                f"recaptcha token fetch failed: {exc}", provider="anonymous_vertex"
-            ) from exc
+    async def close(self) -> None:
+        for node in self.node_pool.nodes:
+            await node.close()
 
     # -- Provider interface --
 
@@ -149,13 +169,39 @@ class AnonymousVertexProvider(Provider):
             return HealthResult(state=resource.health, message="resource unavailable")
         return HealthResult(state=HealthState.HEALTHY, message="anonymous_vertex ok")
 
-    async def complete(
-        self, request: ChatRequest, resource: Resource
+    # -- node-aware attempt machinery --
+
+    async def _fetch_token(self, lease: NodeLease, resource: Resource) -> str:
+        """Fetch a fresh recaptcha token THROUGH THE LEASED NODE.
+
+        The per-node real flow uses the node's own transport, so the
+        reCAPTCHA and the following batchGraphql call share one fixed
+        outbound path.  Outcome is recorded on the node (never on the
+        core resource pool).
+        """
+        if self._token_fetcher is not None:
+            return await self._token_fetcher(resource)
+        from providers.anonymous_vertex.recaptcha import fetch_recaptcha_token
+
+        node = lease.node
+        try:
+            http = await node.http_client()
+            token = await fetch_recaptcha_token(client=http)
+        except Exception as exc:
+            raise _RecaptchaAttemptFailure(
+                UpstreamUnavailableError(
+                    f"recaptcha token fetch failed: {exc}",
+                    provider="anonymous_vertex",
+                )
+            ) from exc
+        await self.node_pool.record_recaptcha_success(node.node_id)
+        return token
+
+    async def _collect_response(
+        self, node: ExecutionNode, vertex_request, token: str, request: ChatRequest
     ) -> ChatResponse:
-        """Non-streaming completion (collects upstream stream chunks)."""
-        client = await self._ensure_client()
-        token = await self._get_token(resource)
-        vertex_request = chat_to_vertex_request(request)
+        """Non-streaming: run one node's upstream stream and collect it."""
+        client = await node.vertex_client()
 
         all_candidates: List[dict] = []
         usage_meta: Optional[dict] = None
@@ -193,16 +239,14 @@ class AnonymousVertexProvider(Provider):
             response_id=response_id,
         )
 
-    async def stream(
-        self, request: ChatRequest, resource: Resource
+    async def _stream_chunks(
+        self, node: ExecutionNode, vertex_request, token: str, model: str
     ) -> AsyncIterator[ChatChunk]:
-        """Streaming completion from upstream NDJSON frames."""
-        client = await self._ensure_client()
-        token = await self._get_token(resource)
-        vertex_request = chat_to_vertex_request(request)
+        """Streaming from one node's upstream NDJSON frames."""
+        client = await node.vertex_client()
 
         usage_meta: Optional[dict] = None
-        model_version = request.model
+        model_version = model
         response_id = ""
 
         async for chunk in client.stream_content(vertex_request, token):
@@ -239,6 +283,121 @@ class AnonymousVertexProvider(Provider):
                     yield final
                 return
 
+    async def complete(
+        self, request: ChatRequest, resource: Resource
+    ) -> ChatResponse:
+        """Non-streaming completion through the node pool.
+
+        Each attempt binds ONE node (reCAPTCHA + batchGraphql on the same
+        outbound path).  A failed attempt records the node and the next
+        attempt re-acquires; exhausted attempts re-raise the last error.
+        """
+        vertex_request = chat_to_vertex_request(request)
+        last_error: Optional[ProviderError] = None
+        tried: set[str] = set()
+
+        for _ in range(self._max_node_attempts):
+            lease = await self.node_pool.acquire(skip=tried)
+            if lease is None:
+                break
+            tried.add(lease.node_id)
+            try:
+                token = await self._fetch_token(lease, resource)
+                started = time.monotonic()
+                response = await self._collect_response(
+                    lease.node, vertex_request, token, request
+                )
+                await self.node_pool.record_success(
+                    lease.node_id, latency_s=time.monotonic() - started
+                )
+                return response
+            except _RecaptchaAttemptFailure as exc:
+                await self.node_pool.record_recaptcha_failure(
+                    lease.node_id, str(exc)
+                )
+                last_error = exc.provider_error
+            except RateLimitError as exc:
+                await self.node_pool.record_rate_limit(lease.node_id, exc.retry_after)
+                last_error = exc
+            except ProviderError as exc:
+                await self.node_pool.record_failure(lease.node_id, exc)
+                last_error = exc
+            except Exception as exc:  # noqa: BLE001 - never leak raw errors
+                await self.node_pool.record_failure(lease.node_id, exc)
+                last_error = UpstreamUnavailableError(
+                    str(exc), provider="anonymous_vertex"
+                )
+            finally:
+                await lease.release()
+
+        if last_error is not None:
+            raise last_error
+        raise UpstreamUnavailableError(
+            "no execution node currently available", provider="anonymous_vertex"
+        )
+
+    async def stream(
+        self, request: ChatRequest, resource: Resource
+    ) -> AsyncIterator[ChatChunk]:
+        """Streaming completion through the node pool.
+
+        Same one-node-per-attempt contract as :meth:`complete`.  Once any
+        chunk has been yielded to the gateway, errors propagate
+        immediately — no transparent retry could ever duplicate output.
+        """
+        vertex_request = chat_to_vertex_request(request)
+        last_error: Optional[ProviderError] = None
+        tried: set[str] = set()
+
+        for _ in range(self._max_node_attempts):
+            lease = await self.node_pool.acquire(skip=tried)
+            if lease is None:
+                break
+            tried.add(lease.node_id)
+            sent_any = False
+            try:
+                token = await self._fetch_token(lease, resource)
+                started = time.monotonic()
+                async for chunk in self._stream_chunks(
+                    lease.node, vertex_request, token, request.model
+                ):
+                    sent_any = True
+                    yield chunk
+                await self.node_pool.record_success(
+                    lease.node_id, latency_s=time.monotonic() - started
+                )
+                return
+            except _RecaptchaAttemptFailure as exc:
+                await self.node_pool.record_recaptcha_failure(
+                    lease.node_id, str(exc)
+                )
+                last_error = exc.provider_error
+            except RateLimitError as exc:
+                await self.node_pool.record_rate_limit(lease.node_id, exc.retry_after)
+                last_error = exc
+                if sent_any:
+                    raise
+            except ProviderError as exc:
+                await self.node_pool.record_failure(lease.node_id, exc)
+                last_error = exc
+                if sent_any:
+                    raise
+            except Exception as exc:  # noqa: BLE001 - never leak raw errors
+                await self.node_pool.record_failure(lease.node_id, exc)
+                last_error = UpstreamUnavailableError(
+                    str(exc), provider="anonymous_vertex"
+                )
+                if sent_any:
+                    raise
+            finally:
+                await lease.release()
+
+        if last_error is not None:
+            raise last_error
+        raise UpstreamUnavailableError(
+            "no execution node currently available", provider="anonymous_vertex"
+        )
+
 
 def trim(model: str) -> str:
     from providers.anonymous_vertex.signature import trim_gemini_path_prefix
@@ -251,4 +410,3 @@ def _flatten(norm: Any) -> List[Any]:
     if isinstance(norm, list):
         return norm
     return [norm]
-

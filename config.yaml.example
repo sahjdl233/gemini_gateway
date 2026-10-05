@@ -88,6 +88,25 @@ providers:
     # models:
     #   - gemini-3.8-flash
     #   - gemini-3.7-flash
+    #
+    # 执行节点池（ANON-004，可选）。缺省 = 单个直连 default 节点。
+    # 每个 Node 是一条完整、固定的出站执行路径（自己的 transport/proxy，
+    # 自己的 reCAPTCHA + batchGraphql），一次 attempt 全程绑定一个 Node。
+    # 429 / reCAPTCHA 失败只冷却该 Node，不影响 provider 级健康。
+    # node_pool:
+    #   max_attempts: 3                 # 每次请求的节点尝试上限
+    #   rate_limit_cooldown:            # 429 递增冷却（秒）：30/60/120...
+    #     base: 30.0
+    #     factor: 2.0
+    #     max: 600.0
+    #   nodes:
+    #     - id: node-a
+    #       weight: 1                   # 同等负载时的优先级（大者优先）
+    #       max_concurrency: 8          # 节点并发上限
+    #       proxy: {scheme: socks5, host: PROXY_HOST, port: PROXY_PORT}
+    #     - id: node-b
+    #       max_concurrency: 4
+    #       enabled: false              # 停用节点不参与调度
     resources:
       - id: default
         # provider: anonymous_vertex   # 缺省自动设为 provider_id

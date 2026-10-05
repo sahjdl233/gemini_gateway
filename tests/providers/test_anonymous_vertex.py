@@ -751,12 +751,15 @@ def test_scheduler_falls_back_after_connect_error():
     )
     resp = asyncio.run(scheduler.chat_completion(make_request()))
 
+    # ANON-004: the node-pool attempt loop absorbs the first wire-level
+    # failure (recorded on the node, retried on the next attempt), so the
+    # scheduler and the core resource never see it.
     assert "Hello from Anonymous Vertex!" in resp.text
     r1, r2 = pool.resources
-    assert r1.total_failures == 1
-    assert r1.consecutive_failures == 1  # cooled down, not forgotten
-    assert r2.total_requests == 1
-    assert r1.in_flight == 0 and r2.in_flight == 0  # no leaks
+    assert r1.total_failures == 0 and r2.total_failures == 0
+    node = provider.node_pool.nodes[0]
+    assert node.total_failures == 1
+    assert node.current_in_flight == 0  # no leaks
 
 
 
@@ -1057,7 +1060,11 @@ def test_disconnect_before_first_chunk_falls_back_to_next_resource():
     chunks = asyncio.run(run())
     texts = "".join(c.text for c in chunks if c.text)
     assert _FRAME1_TEXT in texts
-    assert r1.total_failures == 1
+    # ANON-004: the pre-chunk disconnect was recorded on the node and the
+    # attempt loop moved on; scheduler/core resource stayed clean.
+    assert r1.total_failures == 0 and r2.total_failures == 0
+    node = provider.node_pool.nodes[0]
+    assert node.total_failures == 1
     assert r1.in_flight == 0 and r2.in_flight == 0
 
 
@@ -1095,6 +1102,7 @@ def test_stream_error_status_via_streaming_transport():
 
     from providers.anonymous_vertex.errors import AnonymousVertexUnavailableError
 
+    # ANON-004: a 429 cools its node, so each status gets its own provider.
     r429 = _StaticStreamResponse(
         429,
         b'{"error":{"code":429,"message":"rate","status":"RESOURCE_EXHAUSTED"}}',
@@ -1102,20 +1110,19 @@ def test_stream_error_status_via_streaming_transport():
     )
     r502 = _StaticStreamResponse(502, b'{"error":{"code":502,"message":"bad gateway"}}')
     r503 = _StaticStreamResponse(503, b'{"error":{"code":503,"message":"unavailable"}}')
-    provider = _streaming_provider(r429, r502, r503)
 
     async def run():
         with pytest.raises(AnonymousVertexRateLimitError) as ei:
-            await provider.complete(make_request(), make_resource())
+            await _streaming_provider(r429).complete(make_request(), make_resource())
         assert ei.value.retry_after == 7.0
         assert r429.aread_calls == 1 and r429.closed
 
         with pytest.raises(AnonymousVertexUnavailableError):
-            await provider.complete(make_request(), make_resource())
+            await _streaming_provider(r502).complete(make_request(), make_resource())
         assert r502.closed
 
         with pytest.raises(AnonymousVertexUnavailableError):
-            await provider.complete(make_request(), make_resource())
+            await _streaming_provider(r503).complete(make_request(), make_resource())
         assert r503.closed
 
     asyncio.run(run())
