@@ -532,3 +532,251 @@ async def test_concurrent_double_release_counts_once():
     lease = await pool.acquire()
     await _asyncio.gather(lease.release(), lease.release())
     assert node.current_in_flight == 0
+
+
+
+
+# ---------------------------------------------------------------------------
+# ANON-005: work-conserving attempt scheduler
+#
+# No busy-polling anywhere: waiters are woken by release()/record_*() via
+# the pool condition.  ``asyncio.sleep(0)`` is used only to let pending
+# tasks reach their await point (scheduling ticks), never to "wait long
+# enough".
+# ---------------------------------------------------------------------------
+async def test_capacity_full_waits_instead_of_failing():
+    """1: capacity-full does not fail immediately; the waiter gets the
+    node as soon as it is released."""
+    node = _node("only", max_concurrency=1)
+    pool = _pool(node)
+    lease1 = await pool.acquire()
+
+    task = asyncio.create_task(pool.acquire(wait_for_capacity=True))
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert not task.done(), "waiter must stay pending while capacity is full"
+
+    await lease1.release()
+    lease2 = await asyncio.wait_for(task, timeout=1.0)
+    assert lease2.node is node
+    await lease2.release()
+
+
+async def test_release_wakes_waiter_without_polling():
+    """2: release() genuinely wakes the waiter — the lease is handed over
+    in the first scheduling ticks after the release (structural: the pool
+    uses asyncio.Condition, no sleep polling exists)."""
+    node = _node("only", max_concurrency=1)
+    pool = _pool(node)
+    lease1 = await pool.acquire()
+
+    waiter = asyncio.create_task(pool.acquire(wait_for_capacity=True))
+    await asyncio.sleep(0)
+    assert not waiter.done()
+
+    await lease1.release()
+    lease2 = await asyncio.wait_for(waiter, timeout=0.5)
+    assert lease2.node_id == "only"
+    assert node.current_in_flight == 1
+    await lease2.release()
+
+
+async def test_many_waiters_never_exceed_max_concurrency():
+    """3: with max_concurrency=1 and five waiters, exactly one waiter wins
+    per release and ``current_in_flight`` never exceeds 1."""
+    node = _node("only", max_concurrency=1)
+    pool = _pool(node)
+
+    current = await pool.acquire()
+    waiters = [
+        asyncio.create_task(pool.acquire(wait_for_capacity=True))
+        for _ in range(5)
+    ]
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert node.current_in_flight == 1
+
+    for _ in range(5):
+        await current.release()
+        done, pending = await asyncio.wait(waiters, timeout=1.0)
+        assert len(done) == 1, "exactly one waiter may win per release"
+        current = done.pop().result()  # task -> lease
+        waiters = list(pending)
+        assert node.current_in_flight == 1  # never 2
+        assert all(not w.done() for w in waiters)
+
+    await current.release()
+    assert node.current_in_flight == 0
+
+
+async def test_waiter_waits_for_untried_node_not_skipped_idle_one():
+    """4: A skipped+idle, B untried+full -> the waiter must keep waiting
+    for B instead of silently re-grabbing A."""
+    a = _node("a")
+    b = _node("b", max_concurrency=1)
+    pool = _pool(a, b)
+
+    held = await pool.acquire(skip={"a"})  # -> b
+    assert held.node_id == "b"
+
+    waiter = asyncio.create_task(
+        pool.acquire(skip={"a"}, wait_for_capacity=True)
+    )
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert not waiter.done(), "must wait for b, never re-grab skipped idle a"
+
+    await held.release()
+    lease = await asyncio.wait_for(waiter, timeout=1.0)
+    assert lease.node_id == "b"  # woke on b, not on a
+    await lease.release()
+
+
+async def test_all_tried_and_full_waits_then_reuses():
+    """4b: the only node is already tried AND full -> waiter waits, then
+    reuses it (ANON-004 reuse semantics preserved under waiting)."""
+    node = _node("only", max_concurrency=1)
+    pool = _pool(node)
+    held = await pool.acquire()
+
+    waiter = asyncio.create_task(
+        pool.acquire(skip={"only"}, wait_for_capacity=True)
+    )
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert not waiter.done()
+
+    await held.release()
+    lease = await asyncio.wait_for(waiter, timeout=1.0)
+    assert lease.node_id == "only"
+    await lease.release()
+
+
+async def test_waiter_cancellation_is_safe():
+    """5: cancelling a capacity waiter leaves pool lock/condition clean,
+    counters untouched, and the pool fully usable."""
+    node = _node("only", max_concurrency=1)
+    pool = _pool(node)
+    held = await pool.acquire()
+
+    waiter = asyncio.create_task(pool.acquire(wait_for_capacity=True))
+    await asyncio.sleep(0)
+    assert not waiter.done()
+
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+
+    await held.release()
+    assert node.current_in_flight == 0
+    lease = await asyncio.wait_for(
+        pool.acquire(wait_for_capacity=True), timeout=1.0
+    )
+    assert lease is not None and lease.node_id == "only"
+    await lease.release()
+
+
+async def test_no_healthy_candidate_returns_none_immediately():
+    """6: disabled / cooldown / recaptcha-failed nodes never block a
+    work-conserving acquire — exhaustion semantics stay immediate."""
+    a = _node("a", enabled=False)
+    b = _node("b")
+    pool = _pool(a, b)
+    await pool.record_rate_limit("b")  # cooldown
+
+    lease = await asyncio.wait_for(
+        pool.acquire(wait_for_capacity=True), timeout=1.0
+    )
+    assert lease is None, "no healthy candidate must not wait"
+
+    pool2 = _pool(_node("b2"))
+    await pool2.record_recaptcha_failure("b2")
+    lease2 = await asyncio.wait_for(
+        pool2.acquire(wait_for_capacity=True), timeout=1.0
+    )
+    assert lease2 is None
+
+
+class _GatedResponse:
+    """200 response whose body only starts flowing once the gate opens."""
+
+    status_code = 200
+    headers = {}
+
+    def __init__(self, gate, entered, frames):
+        self._gate = gate
+        self._entered = entered
+        self._frames = frames
+        self.closed = False
+
+    async def aiter_bytes(self):
+        self._entered.set()
+        await self._gate.wait()
+        for frame in self._frames:
+            yield frame
+
+    async def aread(self):
+        return b""
+
+    async def aclose(self):
+        self.closed = True
+
+
+class _SequencedClient:
+    """httpx-shaped fake serving one queued response per stream() call."""
+
+    def __init__(self, responses):
+        self._responses = list(responses)
+
+    def stream(self, method, url, *, content=None, headers=None):
+        from contextlib import asynccontextmanager
+
+        resp = (
+            self._responses.pop(0)
+            if len(self._responses) > 1
+            else self._responses[0]
+        )
+
+        @asynccontextmanager
+        async def cm():
+            yield resp
+
+        return cm()
+
+
+async def test_provider_request_waits_for_node_capacity():
+    """7: through Provider -> NodePool -> NodeLease: request B does not
+    fail with exhaustion while A occupies the only node; B completes after
+    A releases."""
+    gate_a = asyncio.Event()
+    entered_a = asyncio.Event()
+    resp_a = _GatedResponse(gate_a, entered_a, [_FRAME1, _FRAME2])
+    resp_b = _OkStream()
+    node = _node("only", max_concurrency=1)
+    node.set_http_client(_SequencedClient([resp_a, resp_b]))
+    clock = FakeClock()
+    pool = AnonymousVertexNodePool([node], now_fn=clock)
+
+    async def stub_token(resource):
+        return "recaptcha-token"
+
+    provider = AnonymousVertexProvider(node_pool=pool, token_fetcher=stub_token)
+    request = make_request()
+    resource = make_resource()
+
+    task_a = asyncio.create_task(provider.complete(request, resource))
+    await asyncio.wait_for(entered_a.wait(), timeout=1.0)
+    assert node.current_in_flight == 1  # request A occupies the only node
+
+    task_b = asyncio.create_task(provider.complete(request, resource))
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert not task_b.done(), "B must wait, not fail with exhaustion"
+
+    gate_a.set()  # request A finishes -> release -> notify
+    result_a = await asyncio.wait_for(task_a, timeout=2.0)
+    result_b = await asyncio.wait_for(task_b, timeout=2.0)
+    assert _FRAME1_TEXT in result_a.text
+    assert _FRAME1_TEXT in result_b.text
+    assert node.current_in_flight == 0
+    assert node.total_requests == 2

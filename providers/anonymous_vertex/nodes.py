@@ -294,6 +294,9 @@ class AnonymousVertexNodePool:
         self._policy = policy or CooldownPolicy()
         self.now = now_fn or time.monotonic
         self._lock = asyncio.Lock()
+        # Shares the pool lock: notify_all() is legal from any block that
+        # holds self._lock (release / record_*).
+        self._condition = asyncio.Condition(lock=self._lock)
 
     @classmethod
     def from_specs(
@@ -341,55 +344,98 @@ class AnonymousVertexNodePool:
 
     # -- acquire / release --
 
-    def _eligible(self, node: ExecutionNode, now: float) -> bool:
-        if not node.enabled:
-            return False
-        if node.current_in_flight >= node.max_concurrency:
-            return False
-        if node.recaptcha_state == "failed" and node.in_cooldown(now):
-            return False
-        # Lazy cooldown expiry: once the cooldown has passed the node is
-        # schedulable again and a previous recaptcha failure gets one
-        # fresh evaluation on its next attempt.
+    def _refresh_state(self, node: ExecutionNode, now: float) -> None:
+        """Lazy cooldown expiry: once the cooldown has passed the node is
+        schedulable again and a previous recaptcha failure gets one fresh
+        evaluation on its next attempt."""
         if node.cooldown_until and now >= node.cooldown_until:
             node.cooldown_until = 0.0
             if node.recaptcha_state == "failed":
                 node.recaptcha_state = "unknown"
+
+    def _healthy(self, node: ExecutionNode, now: float) -> bool:
+        """Enabled, not cooling down, reCAPTCHA-admitted — capacity NOT
+        considered.  Capacity-blocked healthy nodes are exactly what the
+        work-conserving acquire waits for."""
+        self._refresh_state(node, now)
+        if not node.enabled:
+            return False
         if node.in_cooldown(now):
+            return False
+        if node.recaptcha_state == "failed":
             return False
         return True
 
+    def _has_capacity(self, node: ExecutionNode) -> bool:
+        return node.current_in_flight < node.max_concurrency
+
+    def _pick(self, candidates: List[ExecutionNode]) -> ExecutionNode:
+        return min(
+            candidates,
+            key=lambda n: (n.current_in_flight, -n.weight),
+        )
+
     async def acquire(
-        self, *, skip: Optional[set] = None
+        self,
+        *,
+        skip: Optional[set] = None,
+        wait_for_capacity: bool = False,
     ) -> Optional[NodeLease]:
-        """Acquire one eligible node as a lease, or None if all nodes are
-        disabled / cooling down / recaptcha-failed / at max_concurrency.
+        """Acquire one eligible node as a lease, or None when no healthy
+        candidate exists.
 
         ``skip`` excludes node ids already tried within the current
         request, so a failed node cannot be re-picked by the next attempt
-        (mirrors the core scheduler's ``tried`` semantics)."""
-        async with self._lock:
-            now = self.now()
-            skip = skip or frozenset()
-            eligible = [
-                n for n in self._nodes
-                if n.node_id not in skip and self._eligible(n, now)
-            ]
-            if not eligible and skip:
-                # Every node was already tried within this request: reuse
-                # one rather than giving up (keeps the attempt budget for
-                # single-node pools, mirrors "next attempt" semantics).
-                eligible = [
-                    n for n in self._nodes if self._eligible(n, now)
+        (mirrors the core scheduler's ``tried`` semantics).  When every
+        healthy candidate is already skipped, an already-tried node may be
+        reused (ANON-004 "next attempt" semantics).
+
+        Work-conserving (ANON-005): with ``wait_for_capacity=True`` the
+        call WAITS when healthy untried nodes exist but are all at
+        ``max_concurrency`` — it never waits for cooldowns, disabled or
+        reCAPTCHA-failed nodes, and never returns while execution capacity
+        is idle.  Every state change (release, cooldowns, admission)
+        notifies waiters, which re-check the full predicate under the
+        pool lock; ``max_concurrency`` can never be exceeded.
+        """
+        skip = skip or frozenset()
+        async with self._condition:  # holds self._lock
+            while True:
+                now = self.now()
+                healthy = [
+                    n for n in self._nodes if self._healthy(n, now)
                 ]
-            if not eligible:
+                untried = [n for n in healthy if n.node_id not in skip]
+                tried = [n for n in healthy if n.node_id in skip]
+
+                ready_untried = [n for n in untried if self._has_capacity(n)]
+                if ready_untried:
+                    node = self._pick(ready_untried)
+                    node.current_in_flight += 1
+                    return NodeLease(self, node)
+
+                if untried and wait_for_capacity:
+                    # Healthy untried nodes exist but are capacity-blocked:
+                    # wait for a release / state change instead of failing.
+                    await self._condition.wait()
+                    continue
+
+                # ANON-004 reuse fallback: every healthy candidate is
+                # already tried (or no untried was ready and we are not
+                # waiting) — reuse a tried node rather than giving up.
+                ready_tried = [n for n in tried if self._has_capacity(n)]
+                if ready_tried:
+                    node = self._pick(ready_tried)
+                    node.current_in_flight += 1
+                    return NodeLease(self, node)
+
+                if tried and wait_for_capacity:
+                    # Only already-tried nodes exist and all are at
+                    # capacity: wait, then reuse the first freed one.
+                    await self._condition.wait()
+                    continue
+
                 return None
-            node = min(
-                eligible,
-                key=lambda n: (n.current_in_flight, -n.weight),
-            )
-            node.current_in_flight += 1
-            return NodeLease(self, node)
 
     async def release(self, lease: NodeLease) -> None:
         """Release a lease exactly once (idempotent).
@@ -397,6 +443,7 @@ class AnonymousVertexNodePool:
         The ``released`` flag is checked and flipped under the pool lock,
         so a double release — explicit + async-context-manager exit, or a
         race between two callers — decrements ``in_flight`` only once.
+        Wakes capacity waiters (they re-check full eligibility).
         """
         async with self._lock:
             if lease.released:
@@ -404,6 +451,13 @@ class AnonymousVertexNodePool:
             lease.released = True
             node = lease._node
             node.current_in_flight = max(0, node.current_in_flight - 1)
+            self._condition.notify_all()
+
+    def _notify_state_change(self) -> None:
+        """Wake capacity waiters after any scheduling-relevant state
+        change (cooldown applied/cleared, admission result).  Callers must
+        hold the pool lock."""
+        self._condition.notify_all()
 
     # -- outcome recording --
 
@@ -419,6 +473,7 @@ class AnonymousVertexNodePool:
             if node.recaptcha_state != "failed":
                 node.recaptcha_state = "ok"
             node.last_latency_s = latency_s
+            self._notify_state_change()
 
     async def record_rate_limit(
         self, node_id: str, retry_after: Optional[float] = None
@@ -436,6 +491,7 @@ class AnonymousVertexNodePool:
             )
             node.cooldown_until = self.now() + delay
             node.last_error = "rate limited"
+            self._notify_state_change()
 
     async def record_failure(self, node_id: str, error: Any) -> None:
         """Transport / application failure -> counters; cooldown only once
@@ -449,6 +505,7 @@ class AnonymousVertexNodePool:
             if node.consecutive_failures >= self._policy.failure_threshold:
                 delay = self._policy.failure_delay(node.consecutive_failures)
                 node.cooldown_until = self.now() + delay
+            self._notify_state_change()
 
     async def record_recaptcha_success(self, node_id: str) -> None:
         """A fresh token proves the node's egress path again: clears any
@@ -458,6 +515,7 @@ class AnonymousVertexNodePool:
             node.recaptcha_passes += 1
             node.recaptcha_state = "ok"
             node.cooldown_until = 0.0
+            self._notify_state_change()
 
     async def record_recaptcha_failure(self, node_id: str, error: Any = "") -> None:
         """Token fetch failed -> node unschedulable for the recaptcha
@@ -472,3 +530,4 @@ class AnonymousVertexNodePool:
             node.last_error = f"recaptcha failure: {str(error)[:150]}"
             delay = self._policy.recaptcha_delay(node.recaptcha_failures)
             node.cooldown_until = self.now() + delay
+            self._notify_state_change()

@@ -297,7 +297,13 @@ class AnonymousVertexProvider(Provider):
         tried: set[str] = set()
 
         for _ in range(self._max_node_attempts):
-            lease = await self.node_pool.acquire(skip=tried)
+            # Work-conserving (ANON-005): when healthy untried nodes exist
+            # but are all at max_concurrency, wait for a release instead of
+            # failing the request.  Cooldowns / disabled / recaptcha-failed
+            # nodes never block the call.
+            lease = await self.node_pool.acquire(
+                skip=tried, wait_for_capacity=True
+            )
             if lease is None:
                 break
             tried.add(lease.node_id)
@@ -350,7 +356,13 @@ class AnonymousVertexProvider(Provider):
         tried: set[str] = set()
 
         for _ in range(self._max_node_attempts):
-            lease = await self.node_pool.acquire(skip=tried)
+            # Work-conserving (ANON-005): when healthy untried nodes exist
+            # but are all at max_concurrency, wait for a release instead of
+            # failing the request.  Cooldowns / disabled / recaptcha-failed
+            # nodes never block the call.
+            lease = await self.node_pool.acquire(
+                skip=tried, wait_for_capacity=True
+            )
             if lease is None:
                 break
             tried.add(lease.node_id)
