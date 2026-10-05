@@ -8,7 +8,6 @@ import pytest
 
 from providers.anonymous_vertex.node_import import (
     NodeLineParseError,
-    ParsedNodeEndpoint,
     endpoint_node_id,
     import_node_sources,
     import_node_text,
@@ -215,53 +214,56 @@ def test_pipe_is_never_a_field_separator():
 # official fixture: the user's 32-line TXT
 # ---------------------------------------------------------------------------
 def test_user_fixture_full_parse():
+    """The user's canonical 32-line TXT parses completely and faithfully."""
     lines = _load_fixture()
     assert len(lines) == 32
 
     result = import_node_text(lines, "sample")
-    assert not result.rejected, [r.raw_line for r in result.rejected]
+    assert result.rejected == (), [r.raw_line for r in result.rejected]
+    assert len(result.endpoints) == 32  # no duplicate endpoints in the TXT
 
-    endpoints = {ep.normalized_key: ep for ep in result.endpoints} if False else {
-        (ep.host, ep.port): ep for ep in result.endpoints
-    }
+    endpoints = {(ep.host, ep.port): ep for ep in result.endpoints}
 
-    # all hosts parsed with correct ports
-    assert endpoints[("162.159.198.1", 8443)].labels == ("EDT导航优选域名 | BestCF.pages.dev",)
-    assert endpoints[("162.159.197.1", 443)].labels == ("官方入口 | ZeroTrust",)
-    assert endpoints[("162.159.193.1", 443)].labels == ("官方入口 | WireGuard",)
-    assert endpoints[("www.mskcc.org", 443)].labels == ("更多选择 | MSKCC",)
-
-    # :8443 and :443 are different endpoints
+    # :8443 and :443 are different endpoints (and different node ids)
     assert ("162.159.198.1", 8443) in endpoints
     assert ("162.159.198.1", 443) in endpoints
     assert (endpoints[("162.159.198.1", 8443)].node_id
             != endpoints[("162.159.198.1", 443)].node_id)
 
-    # Chinese labels fully preserved, '|' never split
+    # Chinese labels fully preserved, '|' never split, one label per line
+    assert endpoints[("162.159.198.1", 8443)].labels == (
+        "EDT导航优选域名 | BestCF.pages.dev",
+    )
+    assert endpoints[("162.159.197.1", 443)].labels == ("官方入口 | ZeroTrust",)
+    assert endpoints[("162.159.193.1", 443)].labels == ("官方入口 | WireGuard",)
+    assert endpoints[("www.mskcc.org", 443)].labels == ("更多选择 | MSKCC",)
     for ep in result.endpoints:
-        for label in ep.labels:
-            assert "|" in label or label
+        assert len(ep.labels) == 1
+        assert " | " in ep.labels[0]
 
-    # hostname + IPv4 mix all present
+    # hostname / IPv4 mix, real samples present
     hosts = {ep.host for ep in result.endpoints}
-    assert "store.ubi.com" in hosts
-    assert "serviceshub.samsclub.com" in hosts
-    assert "www.allianz.com" in hosts
-    assert "www.mskcc.org" in hosts
-    assert any(ep.host.startswith("162.159.") for ep in result.endpoints)
+    for expected in (
+        "openai.com",
+        "www.decathlon.com",
+        "chrono24.com",
+        "www.wto.org",
+        "store.ubi.com",
+        "serviceshub.samsclub.com",
+        "mycareer.verizon.com",
+        "digitalocean.com",
+    ):
+        assert expected in hosts, expected
+    assert sum(ep.host.startswith("162.159.") for ep in result.endpoints) == 5
 
-    # trailing-dot line dedups into the plain hostname endpoint
-    ubi = endpoints[("store.ubi.com", 443)]
-    assert ubi.labels == ("企业域名 | 育碧商城", "企业域名 | 育碧商城 尾点")
-    assert ubi.raw_entries[0] == "store.ubi.com:443#企业域名 | 育碧商城"
+    # every line yields a stable derived node id
+    for ep in result.endpoints:
+        assert ep.node_id == endpoint_node_id(ep.host, ep.port)
+        assert ep.node_id.startswith("anv-")
+        assert ep.source_ids == ("sample",)
 
-    # 32 data lines -> 31 unique endpoints (store.ubi.com appears twice)
-    assert len(result.endpoints) == 31
-    assert all(ep.node_id.startswith("anv-") for ep in result.endpoints)
-
-    # re-import is deterministic (stable ids, stable merge order)
-    again = import_node_text(lines, "sample")
-    assert again == result
+    # re-import is deterministic
+    assert import_node_text(lines, "sample") == result
 
 
 def test_fixture_cross_source_view():
@@ -275,10 +277,11 @@ def test_fixture_cross_source_view():
     assert [ep.node_id for ep in result.endpoints] == [
         ep.node_id for ep in single.endpoints
     ]
-    # every endpoint keeps exactly the sources it actually came from;
-    # store.ubi.com spans both halves and must carry both source ids
-    by_key = {(ep.host, ep.port): ep for ep in result.endpoints}
-    assert by_key[("store.ubi.com", 443)].source_ids == ("paste-1", "paste-2")
-    multi = [ep for ep in result.endpoints if len(ep.source_ids) > 1]
-    assert [(ep.host, ep.port) for ep in multi] == [("store.ubi.com", 443)]
-    assert all(ep.source_ids for ep in result.endpoints)
+    # the canonical TXT has no duplicate endpoints, so each endpoint
+    # keeps exactly the single source it came from — yet node identity is
+    # identical to the single-source import (spec section 8)
+    assert all(len(ep.source_ids) == 1 for ep in result.endpoints)
+    assert {ep.source_ids[0] for ep in result.endpoints} == {"paste-1", "paste-2"}
+    assert [ep.node_id for ep in result.endpoints] == [
+        ep.node_id for ep in single.endpoints
+    ]
