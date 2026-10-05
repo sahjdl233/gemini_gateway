@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 
 import pytest
@@ -79,7 +80,7 @@ def test_runtime_mutation_does_not_change_definition():
     node.last_error = "boom"
 
     # definition is frozen AND unchanged in value
-    with pytest.raises(Exception):
+    with pytest.raises(dataclasses.FrozenInstanceError):
         definition.weight = 99  # type: ignore[misc]
     assert definition.proxy == {"scheme": "socks5", "host": "10.0.0.1", "port": 1080}
     assert definition.weight == 2
@@ -218,3 +219,116 @@ async def test_definition_node_in_pool_lifecycle():
     snapshot = node.capture_runtime_state()
     assert snapshot.total_rate_limits == 2
     assert definition.to_dict() == _definition("node-a").to_dict()
+
+
+# ---------------------------------------------------------------------------
+# ANON-006-FIX-01 Part A: deep immutability of definition / source mappings
+# ---------------------------------------------------------------------------
+def test_definition_proxy_mutation_rejected():
+    definition = _definition()
+    with pytest.raises(TypeError):
+        definition.proxy["host"] = "x"
+    with pytest.raises((TypeError, AttributeError)):
+        definition.proxy.pop("host")  # mappingproxy exposes no pop
+    assert definition.proxy["host"] == "10.0.0.1"
+
+
+def test_definition_metadata_mutation_rejected():
+    definition = _definition()
+    with pytest.raises(TypeError):
+        definition.metadata["foo"] = "x"
+    with pytest.raises(TypeError):
+        definition.metadata["region"] = "us"
+    assert definition.metadata["region"] == "hk"
+
+
+def test_source_metadata_mutation_rejected():
+    source = NodeSource(
+        source_id="sub-01",
+        source_type=SOURCE_TYPE_SUBSCRIPTION,
+        metadata={"url": "https://example.com/sub", "interval": 3600},
+    )
+    with pytest.raises(TypeError):
+        source.metadata["url"] = "https://evil.example.com/sub"
+    with pytest.raises(TypeError):
+        source.metadata["extra"] = 1
+    assert source.metadata["url"] == "https://example.com/sub"
+
+
+def test_nested_mapping_bypass_rejected():
+    """Nested dicts / lists inside proxy and metadata are frozen too —
+    an inner reference cannot be used to mutate the definition."""
+    definition = _definition(
+        proxy={
+            "scheme": "socks5",
+            "host": "10.0.0.1",
+            "port": 1080,
+            "options": {"udp": True, "tags": ["hk", "premium"]},
+        }
+    )
+    with pytest.raises(TypeError):
+        definition.proxy["options"]["udp"] = False
+    with pytest.raises(TypeError):
+        definition.proxy["options"]["tags"][0] = "us"  # tuple item assignment
+    with pytest.raises(AttributeError):
+        definition.proxy["options"]["tags"].append("us")  # tuple, not list
+    # values unchanged
+    assert definition.proxy["options"]["udp"] is True
+    assert definition.proxy["options"]["tags"] == ("hk", "premium")
+
+
+def test_to_dict_returns_mutable_plain_payload():
+    definition = _definition(
+        proxy={"scheme": "socks5", "host": "h", "port": 1, "options": {"udp": True}},
+    )
+    raw = definition.to_dict()
+    # plain mutable payload — mutation neither fails nor leaks inside
+    raw["proxy"]["host"] = "mutated"
+    raw["proxy"]["options"]["udp"] = False
+    raw["metadata"]["new-key"] = 1
+    assert definition.proxy["host"] == "h"  # definition untouched
+    assert definition.proxy["options"]["udp"] is True
+    assert "new-key" not in dict(definition.metadata)
+    assert isinstance(raw["proxy"], dict)
+    assert isinstance(raw["proxy"]["options"], dict)
+    # JSON roundtrip still intact
+    assert json.loads(json.dumps(raw)) == raw
+    rebuilt = NodeDefinition.from_dict(raw)
+    assert rebuilt.node_id == definition.node_id
+    assert rebuilt.proxy["host"] == "mutated"  # from the mutated payload
+
+
+# ---------------------------------------------------------------------------
+# ANON-006-FIX-01 Part B: apply_to never restores current_in_flight
+# ---------------------------------------------------------------------------
+def test_rebuild_never_inherits_in_flight():
+    definition = _definition()
+    old = ExecutionNode.from_definition(definition)
+    old.current_in_flight = 3
+    old.total_requests = 10
+
+    state = old.capture_runtime_state()
+    assert state.current_in_flight == 3  # snapshot may describe live state
+
+    rebuilt = ExecutionNode.from_definition(definition, runtime_state=state)
+    assert rebuilt.current_in_flight == 0  # never inherited
+    assert rebuilt.total_requests == 10  # inheritable counters carried over
+
+    # the definition is untouched by the rebuild
+    assert rebuilt.definition is definition
+    assert definition.to_dict() == _definition().to_dict()
+
+
+def test_apply_to_preserves_live_in_flight_accounting():
+    """apply_to on a LIVE node must not zero (or overwrite) its real
+    in-flight count — it is not inheritable state in either direction."""
+    definition = _definition()
+    live = ExecutionNode.from_definition(definition)
+    live.current_in_flight = 2
+    live.total_requests = 7
+
+    snapshot = NodeRuntimeState(node_id="node-a", current_in_flight=9,
+                                total_requests=1)
+    live.restore_runtime_state(snapshot)
+    assert live.current_in_flight == 2  # untouched
+    assert live.total_requests == 1     # inheritable field applied

@@ -24,7 +24,33 @@ No import / TXT parsing / probing / storage is implemented in this module.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field, fields
+from types import MappingProxyType
 from typing import Any, Dict, Optional
+
+
+def _freeze(value: Any) -> Any:
+    """Recursively convert JSON-ish structures into immutable ones.
+
+    dict -> MappingProxyType, list -> tuple, set -> frozenset (nested
+    included), so a caller holding an internal mapping reference cannot
+    mutate a frozen definition in place.
+    """
+    if isinstance(value, dict):
+        return MappingProxyType({k: _freeze(v) for k, v in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze(v) for v in value)
+    if isinstance(value, (set, frozenset)):
+        return frozenset(_freeze(v) for v in value)
+    return value
+
+
+def _thaw(value: Any) -> Any:
+    """Inverse of :func:`_freeze`: plain, mutable, JSON-safe payload."""
+    if isinstance(value, MappingProxyType):
+        return {k: _thaw(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, frozenset, set)):
+        return [_thaw(v) for v in value]
+    return value
 
 
 class NodeSourceTypeError(ValueError):
@@ -57,9 +83,18 @@ class NodeSource:
                 f"unknown source_type: {self.source_type!r} "
                 f"(expected one of {sorted(SOURCE_TYPES)})"
             )
+        object.__setattr__(self, "metadata", _freeze(self.metadata))
 
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        """Plain mutable JSON-safe payload (internal immutable views are
+        never exposed)."""
+        return {
+            "source_id": self.source_id,
+            "source_type": self.source_type,
+            "name": self.name,
+            "enabled": self.enabled,
+            "metadata": _thaw(self.metadata),
+        }
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "NodeSource":
@@ -89,8 +124,22 @@ class NodeDefinition:
     max_concurrency: int = 8
     metadata: Dict[str, Any] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "proxy", _freeze(self.proxy))
+        object.__setattr__(self, "metadata", _freeze(self.metadata))
+
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        """Plain mutable JSON-safe payload (internal immutable views are
+        never exposed)."""
+        return {
+            "node_id": self.node_id,
+            "proxy": _thaw(self.proxy),
+            "source_id": self.source_id,
+            "enabled": self.enabled,
+            "weight": self.weight,
+            "max_concurrency": self.max_concurrency,
+            "metadata": _thaw(self.metadata),
+        }
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "NodeDefinition":
@@ -112,6 +161,11 @@ class NodeRuntimeState:
     Nothing here is required for a NodeDefinition to exist: state can be
     dropped, rebuilt or zeroed at any time.  ``cooldown_until`` lives in
     the pool's monotonic clock domain and is only meaningful in-process.
+
+    ``current_in_flight`` is live in-process accounting: it may be
+    CAPTURED into a snapshot, but ``apply_to`` never restores it — a
+    rebuilt node always starts with zero in-flight requests
+    (ANON-006-FIX-01).
     """
 
     node_id: str
@@ -151,12 +205,15 @@ class NodeRuntimeState:
         )
 
     def apply_to(self, node: Any) -> None:
-        """Write this state onto an ExecutionNode.
+        """Write the inheritable runtime state onto an ExecutionNode.
 
         The caller owns the inheritance decision: applying a state object
         is the only channel through which counters move between nodes.
+
+        ``current_in_flight`` is deliberately NOT restored: in-flight is
+        live accounting of an actual running node and must never be
+        inherited by a rebuild — a rebuilt node starts at zero.
         """
-        node.current_in_flight = self.current_in_flight
         node.cooldown_until = self.cooldown_until
         node.consecutive_rate_limits = self.consecutive_rate_limits
         node.consecutive_failures = self.consecutive_failures
