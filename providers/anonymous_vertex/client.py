@@ -8,7 +8,7 @@ Layering:
     AnonymousVertexClient   (this module)
             |
             v
-    AnonymousVertexProtocol (protocol.py: GraphQL envelope)
+    AnonymousVertexProtocol (protocol.py)
             |
             v
     HTTP Transport          (transport.py / injected client)
@@ -22,9 +22,12 @@ Gemini frames into Gateway chunks.
 
 from __future__ import annotations
 
-from typing import Any, AsyncIterator, Optional
+from typing import Any, AsyncIterator, Dict, Optional, Tuple
+
+from core.errors import TimeoutError as UpstreamTimeoutError
 
 from providers.anonymous_vertex.errors import (
+    AnonymousVertexConnectionError,
     classify_upstream_error,
     parse_upstream_error,
 )
@@ -36,7 +39,7 @@ from providers.anonymous_vertex.protocol import (
 )
 from providers.anonymous_vertex.signature import ANONYMOUS_VERTEX_GRAPHQL_ENDPOINT
 from providers.anonymous_vertex.streaming import iter_chunks
-from providers.anonymous_vertex.transport import HTTPTransport
+from providers.anonymous_vertex.transport import HTTPTransport, stream_context
 
 
 class AnonymousVertexClient:
@@ -56,38 +59,77 @@ class AnonymousVertexClient:
     def build_url(self) -> str:
         return f"{self._endpoint}?key={self._api_key}&prettyPrint=false"
 
+    def build_request_body(
+        self, request: AnonymousVertexRequest, recaptcha_token: str
+    ) -> Tuple[str, bytes, Dict[str, str]]:
+        """Build (url, encoded body, headers) for one upstream POST."""
+        payload = build_graphql_payload(request, recaptcha_token)
+        body = serialize_payload(payload)
+        headers = build_xhr_headers()
+        return self.build_url(), body.encode("utf-8"), headers
+
     async def post_request(
         self, request: AnonymousVertexRequest, recaptcha_token: str
     ) -> Any:
         """POST the GraphQL envelope for an internal request; return raw response."""
-        payload = build_graphql_payload(request, recaptcha_token)
-        body = serialize_payload(payload)
-        headers = build_xhr_headers()
-        return await self._transport.post(
-            self.build_url(),
-            content=body.encode("utf-8"),
-            headers=headers,
-        )
+        url, body, headers = self.build_request_body(request, recaptcha_token)
+        return await self._transport.post(url, content=body, headers=headers)
 
     async def stream_content(
         self, request: AnonymousVertexRequest, recaptcha_token: str
     ) -> AsyncIterator[Any]:
         """POST and yield upstream Gemini frames; raise classified errors.
 
-        On a non-200 response the raw body (plus Retry-After, if present) is
-        mapped through errors.py so the upper layer sees an
-        AnonymousVertexProtocolError subtype (RateLimit/Auth/Unavailable...).
-        No retry or resource switching happens here (TASK-002-A section 15).
+        The request is opened through the transport's streaming context so
+        the NDJSON body is consumed incrementally (ANON-002): frames are
+        yielded as their bytes arrive, never after a full-body read.  On a
+        non-200 response the (small) error body is read and mapped through
+        errors.py so the upper layer sees an AnonymousVertexProtocolError
+        subtype (RateLimit/Auth/Unavailable...).  Connection-level failures
+        (timeout, reset, mid-stream disconnect) are mapped to
+        NetworkError/TimeoutError subtypes so the Scheduler can cool the
+        resource down and fall back.  The response is closed by the
+        transport context on every exit path (EOF, parser error,
+        disconnect, cancellation).  No retry or resource switching happens
+        here (TASK-002-A section 15).
         """
-        resp = await self.post_request(request, recaptcha_token)
-        if resp.status_code != 200:
-            retry_after = self._extract_retry_after(resp)
-            parsed = parse_upstream_error(resp.status_code, resp.content)
-            if retry_after is not None and parsed.retry_after is None:
-                parsed.retry_after = retry_after
-            raise classify_upstream_error(parsed)
-        async for frame in iter_chunks(resp.aiter_bytes()):
-            yield frame
+        import httpx
+
+        url, body, headers = self.build_request_body(request, recaptcha_token)
+        try:
+            async with stream_context(
+                self._transport, url, content=body, headers=headers
+            ) as resp:
+                if resp.status_code != 200:
+                    retry_after = self._extract_retry_after(resp)
+                    parsed = parse_upstream_error(
+                        resp.status_code, await self._read_body(resp)
+                    )
+                    if retry_after is not None and parsed.retry_after is None:
+                        parsed.retry_after = retry_after
+                    raise classify_upstream_error(parsed)
+                async for frame in iter_chunks(resp.aiter_bytes()):
+                    yield frame
+        except httpx.TimeoutException as exc:
+            raise UpstreamTimeoutError(
+                f"upstream timeout: {exc}", provider="anonymous_vertex"
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise AnonymousVertexConnectionError(
+                f"upstream connection failed: {exc}", provider="anonymous_vertex"
+            ) from exc
+
+    @staticmethod
+    async def _read_body(resp: Any) -> bytes:
+        """Read a (non-200) response body without assuming full buffering.
+
+        Streaming responses expose ``aread()``; legacy buffered mock
+        responses expose ``.content``.
+        """
+        aread = getattr(resp, "aread", None)
+        if aread is not None:
+            return await aread()
+        return resp.content
 
     @staticmethod
     def _extract_retry_after(resp: Any) -> Optional[float]:
@@ -105,4 +147,3 @@ class AnonymousVertexClient:
         except (TypeError, ValueError):
             return None
         return value if value > 0 else None
-

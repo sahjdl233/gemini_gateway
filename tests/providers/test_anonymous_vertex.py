@@ -1,7 +1,9 @@
 """TASK-002 tests for the Anonymous Vertex provider (no real network)."""
 from __future__ import annotations
 
+import asyncio
 import json
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import pytest
@@ -44,6 +46,7 @@ from providers.anonymous_vertex.errors import (
     parse_upstream_error,
     AnonymousVertexRateLimitError,
     AnonymousVertexAuthError,
+    AnonymousVertexConnectionError,
     AnonymousVertexProtocolError,
     AnonymousVertexParseError,
 )
@@ -564,3 +567,633 @@ def test_provider_health_check():
     res = make_resource()
     result = asyncio.run(provider.health_check(res))
     assert result.state == HealthState.HEALTHY
+
+
+# ---------------------------------------------------------------------------
+# AUDIT-PROVIDER-001: production-readiness audit regression tests
+# ---------------------------------------------------------------------------
+def test_plain_502_maps_to_unavailable_and_retryable():
+    """A bare upstream HTTP 502 is transient: Unavailable + retryable.
+
+    AUDIT-PROVIDER-001: classify_upstream_error previously mapped 502 to
+    AnonymousVertexAuthError, which is non-retryable — the Scheduler then
+    aborted instead of falling back / cooling down transiently.
+    """
+    from core.errors import is_retryable
+    from providers.anonymous_vertex.errors import (
+        AnonymousVertexUnavailableError,
+        UpstreamVertexError,
+    )
+
+    err = parse_upstream_error(
+        502, b'{"error":{"code":502,"message":"Bad Gateway","status":""}}'
+    )
+    assert err.kind == "server"
+    mapped = classify_upstream_error(err)
+    assert isinstance(mapped, AnonymousVertexUnavailableError)
+    assert not isinstance(mapped, AnonymousVertexAuthError)
+    assert is_retryable(mapped)
+
+    # Same for a kind="server" raw error (parse path always sets kind).
+    raw = UpstreamVertexError("boom", status_code=502, kind="server")
+    mapped2 = classify_upstream_error(raw)
+    assert isinstance(mapped2, AnonymousVertexUnavailableError)
+    assert is_retryable(mapped2)
+
+
+def test_stream_frame_auth_error_502_still_auth():
+    """Stream-frame auth failures (HTTP 200 + kind="auth") stay auth-class."""
+    from core.errors import is_retryable
+    from providers.anonymous_vertex.errors import UpstreamVertexError
+
+    err = UpstreamVertexError(
+        "Failed to verify action", status_code=502, kind="auth"
+    )
+    mapped = classify_upstream_error(err)
+    assert isinstance(mapped, AnonymousVertexAuthError)
+    assert not is_retryable(mapped)
+
+
+def test_connect_error_maps_to_connection_error():
+    """httpx.ConnectError -> AnonymousVertexConnectionError (ProviderError)."""
+    import httpx
+
+    class ResetClient:
+        async def post(self, url, content=None, headers=None):
+            raise httpx.ConnectError("connection reset")
+
+    provider = AnonymousVertexProvider(
+        http_client=ResetClient(), token_fetcher=_token_fetcher
+    )
+    import asyncio
+
+    with pytest.raises(AnonymousVertexConnectionError):
+        asyncio.run(provider.complete(make_request(), make_resource()))
+
+
+def test_timeout_maps_to_timeout_error():
+    """httpx.ReadTimeout -> core TimeoutError (retryable ProviderError)."""
+    import httpx
+
+    from core.errors import TimeoutError as GatewayTimeoutError
+    from core.errors import is_retryable
+
+    class SlowClient:
+        async def post(self, url, content=None, headers=None):
+            raise httpx.ReadTimeout("timed out")
+
+    provider = AnonymousVertexProvider(
+        http_client=SlowClient(), token_fetcher=_token_fetcher
+    )
+    import asyncio
+
+    with pytest.raises(GatewayTimeoutError) as ei:
+        asyncio.run(provider.complete(make_request(), make_resource()))
+    assert is_retryable(ei.value)
+
+
+def test_midstream_reset_maps_to_connection_error():
+    """A connection reset after headers are received is also classified."""
+    import httpx
+
+    class MidstreamResetResponse:
+        status_code = 200
+        content = b""
+
+        async def aiter_bytes(self):
+            yield b'{"results":[{"data":{"ui":{"streamGenerateContentAnonymous":'
+            raise httpx.ReadError("connection reset mid-stream")
+
+    class ResetClient:
+        async def post(self, url, content=None, headers=None):
+            return MidstreamResetResponse()
+
+    provider = AnonymousVertexProvider(
+        http_client=ResetClient(), token_fetcher=_token_fetcher
+    )
+    import asyncio
+
+    async def run():
+        async for _ in provider.stream(make_request(), make_resource()):
+            pass
+
+    with pytest.raises(AnonymousVertexConnectionError):
+        asyncio.run(run())
+
+
+def test_recaptcha_failure_maps_to_unavailable():
+    """recaptcha anchor/reload failure -> UpstreamUnavailableError.
+
+    A raw RuntimeError escaping the provider would bypass the Scheduler's
+    ProviderError bookkeeping (no cooldown, in_flight leak, no fallback).
+    """
+    import asyncio
+
+    from core.errors import UpstreamUnavailableError, is_retryable
+
+    class FailingRecaptchaClient:
+        async def get(self, url):
+            raise RuntimeError("recaptcha anchor failed: HTTP 500")
+
+        async def post(self, url, content=None, headers=None):
+            raise AssertionError("should not be reached")
+
+    provider = AnonymousVertexProvider(http_client=FailingRecaptchaClient())
+    with pytest.raises(UpstreamUnavailableError) as ei:
+        asyncio.run(provider.complete(make_request(), make_resource()))
+    assert is_retryable(ei.value)
+
+
+def test_scheduler_falls_back_after_connect_error():
+    """Resource A connection-reset -> cooldown bookkeeping -> resource B wins.
+
+    End-to-end Scheduler fallback with the real AnonymousVertexProvider and
+    a mock transport: request 1 fails at the wire level, request 2 succeeds
+    on the second resource without any provider-owned retry logic.
+    """
+    import asyncio
+
+    from core.cooldown import CooldownManager
+    from core.pool import InMemoryPool
+    from core.scheduler import Scheduler
+
+    with open(FIXTURES / "response.json", encoding="utf-8") as f:
+        ok_body = f.read().encode()
+
+    import httpx
+
+    class FlakyClient:
+        def __init__(self):
+            self.calls = 0
+
+        async def post(self, url, content=None, headers=None):
+            self.calls += 1
+            if self.calls == 1:
+                raise httpx.ConnectError("connection reset")
+            return MockResponse(200, ok_body)
+
+    provider = AnonymousVertexProvider(
+        http_client=FlakyClient(), token_fetcher=_token_fetcher
+    )
+    resources = [
+        AnonymousVertexResource(id="r1", provider="anonymous_vertex"),
+        AnonymousVertexResource(id="r2", provider="anonymous_vertex"),
+    ]
+    pool = InMemoryPool(
+        provider="anonymous_vertex",
+        resources=resources,
+        cooldown=CooldownManager(),
+    )
+    scheduler = Scheduler(
+        providers={"anonymous_vertex": provider},
+        pools={"anonymous_vertex": pool},
+        max_retries=2,
+    )
+    resp = asyncio.run(scheduler.chat_completion(make_request()))
+
+    assert "Hello from Anonymous Vertex!" in resp.text
+    r1, r2 = pool.resources
+    assert r1.total_failures == 1
+    assert r1.consecutive_failures == 1  # cooled down, not forgotten
+    assert r2.total_requests == 1
+    assert r1.in_flight == 0 and r2.in_flight == 0  # no leaks
+
+
+
+
+# ---------------------------------------------------------------------------
+# ANON-002: true incremental streaming over the transport boundary
+# ---------------------------------------------------------------------------
+def _frame(payload: dict) -> bytes:
+    """Wrap a Gemini chunk payload into one batchGraphql NDJSON frame."""
+    return json.dumps(
+        {"results": [{"data": {"ui": {"streamGenerateContentAnonymous": payload}}}]}
+    ).encode()
+
+
+_FRAME1_TEXT = "Hello"
+_FRAME2_TEXT = " world"
+_FRAME1 = _frame({"candidates": [{"content": {"role": "model", "parts": [{"text": _FRAME1_TEXT}]}}]})
+_FRAME2 = _frame({
+    "candidates": [{
+        "content": {"role": "model", "parts": [{"text": _FRAME2_TEXT}]},
+        "finishReason": "STOP",
+    }],
+    "usageMetadata": {"promptTokenCount": 3, "candidatesTokenCount": 2, "totalTokenCount": 5},
+})
+
+
+class _StreamResponseFake:
+    """Queue-driven streaming response (httpx-shaped, 200 path).
+
+    Bytes reach ``aiter_bytes()`` only as they are pushed — exactly like a
+    real streaming HTTP body.  ``aread()`` is instrumented so tests can
+    prove the 200 path never buffers the body.
+    """
+
+    def __init__(self, status_code=200, headers=None):
+        self.status_code = status_code
+        self.headers = headers or {}
+        self.closed = False
+        self.aread_calls = 0
+        self._queue = asyncio.Queue()
+
+    async def aiter_bytes(self):
+        while True:
+            item = await self._queue.get()
+            if item is None:
+                return
+            if isinstance(item, Exception):
+                raise item
+            yield item
+
+    async def aread(self):
+        self.aread_calls += 1
+        return b""
+
+    async def aclose(self):
+        self.closed = True
+
+    def push(self, data):
+        self._queue.put_nowait(data)
+
+    def end(self):
+        self._queue.put_nowait(None)
+
+
+class _StaticStreamResponse:
+    """Streaming response with a fixed body (non-200 error responses)."""
+
+    def __init__(self, status_code, body, headers=None):
+        self.status_code = status_code
+        self.headers = headers or {}
+        self._body = body
+        self.closed = False
+        self.aread_calls = 0
+
+    async def aiter_bytes(self):
+        yield self._body
+
+    async def aread(self):
+        self.aread_calls += 1
+        return self._body
+
+    async def aclose(self):
+        self.closed = True
+
+
+class _StreamClientFake:
+    """httpx.AsyncClient-shaped fake: ``stream()`` returns an async context
+    manager yielding the response and closing it on exit — the same shape
+    as ``AsyncClient.stream()``, so ``HttpxTransport`` takes the true
+    streaming path with it."""
+
+    def __init__(self, *responses):
+        self._responses = list(responses)
+        self.stream_calls = 0
+
+    def _next_response(self):
+        if len(self._responses) == 1:
+            return self._responses[0]
+        return self._responses.pop(0)
+
+    def stream(self, method, url, *, content=None, headers=None):
+        self.stream_calls += 1
+        resp = self._next_response()
+
+        @asynccontextmanager
+        async def cm():
+            try:
+                yield resp
+            finally:
+                await resp.aclose()
+
+        return cm()
+
+
+def _streaming_provider(*responses):
+    """Provider whose transport takes the true streaming path."""
+    return AnonymousVertexProvider(
+        http_client=_StreamClientFake(*responses), token_fetcher=_token_fetcher
+    )
+
+
+def test_stream_content_is_incremental_first_token_before_next_chunk():
+    """A+B: the first upstream frame reaches the Provider as soon as its
+    bytes arrive — while the NEXT chunk has not been pushed yet.
+
+    A buffered implementation (transport reading the whole body first)
+    deadlocks this test: ``got_first`` can only be set before frame2 is
+    pushed.
+    """
+    import asyncio
+
+    resp = _StreamResponseFake()
+    provider = _streaming_provider(resp)
+    got_first = asyncio.Event()
+    collected = []
+
+    async def consume():
+        async for chunk in provider.stream(make_request(), make_resource()):
+            collected.append(chunk)
+            if chunk.text and not got_first.is_set():
+                got_first.set()
+
+    async def driver():
+        task = asyncio.create_task(consume())
+        await asyncio.sleep(0)  # let the consumer reach the read point
+        resp.push(_FRAME1)  # frame 1 arrives as ONE network chunk
+        await asyncio.wait_for(got_first.wait(), timeout=2.0)
+        # First token already yielded to the gateway; frame2 not sent yet.
+        assert not any((c.text or "").endswith(_FRAME2_TEXT) for c in collected)
+        resp.push(_FRAME2)
+        resp.end()
+        await asyncio.wait_for(task, timeout=2.0)
+
+    asyncio.run(driver())
+    texts = [c.text for c in collected if c.text]
+    assert texts == [_FRAME1_TEXT, _FRAME2_TEXT]
+    assert resp.aread_calls == 0  # 200 path never buffers the body
+    assert resp.closed
+
+
+def test_partial_json_chunks_are_parsed_incrementally():
+    """A: a frame split across two network chunks parses only once complete,
+    and the first token still arrives before the next frame is pushed."""
+    import asyncio
+
+    resp = _StreamResponseFake()
+    provider = _streaming_provider(resp)
+    got_first = asyncio.Event()
+    collected = []
+
+    async def consume():
+        async for chunk in provider.stream(make_request(), make_resource()):
+            collected.append(chunk)
+            if chunk.text and not got_first.is_set():
+                got_first.set()
+
+    async def driver():
+        task = asyncio.create_task(consume())
+        await asyncio.sleep(0)
+        raw = _FRAME1
+        split = len(raw) // 2
+        resp.push(raw[:split])  # partial JSON only
+        await asyncio.sleep(0.02)
+        assert not collected, "no chunk may be produced from a torn frame"
+        resp.push(raw[split:])  # rest of the same frame
+        await asyncio.wait_for(got_first.wait(), timeout=2.0)
+        resp.push(_FRAME2)
+        resp.end()
+        await asyncio.wait_for(task, timeout=2.0)
+
+    asyncio.run(driver())
+    assert [c.text for c in collected if c.text] == [_FRAME1_TEXT, _FRAME2_TEXT]
+    assert resp.closed
+
+
+def test_midstream_disconnect_maps_to_connection_error():
+    """C: chunk1, torn chunk2, connection reset -> ConnectionError."""
+    import asyncio
+
+    import httpx
+
+    resp = _StreamResponseFake()
+    resp.push(_FRAME1)
+    resp.push(_FRAME2[: len(_FRAME2) // 2])  # next frame, torn
+    resp.push(httpx.ReadError("connection reset mid-stream"))
+    provider = _streaming_provider(resp)
+
+    async def run():
+        chunks = []
+        with pytest.raises(AnonymousVertexConnectionError):
+            async for c in provider.stream(make_request(), make_resource()):
+                chunks.append(c)
+        return chunks
+
+    chunks = asyncio.run(run())
+    assert [c.text for c in chunks if c.text] == [_FRAME1_TEXT]
+
+
+def test_midstream_disconnect_releases_resource_and_pool_stays_usable():
+    """C: after a mid-stream disconnect the resource is released
+    (``in_flight`` back to 0, no leak) and the pool serves the next
+    request normally."""
+    import asyncio
+
+    import httpx
+
+    dead = _StreamResponseFake()
+    dead.push(_FRAME1)
+    dead.push(httpx.ReadError("connection reset mid-stream"))
+    healthy = _StreamResponseFake()
+    healthy.push(_FRAME1)
+    healthy.push(_FRAME2)
+    healthy.end()
+    provider = _streaming_provider(dead, healthy)
+
+    from core.cooldown import CooldownManager
+    from core.pool import InMemoryPool
+    from core.scheduler import Scheduler
+
+    resource = AnonymousVertexResource(id="r1", provider="anonymous_vertex")
+    pool = InMemoryPool(
+        provider="anonymous_vertex", resources=[resource], cooldown=CooldownManager()
+    )
+    scheduler = Scheduler(
+        providers={"anonymous_vertex": provider},
+        pools={"anonymous_vertex": pool},
+        max_retries=2,
+    )
+
+    async def run():
+        with pytest.raises(AnonymousVertexConnectionError):
+            async for _ in scheduler.stream_chat(make_request()):
+                pass
+        assert resource.in_flight == 0  # no leak after the failure
+        return await scheduler.chat_completion(make_request())
+
+    result = asyncio.run(run())
+    assert _FRAME1_TEXT in result.text
+    assert resource.in_flight == 0
+
+
+def test_disconnect_before_first_chunk_falls_back_to_next_resource():
+    """C: a connection reset before any parsed chunk lets the Scheduler
+    fall back to resource B; no ``in_flight`` leaks on either resource."""
+    import asyncio
+
+    import httpx
+
+    dead = _StreamResponseFake()
+    dead.push(httpx.ReadError("connection reset before first chunk"))
+    healthy = _StreamResponseFake()
+    healthy.push(_FRAME1)
+    healthy.push(_FRAME2)
+    healthy.end()
+    provider = _streaming_provider(dead, healthy)
+
+    from core.cooldown import CooldownManager
+    from core.pool import InMemoryPool
+    from core.scheduler import Scheduler
+
+    r1 = AnonymousVertexResource(id="r1", provider="anonymous_vertex")
+    r2 = AnonymousVertexResource(id="r2", provider="anonymous_vertex")
+    pool = InMemoryPool(
+        provider="anonymous_vertex", resources=[r1, r2], cooldown=CooldownManager()
+    )
+    scheduler = Scheduler(
+        providers={"anonymous_vertex": provider},
+        pools={"anonymous_vertex": pool},
+        max_retries=2,
+    )
+
+    async def run():
+        chunks = []
+        async for chunk in scheduler.stream_chat(make_request()):
+            chunks.append(chunk)
+        return chunks
+
+    chunks = asyncio.run(run())
+    texts = "".join(c.text for c in chunks if c.text)
+    assert _FRAME1_TEXT in texts
+    assert r1.total_failures == 1
+    assert r1.in_flight == 0 and r2.in_flight == 0
+
+
+def test_normal_eof_yields_single_terminal_finish_chunk():
+    """D: normal EOF — parser ends, the response is closed, and exactly one
+    terminal (empty-delta) finish chunk is emitted with nothing after it."""
+    import asyncio
+
+    resp = _StreamResponseFake()
+    resp.push(_FRAME1)
+    resp.push(_FRAME2)
+    resp.end()
+    provider = _streaming_provider(resp)
+
+    async def run():
+        chunks = []
+        async for c in provider.stream(make_request(), make_resource()):
+            chunks.append(c)
+        return chunks
+
+    chunks = asyncio.run(run())
+    assert [c.text for c in chunks if c.text] == [_FRAME1_TEXT, _FRAME2_TEXT]
+    terminal = [c for c in chunks if c.finish_reason and not c.text]
+    assert len(terminal) == 1  # exactly one terminal finish chunk
+    assert terminal[0] is chunks[-1]  # nothing follows it
+    assert chunks[-1].finish_reason == "stop"
+    assert chunks[-1].usage is not None
+    assert resp.aread_calls == 0 and resp.closed
+
+
+def test_stream_error_status_via_streaming_transport():
+    """E: 429 + Retry-After / 502 / 503 keep their classification through
+    the streaming transport (small error body read, response closed)."""
+    import asyncio
+
+    from providers.anonymous_vertex.errors import AnonymousVertexUnavailableError
+
+    r429 = _StaticStreamResponse(
+        429,
+        b'{"error":{"code":429,"message":"rate","status":"RESOURCE_EXHAUSTED"}}',
+        headers={"Retry-After": "7"},
+    )
+    r502 = _StaticStreamResponse(502, b'{"error":{"code":502,"message":"bad gateway"}}')
+    r503 = _StaticStreamResponse(503, b'{"error":{"code":503,"message":"unavailable"}}')
+    provider = _streaming_provider(r429, r502, r503)
+
+    async def run():
+        with pytest.raises(AnonymousVertexRateLimitError) as ei:
+            await provider.complete(make_request(), make_resource())
+        assert ei.value.retry_after == 7.0
+        assert r429.aread_calls == 1 and r429.closed
+
+        with pytest.raises(AnonymousVertexUnavailableError):
+            await provider.complete(make_request(), make_resource())
+        assert r502.closed
+
+        with pytest.raises(AnonymousVertexUnavailableError):
+            await provider.complete(make_request(), make_resource())
+        assert r503.closed
+
+    asyncio.run(run())
+
+
+def test_cancellation_closes_stream_response():
+    """F: cancelling a consumer parked mid-stream closes the HTTP response."""
+    import asyncio
+    import contextlib
+
+    resp = _StreamResponseFake()  # no data ever: consumer blocks on read
+    closed_by_cancel = asyncio.Event()
+    provider = _streaming_provider(resp)
+
+    async def consume():
+        try:
+            async for _ in provider.stream(make_request(), make_resource()):
+                pass
+        finally:
+            if resp.closed:
+                closed_by_cancel.set()
+
+    async def run():
+        task = asyncio.create_task(consume())
+        await asyncio.sleep(0.05)  # consumer is now parked on the body read
+        assert not resp.closed
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=2.0)
+        await asyncio.wait_for(closed_by_cancel.wait(), timeout=2.0)
+
+    asyncio.run(run())
+    assert resp.closed
+
+
+def test_stream_entry_connect_error_maps_to_connection_error():
+    """A connect failure raised while opening the stream is classified."""
+    import asyncio
+
+    import httpx
+
+    class _ConnectFailClient:
+        def stream(self, method, url, *, content=None, headers=None):
+            @asynccontextmanager
+            async def cm():
+                raise httpx.ConnectError("no route to host")
+                yield  # pragma: no cover
+
+            return cm()
+
+    provider = AnonymousVertexProvider(
+        http_client=_ConnectFailClient(), token_fetcher=_token_fetcher
+    )
+
+    async def run():
+        async for _ in provider.stream(make_request(), make_resource()):
+            pass
+
+    with pytest.raises(AnonymousVertexConnectionError):
+        asyncio.run(run())
+
+
+def test_stream_timeout_maps_to_timeout_error():
+    """A read stall mid-stream maps to the retryable TimeoutError."""
+    import asyncio
+
+    import httpx
+
+    resp = _StreamResponseFake()
+    resp.push(_FRAME1)
+    resp.push(httpx.ReadTimeout("timed out mid-stream"))
+    provider = _streaming_provider(resp)
+
+    from core.errors import TimeoutError as GatewayTimeoutError
+
+    async def run():
+        async for _ in provider.stream(make_request(), make_resource()):
+            pass
+
+    with pytest.raises(GatewayTimeoutError):
+        asyncio.run(run())

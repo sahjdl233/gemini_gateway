@@ -26,7 +26,7 @@ def vertex_response_to_chat_response(
             continue
         fr = cand.get("finishReason", "")
         if fr and fr != "FINISH_REASON_UNSPECIFIED":
-            finish_reason = _map_finish_reason(fr)
+            finish_reason = map_finish_reason(fr)
         content = cand.get("content", {})
         parts = content.get("parts", []) if isinstance(content, dict) else []
         for p in parts:
@@ -58,7 +58,7 @@ def vertex_chunk_to_chat_chunk(
             continue
         fr = cand.get("finishReason", "")
         if fr and fr != "FINISH_REASON_UNSPECIFIED":
-            finish_reason = _map_finish_reason(fr)
+            finish_reason = map_finish_reason(fr)
         content = cand.get("content", {})
         parts = content.get("parts", []) if isinstance(content, dict) else []
         for p in parts:
@@ -93,7 +93,12 @@ _FINISH_MAP = {
 }
 
 
-def _map_finish_reason(fr: str) -> str:
+def map_finish_reason(fr: str) -> str:
+    """Map an upstream finishReason to the OpenAI vocabulary.
+
+    Public because the Provider's terminal streaming chunk needs the same
+    mapping as the per-candidate conversion (ANON-002).
+    """
     return _FINISH_MAP.get(fr.upper().strip(), "stop")
 
 

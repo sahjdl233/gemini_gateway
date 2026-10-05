@@ -35,6 +35,7 @@ from core.resource import Resource
 from providers.anonymous_vertex.client import AnonymousVertexClient
 from providers.anonymous_vertex.request import chat_to_vertex_request
 from providers.anonymous_vertex.response import (
+    map_finish_reason,
     vertex_chunk_to_chat_chunk,
     vertex_response_to_chat_response,
 )
@@ -121,7 +122,17 @@ class AnonymousVertexProvider(Provider):
         from providers.anonymous_vertex.recaptcha import fetch_recaptcha_token
 
         http = await self._ensure_http()
-        return await fetch_recaptcha_token(client=http)
+        try:
+            return await fetch_recaptcha_token(client=http)
+        except Exception as exc:
+            # A failed anchor/reload flow is a transient upstream-side
+            # failure; surface it as a retryable ProviderError so the
+            # Scheduler cools the resource down and falls back instead of
+            # leaking a raw RuntimeError (which is not a ProviderError and
+            # would skip failure bookkeeping entirely).
+            raise UpstreamUnavailableError(
+                f"recaptcha token fetch failed: {exc}", provider="anonymous_vertex"
+            ) from exc
 
     # -- Provider interface --
 
@@ -224,7 +235,7 @@ class AnonymousVertexProvider(Provider):
                     response_id=response_id,
                 )
                 if final is not None:
-                    final.finish_reason = fr
+                    final.finish_reason = map_finish_reason(fr)
                     yield final
                 return
 

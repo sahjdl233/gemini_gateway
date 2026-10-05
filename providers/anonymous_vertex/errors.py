@@ -89,7 +89,11 @@ def classify_upstream_error(err: UpstreamVertexError) -> ProviderError:
             scope="resource",
             retry_after=retry_after,
         )
-    if err.kind == "auth" or err.status_code in (401, 502):
+    # 502 belongs to Unavailable below (docs/anonymous-vertex-protocol.md
+    # error table: "network / 502 -> UpstreamUnavailableError"). Only a
+    # stream-frame auth failure (kind="auth", HTTP 200 + "Failed to verify
+    # action") or a genuine 401 is an authentication error.
+    if err.kind == "auth" or err.status_code == 401:
         return AnonymousVertexAuthError(msg, provider=provider)
     if err.kind == "permission" or err.status_code == 403:
         return AuthorizationError(msg, provider=provider)
