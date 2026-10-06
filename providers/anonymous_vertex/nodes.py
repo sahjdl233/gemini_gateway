@@ -39,7 +39,6 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
 from providers.anonymous_vertex.admission import NodeAdmissionState
-from providers.anonymous_vertex.admission_state import AdmissionStateProvider
 from providers.anonymous_vertex.client import AnonymousVertexClient
 from providers.anonymous_vertex.node_definitions import (
     NodeDefinition,
@@ -48,6 +47,37 @@ from providers.anonymous_vertex.node_definitions import (
 from providers.anonymous_vertex.transport import HttpxTransport
 
 logger = logging.getLogger(__name__)
+
+
+class AdmissionProjection:
+    """The pool's LOCAL admission runtime view (ANON-011-C).
+
+    Push-only projection of the admission world: entries are written via
+    :meth:`update` (through ``AnonymousVertexNodePool.update_admission_state``)
+    and read synchronously inside ``acquire()`` -- the pool never queries an
+    external store or async provider while holding its scheduling lock.
+
+    Semantics are explicit: this object's PRESENCE on the pool enables
+    admission-aware mode (a node is a candidate only after a READY push);
+    its ABSENCE means legacy mode (no admission filtering at all).  A node
+    missing from the mapping has never been admitted -- it is NOT a
+    candidate.  This is pool-internal runtime state: not an ExecutionNode
+    field, not a NodeDefinition field, not persisted.
+    """
+
+    def __init__(self) -> None:
+        self._states = {}
+
+    def is_admitted(self, node_id: str) -> bool:
+        """True only for nodes whose latest pushed state is READY."""
+        return self._states.get(node_id) == NodeAdmissionState.READY
+
+    def update(self, node_id: str, state: NodeAdmissionState) -> None:
+        self._states[node_id] = state
+
+    def snapshot(self):
+        """Read-only copy for observability/tests."""
+        return dict(self._states)
 
 
 @dataclass
@@ -344,7 +374,7 @@ class AnonymousVertexNodePool:
         *,
         policy: Optional[CooldownPolicy] = None,
         now_fn: Optional[Callable[[], float]] = None,
-        admission_state_provider: Optional[AdmissionStateProvider] = None,
+        admission_projection: Optional[AdmissionProjection] = None,
     ) -> None:
         if not nodes:
             raise ValueError("node pool requires at least one node")
@@ -352,11 +382,13 @@ class AnonymousVertexNodePool:
         self._policy = policy or CooldownPolicy()
         self.now = now_fn or time.monotonic
         self._lock = asyncio.Lock()
-        # ANON-011-B: optional admission eligibility view.  None keeps the
-        # pool's behaviour byte-for-byte identical to the pre-admission
-        # semantics; a provider adds a READ-ONLY "must be READY" gate on
-        # top of the runtime checks — it never mutates node state.
-        self._admission_provider = admission_state_provider
+        self._node_ids = frozenset(n.node_id for n in self._nodes)
+        # ANON-011-C: local admission projection (push + read-local).
+        # None = legacy mode: behaviour identical to the pre-admission
+        # pool.  A projection enables admission-aware mode: a node is a
+        # candidate only after an explicit READY push via
+        # ``update_admission_state`` (which notifies capacity waiters).
+        self._admission = admission_projection
         # Shares the pool lock: notify_all() is legal from any block that
         # holds self._lock (release / record_*).
         self._condition = asyncio.Condition(lock=self._lock)
@@ -370,14 +402,15 @@ class AnonymousVertexNodePool:
         policy: Optional[CooldownPolicy] = None,
         now_fn: Optional[Callable[[], float]] = None,
         default_http_client: Any = None,
-        admission_state_provider: Optional[AdmissionStateProvider] = None,
+        admission_projection: Optional[AdmissionProjection] = None,
     ) -> "AnonymousVertexNodePool":
         """Build a pool from static specs.
 
         ``default_http_client`` (compat/test injection) is wired into the
         FIRST node; every node still owns its own transport lifecycle.
-        ``admission_state_provider`` optionally gates candidate selection
-        on admission eligibility (READY only).
+        ``admission_projection`` optionally enables admission-aware
+        candidate selection (READY only, pushed via
+        ``update_admission_state``).
         """
         nodes = []
         for i, spec in enumerate(specs):
@@ -392,7 +425,7 @@ class AnonymousVertexNodePool:
             nodes,
             policy=policy,
             now_fn=now_fn,
-            admission_state_provider=admission_state_provider,
+            admission_projection=admission_projection,
         )
 
     # -- introspection --
@@ -454,35 +487,40 @@ class AnonymousVertexNodePool:
             key=lambda n: (n.current_in_flight, -n.weight),
         )
 
-    async def _filter_admitted(
-        self, nodes: List[ExecutionNode]
-    ) -> List[ExecutionNode]:
-        """Keep only nodes whose latest admission state is READY.
+    async def update_admission_state(
+        self, node_id: str, state: NodeAdmissionState
+    ) -> None:
+        """Push an admission outcome into the pool's local projection.
 
-        Read-only: node runtime state is never touched.  A provider
-        failure or a missing state (None) means NOT admitted — fail-closed,
-        since admission is an eligibility gate.  Without a provider this
-        is the identity filter.
+        The pool-side half of the ANON-011-C architecture::
+
+            Admission state update
+                -> NodePool.update_admission_state(...)
+                -> _condition.notify_all()
+
+        Only the projection changes -- ExecutionNode runtime state and
+        NodeDefinition are untouched, and only READY makes a node
+        selectable (every other state, and "never pushed", is not a
+        candidate).  Waiters blocked in ``acquire(wait_for_capacity=True)``
+        are woken immediately and re-check the full predicate, so a node
+        becoming READY is usable without waiting for the next release.
+
+        Raises RuntimeError when the pool is in legacy mode (no
+        projection) and KeyError for an unknown node_id -- neither is
+        silently ignored.
         """
-        provider = self._admission_provider
-        if provider is None:
-            return nodes
-        states = await asyncio.gather(
-            *(provider.get_state(n.node_id) for n in nodes),
-            return_exceptions=True,
-        )
-        admitted = []
-        for node, state in zip(nodes, states):
-            if isinstance(state, BaseException):
-                logger.warning(
-                    "node_pool.admission_provider_error node=%s error=%s",
-                    node.node_id,
-                    state,
-                )
-                continue
-            if state == NodeAdmissionState.READY:
-                admitted.append(node)
-        return admitted
+        if self._admission is None:
+            raise RuntimeError(
+                "node pool is not admission-aware: construct it with an "
+                "AdmissionProjection to enable update_admission_state"
+            )
+        if not isinstance(state, NodeAdmissionState):
+            raise ValueError(f"invalid admission state: {state!r}")
+        async with self._lock:
+            if node_id not in self._node_ids:
+                raise KeyError(f"unknown node: {node_id}")
+            self._admission.update(node_id, state)
+            self._condition.notify_all()
 
     async def acquire(
         self,
@@ -503,9 +541,12 @@ class AnonymousVertexNodePool:
         call WAITS when healthy untried nodes exist but are all at
         ``max_concurrency`` — it never waits for cooldowns, disabled or
         reCAPTCHA-failed nodes, and never returns while execution capacity
-        is idle.  Every state change (release, cooldowns, admission)
-        notifies waiters, which re-check the full predicate under the
-        pool lock; ``max_concurrency`` can never be exceeded.
+        is idle.  State changes notify waiters, which re-check the full
+        predicate under the pool lock: releases/cooldowns notify directly,
+        and admission changes notify through
+        :meth:`update_admission_state` (the pool reads its LOCAL
+        projection here -- acquire() never awaits an external store or
+        provider).  ``max_concurrency`` can never be exceeded.
         """
         skip = skip or frozenset()
         async with self._condition:  # holds self._lock
@@ -514,11 +555,17 @@ class AnonymousVertexNodePool:
                 healthy = [
                     n for n in self._nodes if self._healthy(n, now)
                 ]
-                # ANON-011-B: admission eligibility ANDs with the runtime
-                # checks above.  Non-READY nodes drop out of BOTH the
-                # capacity-wait candidates and the reuse candidates, so a
-                # FAILED / QUARANTINED node can never be waited on.
-                healthy = await self._filter_admitted(healthy)
+                # ANON-011-C: admission eligibility ANDs with the runtime
+                # checks above, read from the LOCAL projection (sync, no
+                # external await under the scheduling lock).  Non-READY
+                # nodes drop out of BOTH the capacity-wait candidates and
+                # the reuse candidates, so a FAILED / QUARANTINED /
+                # never-admitted node can never be waited on.
+                if self._admission is not None:
+                    healthy = [
+                        n for n in healthy
+                        if self._admission.is_admitted(n.node_id)
+                    ]
                 untried = [n for n in healthy if n.node_id not in skip]
                 tried = [n for n in healthy if n.node_id in skip]
 

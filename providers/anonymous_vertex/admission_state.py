@@ -1,17 +1,16 @@
-"""Admission state read-view for the node pool (ANON-011-B).
+"""External admission read-model adapter (ANON-011-B, re-scoped 011-C).
 
-Minimal read-only boundary between the admission world and the
-AnonymousVertexNodePool::
+The pool's admission gate is now a LOCAL projection fed by pushes
+(``AnonymousVertexNodePool.update_admission_state``); the pool never
+queries anything here at acquire time.  This module keeps the read-only
+lookup abstraction for its remaining role: EXTERNAL consumers and
+bootstrap flows that need to read admission state from a result store
+(e.g. seeding a projection from persisted results, admin/observability
+read models).
 
-    AdmissionStateProvider  (read-only Protocol consumed by the pool)
-             ^
-             |
-    StoreAdmissionStateProvider  (adapter over an AdmissionResultStore)
+    AdmissionResultStore  --(adapter)-->  get_state(node_id)
 
-The pool depends ONLY on the Protocol: it must never import the concrete
-store.  The provider answers one question per node_id — "what is the
-node's latest admission state?" — and never mutates anything.  A missing
-state (``None``) means "never admitted", i.e. not a candidate.
+Read-only by contract: nothing here mutates a store, a node or a pool.
 """
 
 from __future__ import annotations
