@@ -425,6 +425,14 @@ def create_app(
     @asynccontextmanager
     async def lifespan(app_: FastAPI) -> AsyncIterator[None]:
         try:
+            # ANON-012: providers may own background lifecycles (e.g. the
+            # anonymous_vertex admission scheduler).  Start them AFTER the
+            # runtime is built and BEFORE the first request, via an
+            # optional hook — generic getattr, no provider-specific import.
+            for provider in scheduler.providers.values():
+                start = getattr(provider, "start_admission", None)
+                if start is not None:
+                    await start()
             yield
         finally:
             for provider in scheduler.providers.values():

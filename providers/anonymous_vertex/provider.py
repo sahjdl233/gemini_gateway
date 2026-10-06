@@ -41,6 +41,7 @@ touch the core ResourcePool / scheduler health.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from typing import Any, AsyncIterator, List, Optional
@@ -55,7 +56,18 @@ from core.models import ChatChunk, ChatRequest, ChatResponse, ModelInfo
 from core.provider import Provider
 from core.resource import Resource
 
+from providers.anonymous_vertex.admission_orchestrator import (
+    AdmissionOrchestrator,
+)
+from providers.anonymous_vertex.admission_scheduler import AdmissionScheduler
+from providers.anonymous_vertex.admission_sink import AdmissionResultSink
+from providers.anonymous_vertex.admission_store import (
+    InMemoryAdmissionResultStore,
+)
+
+from providers.anonymous_vertex.node_definitions import NodeDefinition
 from providers.anonymous_vertex.nodes import (
+    AdmissionProjection,
     AnonymousVertexNodePool,
     CooldownPolicy,
     ExecutionNode,
@@ -100,6 +112,10 @@ TEXT_MODELS = [
 #: Per-request node-attempt budget (each attempt binds exactly one node).
 DEFAULT_MAX_NODE_ATTEMPTS = 3
 
+#: Admission re-check interval / concurrency defaults (ANON-012).
+DEFAULT_ADMISSION_INTERVAL_SECONDS = 300.0
+DEFAULT_ADMISSION_MAX_CONCURRENCY = 5
+
 
 class _RecaptchaAttemptFailure(Exception):
     """Internal: the reCAPTCHA step of this attempt failed (node recorded)."""
@@ -120,23 +136,142 @@ class AnonymousVertexProvider(Provider):
         token_fetcher=None,
         models: Optional[List[str]] = None,
         node_specs: Optional[List[NodeSpec]] = None,
+        node_definitions: Optional[List[NodeDefinition]] = None,
         node_pool: Optional[AnonymousVertexNodePool] = None,
         cooldown_policy: Optional[CooldownPolicy] = None,
         max_node_attempts: int = DEFAULT_MAX_NODE_ATTEMPTS,
+        admission_orchestrator: Optional[AdmissionOrchestrator] = None,
+        admission_interval_seconds: float = (
+            DEFAULT_ADMISSION_INTERVAL_SECONDS
+        ),
+        admission_max_concurrency: int = DEFAULT_ADMISSION_MAX_CONCURRENCY,
     ) -> None:
         self.api_key = api_key or ANON_API_KEY
         self._token_fetcher = token_fetcher
         self._models = list(models) if models else list(TEXT_MODELS)
         self._max_node_attempts = max(1, int(max_node_attempts))
+        self._admission_start_lock: Optional[asyncio.Lock] = None
+        self._admission_started = False
+        self._admission_stopped = False
+
         if node_pool is not None:
+            # Test-only injection: a caller-built pool runs in legacy mode
+            # (no admission projection) and owns its own wiring.
             self.node_pool = node_pool
-        else:
-            self.node_pool = AnonymousVertexNodePool.from_specs(
-                node_specs or [NodeSpec(node_id="default")],
-                api_key=self.api_key,
+            self.node_definitions: List[NodeDefinition] = []
+            self.admission_projection = None
+            self.admission_store = None
+            self.admission_sink = None
+            self._admission_scheduler = None
+            self._admission_orchestrator = admission_orchestrator
+            return
+
+        if node_definitions is not None:
+            # Production construction path (ANON-012): ExecutionNodes AND
+            # the AdmissionScheduler are built from the SAME
+            # NodeDefinition objects — one store, one projection, one
+            # sink, one scheduler per provider instance.
+            self.node_definitions = list(node_definitions)
+            self.admission_projection = AdmissionProjection()
+            self.admission_store = InMemoryAdmissionResultStore()
+            nodes = [
+                ExecutionNode.from_definition(
+                    definition, api_key=self.api_key
+                )
+                for definition in self.node_definitions
+            ]
+            self.node_pool = AnonymousVertexNodePool(
+                nodes,
                 policy=cooldown_policy,
-                default_http_client=http_client,
+                admission_projection=self.admission_projection,
             )
+            self.admission_sink = AdmissionResultSink(
+                self.admission_store, self.node_pool
+            )
+            self._admission_orchestrator = (
+                admission_orchestrator
+                if admission_orchestrator is not None
+                else self._build_default_admission_orchestrator()
+            )
+            self._admission_interval_seconds = float(
+                admission_interval_seconds
+            )
+            self._admission_max_concurrency = int(admission_max_concurrency)
+            # The scheduler OBJECT is created at start_admission() so it
+            # binds the orchestrator current at start time (wire -> start,
+            # ANON-012 section 6); everything it needs already exists.
+            self._admission_scheduler = None
+            return
+
+        # Legacy / test construction (NodeSpec or bare default): no
+        # admission stack, behaviour identical to pre-ANON-012 providers.
+        self.node_definitions = []
+        self.admission_projection = None
+        self.admission_store = None
+        self.admission_sink = None
+        self._admission_scheduler = None
+        self._admission_orchestrator = None
+        self.node_pool = AnonymousVertexNodePool.from_specs(
+            node_specs or [NodeSpec(node_id="default")],
+            api_key=self.api_key,
+            policy=cooldown_policy,
+            default_http_client=http_client,
+        )
+
+    def _build_default_admission_orchestrator(self) -> AdmissionOrchestrator:
+        """Real checker pipeline over one shared admission probe client."""
+        from transport.http import build_client
+        from transport.proxy import TransportConfig
+        from providers.anonymous_vertex.checkers import (
+            AnonymousVertexAuthChecker,
+            AnonymousVertexCapabilityChecker,
+            AnonymousVertexConnectivityChecker,
+        )
+
+        self._admission_probe_client = build_client(
+            TransportConfig(timeout_seconds=30.0)
+        )
+        return AdmissionOrchestrator([
+            AnonymousVertexConnectivityChecker(self._admission_probe_client),
+            AnonymousVertexCapabilityChecker(self._admission_probe_client),
+            AnonymousVertexAuthChecker(self._admission_probe_client),
+        ])
+
+    @property
+    def admission_scheduler(self) -> Optional[AdmissionScheduler]:
+        return self._admission_scheduler
+
+    @property
+    def admission_running(self) -> bool:
+        if self._admission_scheduler is None:
+            return False
+        return self._admission_scheduler.running
+
+    async def start_admission(self) -> None:
+        """Start the background admission scheduler (idempotent).
+
+        Called by the application lifespan on startup; safe to call again.
+        After :meth:`close` the scheduler is never restarted on this
+        provider instance.
+        """
+        if self._admission_orchestrator is None:
+            return  # legacy provider: no admission stack to start
+        if self._admission_started:
+            return
+        if self._admission_start_lock is None:
+            self._admission_start_lock = asyncio.Lock()
+        async with self._admission_start_lock:
+            if self._admission_started or self._admission_stopped:
+                return
+            self._admission_scheduler = AdmissionScheduler(
+                self._admission_orchestrator,
+                self.node_definitions,
+                interval_seconds=self._admission_interval_seconds,
+                max_concurrency=self._admission_max_concurrency,
+                result_sink=self.admission_sink,
+            )
+            self._admission_started = True
+            await self._admission_scheduler.start()
 
     # -- lifecycle / compat wiring (tests) --
 
@@ -151,6 +286,19 @@ class AnonymousVertexProvider(Provider):
         self._token_fetcher = fetcher
 
     async def close(self) -> None:
+        """Stop the admission scheduler (no residual background tasks) and
+        close every node transport.  Idempotent."""
+        self._admission_stopped = True
+        if self._admission_scheduler is not None:
+            await self._admission_scheduler.stop()
+        probe = getattr(self, "_admission_probe_client", None)
+        if probe is not None:
+            aclose = getattr(probe, "aclose", None)
+            if aclose is not None:
+                try:
+                    await aclose()
+                except Exception:  # noqa: BLE001 - shutdown best-effort
+                    pass
         for node in self.node_pool.nodes:
             await node.close()
 
