@@ -14,7 +14,7 @@ from providers.anonymous_vertex.checkers import (
 )
 from providers.anonymous_vertex.node_definitions import NodeDefinition
 
-_PROBE_PATH = "/v1internal:generateContent"
+from providers.anonymous_vertex.checkers.capability import _PROBE_URL
 
 
 class FakeResponse:
@@ -73,7 +73,7 @@ async def test_valid_capability_response_is_ready():
     assert result.reason is None
     assert result.checked_at.tzinfo is not None
     (call,) = client.calls
-    assert call["url"] == "https://162.159.198.1:443" + _PROBE_PATH
+    assert call["url"] == _PROBE_URL  # the REAL batchGraphql endpoint
     assert call["timeout"] == 15.0
 
 
@@ -202,10 +202,14 @@ async def test_definition_is_never_mutated():
     assert node.to_dict() == before
 
 
-async def test_unprobeable_endpoint_fails_without_client_call():
-    client = FakeHttpClient([FakeResponse(200, body={"candidates": []})])
-    checker = _checker(client)
-    result = await checker.check(NodeDefinition(node_id="n", proxy={}))
-    assert result.state == NodeAdmissionState.FAILED
-    assert result.reason == "invalid_endpoint"
-    assert client.calls == []
+async def test_client_factory_routes_through_node_egress():
+    seen = []
+
+    def factory(node):
+        seen.append(node.node_id)
+        return FakeHttpClient([FakeResponse(200, body={"candidates": []})])
+
+    checker = AnonymousVertexCapabilityChecker(client_factory=factory)
+    result = await checker.check(_node())
+    assert result.state == NodeAdmissionState.READY
+    assert seen == ["node-a"]

@@ -98,14 +98,7 @@ async def test_anonymous_vertex_full_chain_first_discovery():
     scheduler = build_runtime(_anon_config(models=["gemini-3.8-flash"]))
     assert scheduler.model_registry.last_refresh is None  # never refreshed yet
 
-    # ANON-012: production providers are admission-aware; admit the
-    # default node so the request path can reach it.
-    from providers.anonymous_vertex.admission import NodeAdmissionState
-
-    await scheduler.providers[
-        "anonymous_vertex"
-    ].node_pool.update_admission_state("default", NodeAdmissionState.READY)
-
+    # no node_pool config -> legacy default-direct path (no admission)
     provider = scheduler.providers["anonymous_vertex"]
     fixture = (
         Path(__file__).parent.parent

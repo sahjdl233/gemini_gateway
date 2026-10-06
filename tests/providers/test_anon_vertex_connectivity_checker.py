@@ -16,6 +16,9 @@ from providers.anonymous_vertex.admission_policy import (
 from providers.anonymous_vertex.checkers import (
     AnonymousVertexConnectivityChecker,
 )
+from providers.anonymous_vertex.checkers.connectivity import (
+    CONNECTIVITY_PROBE_URL,
+)
 from providers.anonymous_vertex.node_definitions import NodeDefinition
 
 
@@ -74,7 +77,7 @@ async def test_http_200_is_ready():
     assert result.reason is None
     assert result.checked_at.tzinfo is not None
     assert client.calls == [
-        ("HEAD", "https://162.159.198.1:443/", 10.0),
+        ("HEAD", CONNECTIVITY_PROBE_URL, 10.0),
     ]
 
 
@@ -167,19 +170,34 @@ async def test_checker_uses_injected_client_only():
     client = FakeHttpClient([200])
     checker = _checker(client, timeout_seconds=3.5)
     await checker.check(_node())
-    assert client.calls[0] == ("HEAD", "https://162.159.198.1:443/", 3.5)
+    assert client.calls[0] == ("HEAD", CONNECTIVITY_PROBE_URL, 3.5)
     # no internal client was created: the injected instance served the call
     assert checker._http is client
 
 
-async def test_unprobeable_endpoint_fails_without_client_call():
-    client = FakeHttpClient([200])
-    for proxy in ({}, {"scheme": "https"}, {"scheme": "https", "host": "h"},
-                  {"scheme": "direct", "host": "h", "port": 1}):
-        result = await _checker(client).check(_node(proxy))
-        assert result.state == NodeAdmissionState.FAILED
-        assert result.reason == "invalid_endpoint"
-    assert client.calls == []  # client never touched
+async def test_client_factory_routes_each_node_through_its_own_egress():
+    """Per-node real transports: the factory receives the node definition
+    and the checker probes through whatever client it returns (a direct
+    node and a socks5 node never share an egress client)."""
+    seen = []
+
+    def factory(node):
+        seen.append(node.node_id)
+        return FakeHttpClient([200])
+
+    checker = AnonymousVertexConnectivityChecker(client_factory=factory)
+    assert (await checker.check(_node())).state == NodeAdmissionState.READY
+    assert seen == ["node-a"]  # factory got the node, not a URL string
+
+
+async def test_factory_failure_is_classified_not_fatal():
+    def factory(node):
+        raise RuntimeError("no egress available")
+
+    checker = AnonymousVertexConnectivityChecker(client_factory=factory)
+    result = await checker.check(_node())
+    assert result.state == NodeAdmissionState.FAILED
+    assert result.reason.startswith("checker_error")
 
 
 async def test_definition_is_never_mutated():

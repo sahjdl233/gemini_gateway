@@ -18,7 +18,7 @@ from providers.anonymous_vertex.checkers import AnonymousVertexAuthChecker
 from providers.anonymous_vertex.checkers.auth import classify_auth_response
 from providers.anonymous_vertex.node_definitions import NodeDefinition
 
-_PROBE_PATH = "/v1internal:generateContent"
+from providers.anonymous_vertex.checkers.auth import _PROBE_URL
 
 
 class FakeResponse:
@@ -72,7 +72,7 @@ async def test_anonymous_success_is_ready():
     assert result.state == NodeAdmissionState.READY
     assert result.reason is None
     (call,) = client.calls
-    assert call["url"] == "https://162.159.198.1:443" + _PROBE_PATH
+    assert call["url"] == _PROBE_URL  # the REAL batchGraphql endpoint
     assert call["json"]["contents"][0]["parts"][0]["text"] == "ping"
 
 

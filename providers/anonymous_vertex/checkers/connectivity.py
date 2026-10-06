@@ -43,6 +43,12 @@ __all__ = ["AnonymousVertexConnectivityChecker"]
 
 DEFAULT_TIMEOUT_SECONDS = 10.0
 
+#: Fixed connectivity probe target: Google's canonical connectivity-check
+#: endpoint (HTTP 204, no auth, designed for exactly this purpose).  The
+#: probe travels THROUGH the node's real egress (the injected client), so
+#: this URL is never derived from the node's proxy configuration.
+CONNECTIVITY_PROBE_URL = "https://connectivitycheck.gstatic.com/generate_204"
+
 #: HEAD responses that mean "method not supported here" -> retry with GET.
 _HEAD_FALLBACK_STATUSES = frozenset({405, 501})
 
@@ -68,26 +74,42 @@ class AnonymousVertexConnectivityChecker:
 
     def __init__(
         self,
-        http_client: Any,
+        http_client: Any = None,
         *,
+        client_factory: Optional[Any] = None,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     ) -> None:
+        """``http_client`` is the egress client to probe through; OR pass
+        ``client_factory(node) -> client`` so each node probes through its
+        OWN real transport (proxy-aware).  Exactly the same injection
+        boundary as before — the checker never creates clients itself.
+        """
+        if http_client is None and client_factory is None:
+            raise ValueError(
+                "connectivity checker requires http_client or client_factory"
+            )
         self._http = http_client
+        self._client_factory = client_factory
         self._timeout_seconds = float(timeout_seconds)
 
-    async def check(self, node: NodeDefinition) -> NodeAdmissionResult:
-        url = self._endpoint_url(node)
-        if url is None:
-            # missing or non-probeable endpoint configuration
-            return _failed("invalid_endpoint")
+    def _client_for(self, node: NodeDefinition) -> Any:
+        if self._client_factory is not None:
+            return self._client_factory(node)
+        return self._http
 
+    async def check(self, node: NodeDefinition) -> NodeAdmissionResult:
         try:
-            response = await self._http.head(url, timeout=self._timeout_seconds)
+            # factory failures (e.g. no egress available) are classified
+            # like any other probe failure — never allowed to escape
+            client = self._client_for(node)
+            response = await client.head(
+                CONNECTIVITY_PROBE_URL, timeout=self._timeout_seconds
+            )
             status = int(getattr(response, "status_code", 0))
             if status in _HEAD_FALLBACK_STATUSES:
-                # HEAD not supported by this endpoint: fall back to GET
-                response = await self._http.get(
-                    url, timeout=self._timeout_seconds
+                # HEAD not supported by this target: fall back to GET
+                response = await client.get(
+                    CONNECTIVITY_PROBE_URL, timeout=self._timeout_seconds
                 )
                 status = int(getattr(response, "status_code", 0))
         except asyncio.TimeoutError:
@@ -102,18 +124,4 @@ class AnonymousVertexConnectivityChecker:
         if 200 <= status < 400:
             return _ready()
         return _failed(f"http_status_{status}")
-
-    @staticmethod
-    def _endpoint_url(node: NodeDefinition) -> Optional[str]:
-        """Build the probe URL from the definition's own endpoint fields."""
-        proxy = node.proxy or {}
-        scheme = str(proxy.get("scheme") or "").strip().lower()
-        host = proxy.get("host")
-        port = proxy.get("port")
-        if not scheme or not host or not port:
-            return None
-        if scheme == "direct":
-            # a direct node has no dedicated endpoint to probe
-            return None
-        return f"{scheme}://{host}:{port}/"
 

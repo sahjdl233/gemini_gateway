@@ -109,12 +109,27 @@ def test_production_provider_is_admission_aware():
     assert asyncio.run(pool.acquire()) is None
 
 
-def test_default_definition_created_without_node_pool_section():
+def test_without_node_pool_config_stays_legacy_direct():
+    """The config.yaml.example default (no node_pool) must NOT be killed
+    by admission: it stays on the legacy default-direct path."""
     provider = AnonymousVertexProviderFactory().create_provider(
         "anonymous_vertex", {"enabled": True}
     )
-    assert [d.node_id for d in provider.node_definitions] == ["default"]
+    assert provider.node_definitions == []
+    assert provider.admission_projection is None
+    assert provider.admission_scheduler is None
+    assert provider.admission_store is None
+    # the plain direct node is selectable without any admission result
+    lease = asyncio.run(provider.node_pool.acquire())
+    assert lease is not None and lease.node_id == "default"
+    asyncio.run(provider.node_pool.release(lease))
+
+
+def test_explicit_node_pool_enters_admission_aware_path():
+    provider = _provider()
     assert provider.admission_projection is not None
+    assert [d.node_id for d in provider.node_definitions] == ["node-a", "node-b"]
+    assert [d.source_id for d in provider.node_definitions] == ["config", "config"]
 
 
 # ---------------------------------------------------------------------------

@@ -48,13 +48,14 @@ class AnonymousVertexProviderFactory:
 
       The parsed nodes become persistable NodeDefinition objects (the
       single construction source of record): the provider builds its
-      ExecutionNodes AND its AdmissionScheduler from the SAME definitions.
-      Admission is therefore always enabled on the production path.
+      ExecutionNodes AND its AdmissionScheduler from the SAME definitions,
+      so an explicitly configured node pool always runs admission-aware.
 
-      Absent node_pool => a single direct-connection default definition.
-      NOTE: such a node has no probeable endpoint, so the admission
-      checkers will (correctly) never admit it — production configs must
-      define node_pool nodes with real endpoints.
+      Absent node_pool => the LEGACY default-direct path (single direct
+      node, no admission projection): the config.yaml.example default
+      "just works" behaviour must never be killed by admission gating.
+      Admission-aware operation requires an explicitly configured node
+      pool with real endpoints.
     """
 
     def create_provider(
@@ -70,19 +71,21 @@ class AnonymousVertexProviderFactory:
             models = config.get("models")
             np_cfg = config.get("node_pool") or {}
             entries = list(np_cfg.get("nodes") or [])
-            if not entries:
-                entries = [{"id": "default"}]
-            node_definitions = [
-                NodeDefinition(
-                    node_id=str(entry.get("id") or f"node-{i + 1}"),
-                    proxy=dict(entry.get("proxy") or {}),
-                    source_id=CONFIG_SOURCE_ID,
-                    enabled=bool(entry.get("enabled", True)),
-                    weight=int(entry.get("weight", 1)),
-                    max_concurrency=int(entry.get("max_concurrency", 8)),
-                )
-                for i, entry in enumerate(entries)
-            ]
+            if entries:
+                node_definitions = [
+                    NodeDefinition(
+                        node_id=str(entry.get("id") or f"node-{i + 1}"),
+                        proxy=dict(entry.get("proxy") or {}),
+                        source_id=CONFIG_SOURCE_ID,
+                        enabled=bool(entry.get("enabled", True)),
+                        weight=int(entry.get("weight", 1)),
+                        max_concurrency=int(entry.get("max_concurrency", 8)),
+                    )
+                    for i, entry in enumerate(entries)
+                ]
+            # no explicit nodes -> stay on the legacy default-direct path
+            # (node_definitions stays None; the provider builds a plain
+            # direct node WITHOUT an admission projection)
             rl = np_cfg.get("rate_limit_cooldown") or {}
             if rl:
                 policy = CooldownPolicy(

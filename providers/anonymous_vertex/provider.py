@@ -153,6 +153,7 @@ class AnonymousVertexProvider(Provider):
         self._admission_start_lock: Optional[asyncio.Lock] = None
         self._admission_started = False
         self._admission_stopped = False
+        self._admission_clients: dict = {}
 
         if node_pool is not None:
             # Test-only injection: a caller-built pool runs in legacy mode
@@ -218,23 +219,57 @@ class AnonymousVertexProvider(Provider):
             default_http_client=http_client,
         )
 
+    def _admission_client_for_node(self, node: NodeDefinition) -> Any:
+        """One probe client PER NODE, using the node's REAL egress.
+
+        The node's own proxy configuration (socks5/http/https) becomes the
+        client's outbound proxy; a direct node gets a proxy-less client.
+        The probe then targets the fixed probe endpoints THROUGH that
+        egress — the proxy config is never misread as a target URL.
+        Cached per node_id; closed by :meth:`close`.
+        """
+        node_id = node.node_id
+        client = self._admission_clients.get(node_id)
+        if client is None:
+            from transport.http import build_client
+            from transport.proxy import ProxyConfig, TransportConfig
+
+            proxy = node.proxy or {}
+            scheme = str(proxy.get("scheme") or "direct").strip().lower()
+            proxy_config = None
+            if scheme != "direct" and proxy.get("host"):
+                proxy_config = ProxyConfig(
+                    scheme=scheme,
+                    host=proxy.get("host"),
+                    port=proxy.get("port"),
+                    username=proxy.get("username"),
+                    password=proxy.get("password"),
+                )
+            client = build_client(
+                TransportConfig(proxy=proxy_config, timeout_seconds=30.0)
+            )
+            self._admission_clients[node_id] = client
+        return client
+
     def _build_default_admission_orchestrator(self) -> AdmissionOrchestrator:
-        """Real checker pipeline over one shared admission probe client."""
-        from transport.http import build_client
-        from transport.proxy import TransportConfig
+        """Real checker pipeline; every probe goes through the probed
+        node's own real transport via the per-node client factory."""
         from providers.anonymous_vertex.checkers import (
             AnonymousVertexAuthChecker,
             AnonymousVertexCapabilityChecker,
             AnonymousVertexConnectivityChecker,
         )
 
-        self._admission_probe_client = build_client(
-            TransportConfig(timeout_seconds=30.0)
-        )
         return AdmissionOrchestrator([
-            AnonymousVertexConnectivityChecker(self._admission_probe_client),
-            AnonymousVertexCapabilityChecker(self._admission_probe_client),
-            AnonymousVertexAuthChecker(self._admission_probe_client),
+            AnonymousVertexConnectivityChecker(
+                client_factory=self._admission_client_for_node
+            ),
+            AnonymousVertexCapabilityChecker(
+                client_factory=self._admission_client_for_node
+            ),
+            AnonymousVertexAuthChecker(
+                client_factory=self._admission_client_for_node
+            ),
         ])
 
     @property
@@ -291,14 +326,14 @@ class AnonymousVertexProvider(Provider):
         self._admission_stopped = True
         if self._admission_scheduler is not None:
             await self._admission_scheduler.stop()
-        probe = getattr(self, "_admission_probe_client", None)
-        if probe is not None:
-            aclose = getattr(probe, "aclose", None)
+        for client in self._admission_clients.values():
+            aclose = getattr(client, "aclose", None)
             if aclose is not None:
                 try:
                     await aclose()
                 except Exception:  # noqa: BLE001 - shutdown best-effort
                     pass
+        self._admission_clients.clear()
         for node in self.node_pool.nodes:
             await node.close()
 

@@ -35,13 +35,18 @@ from providers.anonymous_vertex.admission import (
     NodeAdmissionState,
 )
 from providers.anonymous_vertex.node_definitions import NodeDefinition
+from providers.anonymous_vertex.signature import (
+    ANONYMOUS_VERTEX_GRAPHQL_ENDPOINT,
+)
 
 __all__ = ["AnonymousVertexCapabilityChecker"]
 
 DEFAULT_TIMEOUT_SECONDS = 15.0
 
-#: Fixed capability-probe path (v1): a Vertex-style generateContent route.
-_PROBE_PATH = "/v1internal:generateContent"
+#: Fixed capability probe: the REAL Anonymous Vertex batchGraphql endpoint,
+#: reached THROUGH the node's egress (the injected client).  Never derived
+#: from the node's proxy configuration.
+_PROBE_URL = ANONYMOUS_VERTEX_GRAPHQL_ENDPOINT
 
 #: Minimal probe payload — a fixed "ping", never real user content.
 _PROBE_PAYLOAD: Dict[str, Any] = {
@@ -88,21 +93,35 @@ class AnonymousVertexCapabilityChecker:
 
     def __init__(
         self,
-        http_client: Any,
+        http_client: Any = None,
         *,
+        client_factory: Optional[Any] = None,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     ) -> None:
+        """``http_client`` is the egress client to probe through; OR pass
+        ``client_factory(node) -> client`` for per-node real transports.
+        Same injection boundary as before — no client creation in check().
+        """
+        if http_client is None and client_factory is None:
+            raise ValueError(
+                "capability checker requires http_client or client_factory"
+            )
         self._http = http_client
+        self._client_factory = client_factory
         self._timeout_seconds = float(timeout_seconds)
 
-    async def check(self, node: NodeDefinition) -> NodeAdmissionResult:
-        url = self._endpoint_url(node)
-        if url is None:
-            return _failed("invalid_endpoint")
+    def _client_for(self, node: NodeDefinition) -> Any:
+        if self._client_factory is not None:
+            return self._client_factory(node)
+        return self._http
 
+    async def check(self, node: NodeDefinition) -> NodeAdmissionResult:
         try:
-            response = await self._http.post(
-                url + _PROBE_PATH,
+            # factory failures (e.g. no egress available) are classified
+            # like any other probe failure — never allowed to escape
+            client = self._client_for(node)
+            response = await client.post(
+                _PROBE_URL,
                 json=_PROBE_PAYLOAD,
                 headers=dict(_PROBE_HEADERS),
                 timeout=self._timeout_seconds,
@@ -136,18 +155,6 @@ class AnonymousVertexCapabilityChecker:
         except Exception:  # noqa: BLE001 - any decode error is "not JSON"
             return _NOT_JSON
 
-    @staticmethod
-    def _endpoint_url(node: NodeDefinition) -> Optional[str]:
-        """Build the probe base URL from the definition's own fields."""
-        proxy = node.proxy or {}
-        scheme = str(proxy.get("scheme") or "").strip().lower()
-        host = proxy.get("host")
-        port = proxy.get("port")
-        if not scheme or not host or not port:
-            return None
-        if scheme == "direct":
-            return None
-        return f"{scheme}://{host}:{port}"
 
 
 #: Sentinel returned by :meth:`_parse_json` for undecodable bodies.
