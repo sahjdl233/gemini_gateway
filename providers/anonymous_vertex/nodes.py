@@ -33,16 +33,21 @@ failure cools the node, not the provider or the resource.
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
+from providers.anonymous_vertex.admission import NodeAdmissionState
+from providers.anonymous_vertex.admission_state import AdmissionStateProvider
 from providers.anonymous_vertex.client import AnonymousVertexClient
 from providers.anonymous_vertex.node_definitions import (
     NodeDefinition,
     NodeRuntimeState,
 )
 from providers.anonymous_vertex.transport import HttpxTransport
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -339,6 +344,7 @@ class AnonymousVertexNodePool:
         *,
         policy: Optional[CooldownPolicy] = None,
         now_fn: Optional[Callable[[], float]] = None,
+        admission_state_provider: Optional[AdmissionStateProvider] = None,
     ) -> None:
         if not nodes:
             raise ValueError("node pool requires at least one node")
@@ -346,6 +352,11 @@ class AnonymousVertexNodePool:
         self._policy = policy or CooldownPolicy()
         self.now = now_fn or time.monotonic
         self._lock = asyncio.Lock()
+        # ANON-011-B: optional admission eligibility view.  None keeps the
+        # pool's behaviour byte-for-byte identical to the pre-admission
+        # semantics; a provider adds a READ-ONLY "must be READY" gate on
+        # top of the runtime checks — it never mutates node state.
+        self._admission_provider = admission_state_provider
         # Shares the pool lock: notify_all() is legal from any block that
         # holds self._lock (release / record_*).
         self._condition = asyncio.Condition(lock=self._lock)
@@ -359,11 +370,14 @@ class AnonymousVertexNodePool:
         policy: Optional[CooldownPolicy] = None,
         now_fn: Optional[Callable[[], float]] = None,
         default_http_client: Any = None,
+        admission_state_provider: Optional[AdmissionStateProvider] = None,
     ) -> "AnonymousVertexNodePool":
         """Build a pool from static specs.
 
         ``default_http_client`` (compat/test injection) is wired into the
         FIRST node; every node still owns its own transport lifecycle.
+        ``admission_state_provider`` optionally gates candidate selection
+        on admission eligibility (READY only).
         """
         nodes = []
         for i, spec in enumerate(specs):
@@ -374,7 +388,12 @@ class AnonymousVertexNodePool:
                 nodes.append(node)
                 continue
             nodes.append(ExecutionNode(spec, api_key=api_key, client_factory=factory))
-        return cls(nodes, policy=policy, now_fn=now_fn)
+        return cls(
+            nodes,
+            policy=policy,
+            now_fn=now_fn,
+            admission_state_provider=admission_state_provider,
+        )
 
     # -- introspection --
 
@@ -435,6 +454,36 @@ class AnonymousVertexNodePool:
             key=lambda n: (n.current_in_flight, -n.weight),
         )
 
+    async def _filter_admitted(
+        self, nodes: List[ExecutionNode]
+    ) -> List[ExecutionNode]:
+        """Keep only nodes whose latest admission state is READY.
+
+        Read-only: node runtime state is never touched.  A provider
+        failure or a missing state (None) means NOT admitted — fail-closed,
+        since admission is an eligibility gate.  Without a provider this
+        is the identity filter.
+        """
+        provider = self._admission_provider
+        if provider is None:
+            return nodes
+        states = await asyncio.gather(
+            *(provider.get_state(n.node_id) for n in nodes),
+            return_exceptions=True,
+        )
+        admitted = []
+        for node, state in zip(nodes, states):
+            if isinstance(state, BaseException):
+                logger.warning(
+                    "node_pool.admission_provider_error node=%s error=%s",
+                    node.node_id,
+                    state,
+                )
+                continue
+            if state == NodeAdmissionState.READY:
+                admitted.append(node)
+        return admitted
+
     async def acquire(
         self,
         *,
@@ -465,6 +514,11 @@ class AnonymousVertexNodePool:
                 healthy = [
                     n for n in self._nodes if self._healthy(n, now)
                 ]
+                # ANON-011-B: admission eligibility ANDs with the runtime
+                # checks above.  Non-READY nodes drop out of BOTH the
+                # capacity-wait candidates and the reuse candidates, so a
+                # FAILED / QUARANTINED node can never be waited on.
+                healthy = await self._filter_admitted(healthy)
                 untried = [n for n in healthy if n.node_id not in skip]
                 tried = [n for n in healthy if n.node_id in skip]
 
