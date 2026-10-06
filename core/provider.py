@@ -8,11 +8,23 @@ to 'Provider' and never to a concrete Google implementation.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import AsyncIterator, List
+import inspect
+from typing import Any, AsyncIterator, List
 
 from .health import HealthResult
 from .models import ChatChunk, ChatRequest, ChatResponse, ModelInfo
 from .resource import Resource
+
+
+async def await_if_needed(result: Any) -> None:
+    """Await an optional awaitable returned by a duck-typed provider hook.
+
+    Provider lifecycle seams (e.g. ``invalidate_resource``) may be sync or
+    async depending on the provider; callers that only ``await`` when the
+    hook returned an awaitable support both without breaking either.
+    """
+    if inspect.isawaitable(result):
+        await result
 
 
 class Provider(ABC):

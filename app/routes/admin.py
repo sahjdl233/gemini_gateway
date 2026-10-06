@@ -389,7 +389,7 @@ async def update_credential_payload(credential_id: str, request: Request):
         # the fresh adapter re-resolves material from the new payload.
         # Rotation (AUTH-014) is unaffected: it persists through the
         # listener inside the refresh flow, never through this route.
-        _invalidate_credential_adapters(request, credential_id)
+        await _invalidate_credential_adapters(request, credential_id)
     return _credential_view(request, credential)
 
 
@@ -408,7 +408,9 @@ def _credential_is_referenced(request: Request, credential_id: str) -> bool:
     return False
 
 
-def _invalidate_credential_adapters(request: Request, credential_id: str) -> int:
+async def _invalidate_credential_adapters(
+    request: Request, credential_id: str
+) -> int:
     """Drop the per-resource auth adapter of every resource bound to a
     credential whose payload was just mutated (AUTH-016 A).
 
@@ -422,9 +424,11 @@ def _invalidate_credential_adapters(request: Request, credential_id: str) -> int
         invalidate = getattr(provider, "invalidate_resource", None)
         if invalidate is None:
             continue
+        from core.provider import await_if_needed
+
         for resource in pool.resources:
             if resource.credential_id == credential_id:
-                invalidate(resource.id)
+                await await_if_needed(invalidate(resource.id))
                 invalidated += 1
     return invalidated
 

@@ -50,7 +50,13 @@ class FirebaseProvider(Provider):
         credential_store: Optional[Any] = None,
     ) -> None:
         self._models = list(models) if models else list(DEFAULT_MODELS)
+        # ANON lifecycle fix: explicit ownership.  ``self._http`` is
+        # BORROWED (injected; never closed here).  Clients the provider
+        # builds itself (per-resource proxy-aware transports) are OWNED
+        # and closed by close()/invalidate_resource.
         self._http = http_client
+        self._owned_http: Dict[str, Any] = {}
+        self._retired_http: List[Any] = []
         self._clients: Dict[str, FirebaseClient] = {}
         # Per-resource FirebaseAuthAdapter instances (AUTH-005).  The
         # adapter owns the App Check lifecycle and the credential->material
@@ -62,15 +68,27 @@ class FirebaseProvider(Provider):
 
     # -- lifecycle / resource wiring --
 
+    def _retire_owned_clients(self) -> None:
+        """Move every owned client into the retire drain (sync paths cannot
+        await aclose; close() drains this later — no owned client is ever
+        leaked unclosed past shutdown)."""
+        self._retired_http.extend(self._owned_http.values())
+        self._owned_http.clear()
+
     def set_http_client(self, client: Any) -> None:
-        """Inject an httpx.AsyncClient-compatible object (tests)."""
+        """Inject an httpx.AsyncClient-compatible object (tests).
+
+        Borrowed: the injected client is never closed by this provider;
+        previously OWNED clients are retired (closed by close())."""
         self._http = client
+        self._retire_owned_clients()
         self._clients.clear()
         self._adapters.clear()
 
     def set_credential_store(self, store: Any) -> None:
         """Attach the application-wide credential store (AUTH-002)."""
         self._credential_store = store
+        self._retire_owned_clients()
         self._clients.clear()
         self._adapters.clear()
 
@@ -82,6 +100,7 @@ class FirebaseProvider(Provider):
         http = self._http
         if http is None:
             http = self._build_http(resource)
+            self._owned_http[resource.id] = http  # provider-owned
         adapter = FirebaseAuthAdapter(
             http=http,
             credential_store=self._credential_store,
@@ -101,17 +120,23 @@ class FirebaseProvider(Provider):
         await self._client_for(resource)
         return self._adapters[resource.id]
 
-    def invalidate_resource(self, resource_id: str) -> None:
-        """Drop the cached client + auth adapter of one resource.
+    async def invalidate_resource(self, resource_id: str) -> None:
+        """Drop the cached client + auth adapter of one resource and close
+        its provider-owned transport.
 
         CONTROL-006-FIX-1: called by the management layer when a resource
         definition is replaced or removed.  Both caches are keyed by
         ``resource.id`` and the client binds the adapter's auth, so both
         must go together — otherwise the popped adapter would stay
-        reachable through the cached client.
+        reachable through the cached client.  The awaitable seam lets the
+        owned httpx transport (if any) finish its ``aclose()`` here;
+        borrowed/injected transports are never touched.
         """
         self._adapters.pop(resource_id, None)
         self._clients.pop(resource_id, None)
+        owned = self._owned_http.pop(resource_id, None)
+        if owned is not None:
+            await _aclose_quietly(owned, resource_id)
 
     def _build_http(self, resource: FirebaseResource) -> Any:
         """Build an httpx client honouring the resource's optional proxy."""
@@ -122,6 +147,22 @@ class FirebaseProvider(Provider):
         return build_client(
             TransportConfig(proxy=proxy, timeout_seconds=180.0)
         )
+
+    async def close(self) -> None:
+        """Close every provider-OWNED http transport and drop caches.
+
+        Borrowed/injected clients (``set_http_client``) are NOT closed.
+        Idempotent; a single failing aclose never blocks the others."""
+        self._adapters.clear()
+        self._clients.clear()
+        owned = list(self._owned_http.items())
+        self._owned_http.clear()
+        retired = list(self._retired_http)
+        self._retired_http.clear()
+        for resource_id, client in owned + [
+            (f"retired-{i}", c) for i, c in enumerate(retired)
+        ]:
+            await _aclose_quietly(client, resource_id)
 
     # -- Provider interface --
 
@@ -165,6 +206,18 @@ class FirebaseProvider(Provider):
             chunk = parse_chunk(event, model)
             if chunk is not None:
                 yield chunk
+
+
+async def _aclose_quietly(client: Any, owner: str) -> None:
+    """Best-effort aclose: one failing client never blocks the others."""
+    aclose = getattr(client, "aclose", None)
+    if aclose is None:
+        return
+    try:
+        await aclose()
+    except Exception as exc:  # noqa: BLE001 - shutdown best-effort
+        logger.warning("firebase transport close failed owner=%s error=%s",
+                       owner, exc)
 
 
 def _require_resource(resource: Resource) -> FirebaseResource:

@@ -474,7 +474,7 @@ class ResourceManager:
 
     # -- DB-RESOURCE-013 / CONTROL-004-FIX: repository write path --------
 
-    def _invalidate_provider_adapters(
+    async def _invalidate_provider_adapters(
         self, provider_id: str, resource_ids: Iterable[str]
     ) -> None:
         """Notify a provider that per-resource auth state must be dropped.
@@ -490,8 +490,12 @@ class ResourceManager:
         invalidate = getattr(provider, "invalidate_resource", None)
         if invalidate is None:
             return
+        from core.provider import await_if_needed
+
         for resource_id in resource_ids:
-            invalidate(resource_id)
+            # sync or async provider seam (firebase closes owned transports,
+            # so its invalidation is async); both are supported here
+            await await_if_needed(invalidate(resource_id))
 
     def _stale_adapter_ids(
         self, old_resources: Iterable[Any], new_resources: List[Any]
@@ -552,7 +556,7 @@ class ResourceManager:
         # rolled back and must leave the providers untouched).
         for provider_id, stale in stale_by_provider.items():
             if stale:
-                self._invalidate_provider_adapters(provider_id, stale)
+                await self._invalidate_provider_adapters(provider_id, stale)
         # CONFIG/R-2-C: the definitions are live in the runtime — the
         # discovery cache must not keep serving the old index.  Only
         # this SUCCESS point invalidates; a reconcile failure is rolled
@@ -877,7 +881,7 @@ class ResourceManager:
                 resource.health = HealthState.HEALTHY
                 resource.cooldown_until = None
                 resource.consecutive_failures = 0
-                self._invalidate_provider_adapters(
+                await self._invalidate_provider_adapters(
                     "antigravity", (resource_id,)
                 )
             # CONFIG/R-2-C: the definition is live — invalidate discovery.

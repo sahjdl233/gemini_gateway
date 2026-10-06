@@ -243,6 +243,31 @@ def _migrate_legacy_credentials_if_durable(
     )
 
 
+async def _initialize_persistence_repositories(
+    resource_sink: Any,
+    definition_repo: Any,
+) -> None:
+    """Idempotent R6/R7 persistence initialization (ANON-012 Part B).
+
+    The legacy sink's own ``initialize()`` only creates the BASE
+    ``resource_definitions`` table — the full R6 migration (id /
+    created_at / updated_at upgrade columns, ``credentials`` and
+    ``runtime_state``) lives behind
+    :meth:`PostgresResourceDefinitionRepository.initialize` →
+    ``initialize_persistence()`` and MUST run at startup, independent of
+    whether resource bootstrap is enabled.  Both repositories target the
+    same database/tables and every statement is idempotent, so R7's
+    dual-side layout (legacy write sink + new-protocol source of record)
+    initializes correctly in any order.
+    """
+    definition_initialize = getattr(definition_repo, "initialize", None)
+    if definition_initialize is not None:
+        await definition_initialize()
+    sink_initialize = getattr(resource_sink, "initialize", None)
+    if sink_initialize is not None:
+        await sink_initialize()
+
+
 def _apply_resource_bootstrap(
     definition_repo: Any,
     sink: Any,
@@ -370,6 +395,17 @@ def create_app(
     incoming_source = create_config_definition_source(cfg)
     definition_repo = create_resource_definition_repository(cfg)
     bootstrap_enabled, bootstrap_mode = resource_bootstrap_settings(cfg)
+
+    # ANON-012 Part B: when the durable store is postgres, startup ALWAYS
+    # completes the full idempotent R6 migration (resource_definitions
+    # with id/created_at/updated_at, credentials, runtime_state) — not
+    # just the legacy sink's base table, and independent of whether
+    # bootstrap is enabled.  Failures propagate and abort startup
+    # (fail-closed, same contract as bootstrap).
+    if resource_store_backend(cfg) == "postgres":
+        asyncio.run(
+            _initialize_persistence_repositories(resource_sink, definition_repo)
+        )
 
     registry = ProviderRegistry()
     register_builtin_providers(registry)
