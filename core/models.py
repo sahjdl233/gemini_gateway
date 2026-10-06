@@ -18,6 +18,7 @@ class ChatMessage(BaseModel):
     role: str
     content: Optional[Any] = None  # str | list[dict] (multimodal, TASK-004)
     tool_calls: Optional[List[Any]] = None
+    tool_call_id: Optional[str] = None
     name: Optional[str] = None
 
 

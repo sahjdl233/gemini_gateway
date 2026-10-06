@@ -11,7 +11,7 @@ import json
 from typing import Any, Dict, List, Optional, Tuple
 
 from core.models import ChatChunk, ChatResponse, Usage
-from protocol.common import new_id
+from protocol.common import new_id, stable_tool_call_id
 
 
 _FINISH_MAP = {
@@ -54,7 +54,7 @@ def parse_response(
     cand = candidates[0]
     content = cand.get("content", {})
     parts = content.get("parts", [])
-    text, tool_calls = _parts_to_text_and_tools(parts)
+    text, tool_calls = _parts_to_text_and_tools(parts, streaming=False)
     fr = _map_finish_reason(cand.get("finishReason"))
     return ChatResponse(
         id=new_id(),
@@ -88,7 +88,7 @@ def parse_chunk(
     cand = candidates[0]
     content = cand.get("content", {})
     parts = content.get("parts", [])
-    text, tool_calls = _parts_to_text_and_tools(parts)
+    text, tool_calls = _parts_to_text_and_tools(parts, streaming=True)
     fr = _map_finish_reason(cand.get("finishReason"))
     usage = _parse_usage(usage_meta)
 
@@ -111,12 +111,13 @@ def parse_chunk(
 
 def _parts_to_text_and_tools(
     parts: List[Dict[str, Any]],
+    *,
+    streaming: bool = False,
 ) -> Tuple[Optional[str], Optional[List[Dict[str, Any]]]]:
     """Separate Gemini parts into text and OpenAI-style tool_calls."""
     text_pieces: List[str] = []
     tool_calls: List[Dict[str, Any]] = []
-    index = 0
-    for part in parts:
+    for index, part in enumerate(parts):
         if not isinstance(part, dict):
             continue
         if part.get("thought"):
@@ -133,19 +134,19 @@ def _parts_to_text_and_tools(
                     args = json.loads(args.decode("utf-8"))
                 except Exception:  # noqa: BLE001
                     args = {}
-            if not isinstance(args, dict):
-                try:
+            if isinstance(args, str):
+                arguments = args
+            else:
+                if not isinstance(args, dict):
                     args = {"value": args}
-                except Exception:  # noqa: BLE001
-                    args = {}
+                arguments = json.dumps(args, ensure_ascii=False)
             tool_calls.append(
                 {
-                    "id": "call_" + str(index),
+                    "id": stable_tool_call_id(index, fn_name),
                     "type": "function",
-                    "function": {"name": fn_name, "arguments": json.dumps(args)},
+                    "function": {"name": fn_name, "arguments": arguments},
                 }
             )
-            index += 1
     text = "".join(text_pieces) if text_pieces else ("" if parts else None)
     return text, tool_calls or None
 

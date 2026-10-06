@@ -104,7 +104,8 @@ def _convert_messages(messages) -> tuple:
     """OpenAI messages -> (systemInstruction text, contents list)."""
     system_parts: List[str] = []
     contents: List[Dict[str, Any]] = []
-    pending_names: List[str] = []
+    call_names: Dict[str, str] = {}
+    pending_names: List[str] = []  # legacy fallback only
 
     for m in messages:
         role = m.role
@@ -131,7 +132,11 @@ def _convert_messages(messages) -> tuple:
                     except Exception:  # noqa: BLE001
                         args = {}
                 if name:
-                    pending_names.append(name)
+                    call_id = tc.get("id") if isinstance(tc, dict) else None
+                    if call_id:
+                        call_names[str(call_id)] = name
+                    else:
+                        pending_names.append(name)
                 parts.append(
                     {
                         "functionCall": {
@@ -148,7 +153,10 @@ def _convert_messages(messages) -> tuple:
                     {"role": "model", "parts": [{"text": ""}]}
                 )
         elif role == "tool":
-            name = pending_names.pop(0) if pending_names else "unknown"
+            if m.tool_call_id:
+                name = call_names.get(m.tool_call_id, m.name or "unknown")
+            else:
+                name = m.name or (pending_names.pop(0) if pending_names else "unknown")
             content = m.content or ""
             if isinstance(content, str):
                 try:

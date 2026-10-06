@@ -57,7 +57,8 @@ def _convert_messages(
     """OpenAI messages → (systemInstruction, contents)."""
     system_parts: List[str] = []
     contents: List[Dict[str, Any]] = []
-    pending_names: List[str] = []
+    call_names: Dict[str, str] = {}
+    pending_names: List[str] = []  # legacy fallback only
 
     for m in messages:
         role = m.role
@@ -75,7 +76,11 @@ def _convert_messages(
             for tc in (m.tool_calls or []):
                 fn = tc.get("function", {}) if isinstance(tc, dict) else {}
                 name = fn.get("name", "")
-                pending_names.append(name)
+                call_id = tc.get("id") if isinstance(tc, dict) else None
+                if call_id:
+                    call_names[str(call_id)] = name
+                else:
+                    pending_names.append(name)
                 try:
                     args = json.loads(fn.get("arguments", "{}") or "{}")
                 except Exception:
@@ -89,7 +94,10 @@ def _convert_messages(
             else:
                 contents.append({"role": "model", "parts": [{"text": ""}]})
         elif role == "tool":
-            name = pending_names.pop(0) if pending_names else "unknown"
+            if m.tool_call_id:
+                name = call_names.get(m.tool_call_id, m.name or "unknown")
+            else:
+                name = m.name or (pending_names.pop(0) if pending_names else "unknown")
             content = m.content or ""
             if isinstance(content, str):
                 try:

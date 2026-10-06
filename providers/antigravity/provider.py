@@ -14,7 +14,7 @@ from core.provider import Provider
 from core.resource import Resource
 from execution.base import ExecutionBackend
 from execution.http import HttpExecutionBackend
-from protocol.common import new_id
+from protocol.common import new_id, stable_tool_call_id, tool_call_deltas
 from transport.proxy import ProxyConfig
 
 from .auth_adapter import AntigravityAuthAdapter
@@ -207,9 +207,25 @@ class AntigravityProvider(Provider):
         contents = []
         system_instruction = None
 
+        call_names: dict[str, str] = {}
+        pending_names: list[str] = []
         for msg in request.messages:
             if msg.role == "system":
                 system_instruction = msg.content
+                continue
+            if msg.role == "tool":
+                if msg.tool_call_id:
+                    name = call_names.get(msg.tool_call_id, msg.name or "unknown")
+                else:
+                    name = msg.name or (pending_names.pop(0) if pending_names else "unknown")
+                try:
+                    result = json.loads(msg.content) if isinstance(msg.content, str) else msg.content
+                except (TypeError, ValueError):
+                    result = {"result": msg.content}
+                contents.append({
+                    "role": "user",
+                    "parts": [{"functionResponse": {"name": name, "response": result}}],
+                })
                 continue
             role = "user" if msg.role in ("user", "human") else "model"
             content = msg.content
@@ -220,7 +236,45 @@ class AntigravityProvider(Provider):
                         parts.append({"text": item})
                     elif isinstance(item, dict):
                         parts.append(item)
+                if msg.role == "assistant":
+                    for tc in (msg.tool_calls or []):
+                        fn = tc.get("function", {}) if isinstance(tc, dict) else {}
+                        name = fn.get("name", "")
+                        call_id = tc.get("id") if isinstance(tc, dict) else None
+                        if call_id:
+                            call_names[str(call_id)] = name
+                        else:
+                            pending_names.append(name)
+                        args = fn.get("arguments", "{}")
+                        if isinstance(args, str):
+                            try:
+                                args = json.loads(args) if args else {}
+                            except (TypeError, ValueError):
+                                args = {}
+                        parts.append({"functionCall": {"name": name, "args": args if isinstance(args, dict) else {}}})
                 content_obj = {"role": role, "parts": parts}
+            elif msg.role == "assistant":
+                parts = []
+                if isinstance(content, str) and content:
+                    parts.append({"text": content})
+                for tc in (msg.tool_calls or []):
+                    fn = tc.get("function", {}) if isinstance(tc, dict) else {}
+                    name = fn.get("name", "")
+                    call_id = tc.get("id") if isinstance(tc, dict) else None
+                    if call_id:
+                        call_names[str(call_id)] = name
+                    else:
+                        pending_names.append(name)
+                    args = fn.get("arguments", "{}")
+                    if isinstance(args, str):
+                        try:
+                            args = json.loads(args) if args else {}
+                        except (TypeError, ValueError):
+                            args = {}
+                    parts.append({"functionCall": {"name": name, "args": args if isinstance(args, dict) else {}}})
+                if not parts:
+                    parts = [{"text": ""}]
+                content_obj = {"role": "model", "parts": parts}
             else:
                 content_obj = {"role": role, "parts": [{"text": str(content) if content else ""}]}
             contents.append(content_obj)
@@ -271,15 +325,27 @@ class AntigravityProvider(Provider):
         candidates = inner.get("candidates", [])
 
         text_parts = []
+        tool_calls = []
         finish_reason = "stop"
 
         if candidates:
             cand = candidates[0]
             content = cand.get("content", {})
             parts = content.get("parts", [])
-            for part in parts:
+            for index, part in enumerate(parts):
                 if "text" in part:
                     text_parts.append(part["text"])
+                fc = part.get("functionCall")
+                if isinstance(fc, dict):
+                    name = fc.get("name", "")
+                    args = fc.get("args", {})
+                    if not isinstance(args, str):
+                        args = json.dumps(args if isinstance(args, dict) else {}, ensure_ascii=False)
+                    tool_calls.append({
+                        "id": stable_tool_call_id(index, name),
+                        "type": "function",
+                        "function": {"name": name, "arguments": args},
+                    })
             fr = cand.get("finishReason", "")
             if fr:
                 fr_map = {
@@ -293,15 +359,27 @@ class AntigravityProvider(Provider):
             # Non-candidates response - might be direct content
             content = inner.get("content", {})
             if isinstance(content, dict):
-                for part in content.get("parts", []):
+                for index, part in enumerate(content.get("parts", [])):
                     if "text" in part:
                         text_parts.append(part["text"])
+                    fc = part.get("functionCall")
+                    if isinstance(fc, dict):
+                        name = fc.get("name", "")
+                        args = fc.get("args", {})
+                        if not isinstance(args, str):
+                            args = json.dumps(args if isinstance(args, dict) else {}, ensure_ascii=False)
+                        tool_calls.append({
+                            "id": stable_tool_call_id(index, name),
+                            "type": "function",
+                            "function": {"name": name, "arguments": args},
+                        })
 
         return ChatResponse(
             id=new_id(),
             model=model,
             text="".join(text_parts),
             finish_reason=finish_reason,
+            tool_calls=tool_calls or None,
             usage=_parse_usage(usage_meta),
         )
 
@@ -316,15 +394,27 @@ class AntigravityProvider(Provider):
         candidates = inner.get("candidates", [])
 
         text_parts = []
+        tool_calls = []
         finish_reason = None
 
         if candidates:
             cand = candidates[0]
             content = cand.get("content", {})
             parts = content.get("parts", [])
-            for part in parts:
+            for index, part in enumerate(parts):
                 if "text" in part:
                     text_parts.append(part["text"])
+                fc = part.get("functionCall")
+                if isinstance(fc, dict):
+                    name = fc.get("name", "")
+                    args = fc.get("args", {})
+                    if not isinstance(args, str):
+                        args = json.dumps(args if isinstance(args, dict) else {}, ensure_ascii=False)
+                    tool_calls.append({
+                        "id": stable_tool_call_id(index, name),
+                        "type": "function",
+                        "function": {"name": name, "arguments": args},
+                    })
             fr = cand.get("finishReason")
             if fr:
                 fr_map = {
@@ -337,14 +427,26 @@ class AntigravityProvider(Provider):
         else:
             content = inner.get("content", {})
             if isinstance(content, dict):
-                for part in content.get("parts", []):
+                for index, part in enumerate(content.get("parts", [])):
                     if "text" in part:
                         text_parts.append(part["text"])
+                    fc = part.get("functionCall")
+                    if isinstance(fc, dict):
+                        name = fc.get("name", "")
+                        args = fc.get("args", {})
+                        if not isinstance(args, str):
+                            args = json.dumps(args if isinstance(args, dict) else {}, ensure_ascii=False)
+                        tool_calls.append({
+                            "id": stable_tool_call_id(index, name),
+                            "type": "function",
+                            "function": {"name": name, "arguments": args},
+                        })
 
         return ChatChunk(
             id=new_id(),
             model=model,
             text="".join(text_parts) if text_parts else None,
+            tool_calls=tool_calls or None,
             finish_reason=finish_reason,
             usage=_parse_usage(usage_meta) if usage_meta else None,
         )
@@ -368,6 +470,7 @@ class AntigravityProvider(Provider):
         resp = await self.client.stream_generate_content(ag_res, payload)
 
         buf = ""
+        tool_state: dict[str, Any] = {}
         decoder = getincrementaldecoder("utf-8")("strict")
         try:
             async for raw in resp.aiter_bytes():
@@ -406,7 +509,9 @@ class AntigravityProvider(Provider):
                             resource_id=ag_res.id,
                         )
                     chunk = self._parse_chunk(data, request.model)
-                    if chunk.text or chunk.finish_reason or chunk.usage:
+                    if chunk.tool_calls:
+                        chunk.tool_calls = tool_call_deltas(chunk.tool_calls, tool_state)
+                    if chunk.text or chunk.tool_calls or chunk.finish_reason or chunk.usage:
                         yield chunk
             try:
                 buf += decoder.decode(b"", final=True)
@@ -443,7 +548,9 @@ class AntigravityProvider(Provider):
                             resource_id=ag_res.id,
                         )
                     chunk = self._parse_chunk(data, request.model)
-                    if chunk.text or chunk.finish_reason or chunk.usage:
+                    if chunk.tool_calls:
+                        chunk.tool_calls = tool_call_deltas(chunk.tool_calls, tool_state)
+                    if chunk.text or chunk.tool_calls or chunk.finish_reason or chunk.usage:
                         yield chunk
         finally:
             await resp.aclose()

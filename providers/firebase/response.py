@@ -11,11 +11,10 @@ from __future__ import annotations
 
 import json
 import time
-import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
 from core.models import ChatChunk, ChatResponse, Usage
-from protocol.common import new_id
+from protocol.common import new_id, stable_tool_call_id
 
 
 _FINISH_MAP = {
@@ -40,7 +39,7 @@ def parse_response(
     cand = candidates[0]
     content = cand.get("content", {})
     parts = content.get("parts", [])
-    text, tool_calls = _parts_to_text_and_tools(parts)
+    text, tool_calls = _parts_to_text_and_tools(parts, streaming=False)
     fr = _map_finish_reason(cand.get("finishReason"))
     return ChatResponse(
         id=new_id(),
@@ -68,7 +67,7 @@ def parse_chunk(
     cand = candidates[0]
     content = cand.get("content", {})
     parts = content.get("parts", [])
-    text, tool_calls = _parts_to_text_and_tools(parts)
+    text, tool_calls = _parts_to_text_and_tools(parts, streaming=True)
     fr = _map_finish_reason(cand.get("finishReason"))
     usage_meta = data.get("usageMetadata")
     usage = _parse_usage(usage_meta) if usage_meta else None
@@ -84,11 +83,13 @@ def parse_chunk(
 
 def _parts_to_text_and_tools(
     parts: List[Dict[str, Any]],
+    *,
+    streaming: bool = False,
 ) -> Tuple[str, List[Dict[str, Any]]]:
     """Extract text and tool_calls from Gemini parts, ignoring thought."""
     text = ""
     tool_calls: List[Dict[str, Any]] = []
-    for p in parts:
+    for index, p in enumerate(parts):
         if "thought" in p:
             continue  # skip thinking content
         elif "text" in p:
@@ -98,18 +99,17 @@ def _parts_to_text_and_tools(
             name = fc.get("name", "")
             args = fc.get("args", {})
             if isinstance(args, str):
-                try:
-                    args = json.loads(args)
-                except Exception:
+                arguments = args
+            else:
+                if not isinstance(args, dict):
                     args = {}
-            if not isinstance(args, dict):
-                args = {}
+                arguments = json.dumps(args, ensure_ascii=False)
             tool_calls.append({
-                "id": f"call_{uuid.uuid4().hex[:16]}",
+                "id": stable_tool_call_id(index, name),
                 "type": "function",
                 "function": {
                     "name": name,
-                    "arguments": json.dumps(args, ensure_ascii=False),
+                    "arguments": arguments,
                 },
             })
     return text, tool_calls

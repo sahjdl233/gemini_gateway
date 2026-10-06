@@ -31,8 +31,13 @@ async def chat_completions(request: Request, payload: Dict[str, Any]):
 
     if chat_request.stream:
         async def event_stream():
+            stream_id = None
             try:
                 async for chunk in scheduler.stream_chat(chat_request):
+                    if stream_id is None:
+                        stream_id = chunk.id
+                    elif chunk.id != stream_id:
+                        chunk = chunk.model_copy(update={"id": stream_id})
                     yield to_openai_chunk_sse(chunk)
                 yield DONE_SSE
             except ProviderError as exc:

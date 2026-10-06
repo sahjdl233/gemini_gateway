@@ -10,6 +10,7 @@ import json
 from typing import Any, AsyncIterator, Optional
 
 from providers.firebase.response import parse_chunk as _parse_chunk
+from protocol.common import tool_call_deltas
 
 
 async def iter_sse_events(
@@ -37,7 +38,10 @@ async def iter_chunks(
     response: Any, model: str
 ) -> AsyncIterator[Any]:
     """Parse SSE into ChatChunk objects using response.parse_chunk."""
+    tool_state: dict[str, Any] = {}
     async for data in iter_sse_events(response):
         chunk = _parse_chunk(data, model)
         if chunk is not None:
+            if chunk.tool_calls:
+                chunk.tool_calls = tool_call_deltas(chunk.tool_calls, tool_state)
             yield chunk

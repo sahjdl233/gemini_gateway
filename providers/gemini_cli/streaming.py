@@ -14,6 +14,7 @@ import json
 from typing import Any, AsyncIterator, Dict, Optional
 
 from providers.gemini_cli.response import parse_chunk as _parse_chunk
+from protocol.common import tool_call_deltas
 
 
 async def iter_sse_events(response: Any) -> AsyncIterator[Dict[str, Any]]:
@@ -47,7 +48,10 @@ async def iter_chunks(
     model: str,
 ) -> AsyncIterator[Any]:
     """Parse GCLI SSE into ChatChunk objects (envelope-aware)."""
+    tool_state: dict[str, Any] = {}
     async for data in iter_sse_events(response):
         chunk = _parse_chunk(data, model)
         if chunk is not None:
+            if chunk.tool_calls:
+                chunk.tool_calls = tool_call_deltas(chunk.tool_calls, tool_state)
             yield chunk

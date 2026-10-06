@@ -39,6 +39,7 @@ def parse_openai_chat_request(payload: Dict[str, Any]) -> ChatRequest:
                 role=item["role"],
                 content=item.get("content"),
                 tool_calls=item.get("tool_calls"),
+                tool_call_id=item.get("tool_call_id"),
                 name=item.get("name"),
             )
         )
