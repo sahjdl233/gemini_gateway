@@ -41,11 +41,19 @@ def tool_call_deltas(tool_calls: list[dict[str, Any]], state: dict[str, Any]) ->
     """
     result: list[dict[str, Any]] = []
     index_by_id = state.setdefault("__index_by_id__", {})
+    id_by_name = state.setdefault("__id_by_name__", {})
     next_index = state.setdefault("__next_index__", 0)
     for call in tool_calls:
         item = copy.deepcopy(call)
         function = item.get("function") or {}
-        call_id = str(item.get("id", ""))
+        incoming_id = str(item.get("id", ""))
+        name = str(function.get("name", ""))
+        # Gemini streams may omit previously emitted functionCalls from a
+        # later parts array.  Function names are unique within a tool
+        # declaration set, so retain the first generated identity when the
+        # parser presents the same call with a new per-chunk ordinal.
+        call_id = id_by_name.setdefault(name, incoming_id)
+        item["id"] = call_id
         if call_id not in index_by_id:
             index_by_id[call_id] = next_index
             next_index += 1

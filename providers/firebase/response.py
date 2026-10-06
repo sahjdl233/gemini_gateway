@@ -93,7 +93,8 @@ def _parts_to_text_and_tools(
     """Extract text and tool_calls from Gemini parts, ignoring thought."""
     text = ""
     tool_calls: List[Dict[str, Any]] = []
-    for index, p in enumerate(parts):
+    function_ordinal = 0
+    for p in parts:
         if "thought" in p:
             continue  # skip thinking content
         elif "text" in p:
@@ -101,6 +102,8 @@ def _parts_to_text_and_tools(
         elif "functionCall" in p:
             fc = p["functionCall"]
             name = fc.get("name", "")
+            ordinal = function_ordinal
+            function_ordinal += 1
             args = fc.get("args", {})
             if isinstance(args, str):
                 arguments = args
@@ -109,7 +112,7 @@ def _parts_to_text_and_tools(
                     args = {}
                 arguments = json.dumps(args, ensure_ascii=False)
             tool_calls.append({
-                "id": stable_tool_call_id(index, name),
+                "id": stable_tool_call_id(ordinal, name),
                 "type": "function",
                 "function": {
                     "name": name,

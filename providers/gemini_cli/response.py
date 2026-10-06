@@ -121,7 +121,8 @@ def _parts_to_text_and_tools(
     """Separate Gemini parts into text and OpenAI-style tool_calls."""
     text_pieces: List[str] = []
     tool_calls: List[Dict[str, Any]] = []
-    for index, part in enumerate(parts):
+    function_ordinal = 0
+    for part in parts:
         if not isinstance(part, dict):
             continue
         if part.get("thought"):
@@ -132,6 +133,8 @@ def _parts_to_text_and_tools(
         fc = part.get("functionCall")
         if isinstance(fc, dict):
             fn_name = fc.get("name", "")
+            ordinal = function_ordinal
+            function_ordinal += 1
             args = fc.get("args")
             if isinstance(args, bytes):
                 try:
@@ -146,7 +149,7 @@ def _parts_to_text_and_tools(
                 arguments = json.dumps(args, ensure_ascii=False)
             tool_calls.append(
                 {
-                    "id": stable_tool_call_id(index, fn_name),
+                    "id": stable_tool_call_id(ordinal, fn_name),
                     "type": "function",
                     "function": {"name": fn_name, "arguments": arguments},
                 }

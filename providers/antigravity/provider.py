@@ -332,17 +332,20 @@ class AntigravityProvider(Provider):
             cand = candidates[0]
             content = cand.get("content", {})
             parts = content.get("parts", [])
-            for index, part in enumerate(parts):
+            function_ordinal = 0
+            for part in parts:
                 if "text" in part:
                     text_parts.append(part["text"])
                 fc = part.get("functionCall")
                 if isinstance(fc, dict):
                     name = fc.get("name", "")
+                    ordinal = function_ordinal
+                    function_ordinal += 1
                     args = fc.get("args", {})
                     if not isinstance(args, str):
                         args = json.dumps(args if isinstance(args, dict) else {}, ensure_ascii=False)
                     tool_calls.append({
-                        "id": stable_tool_call_id(index, name),
+                        "id": stable_tool_call_id(ordinal, name),
                         "type": "function",
                         "function": {"name": name, "arguments": args},
                     })
@@ -361,17 +364,20 @@ class AntigravityProvider(Provider):
             # Non-candidates response - might be direct content
             content = inner.get("content", {})
             if isinstance(content, dict):
-                for index, part in enumerate(content.get("parts", [])):
+                function_ordinal = 0
+                for part in content.get("parts", []):
                     if "text" in part:
                         text_parts.append(part["text"])
                     fc = part.get("functionCall")
                     if isinstance(fc, dict):
                         name = fc.get("name", "")
+                        ordinal = function_ordinal
+                        function_ordinal += 1
                         args = fc.get("args", {})
                         if not isinstance(args, str):
                             args = json.dumps(args if isinstance(args, dict) else {}, ensure_ascii=False)
                         tool_calls.append({
-                            "id": stable_tool_call_id(index, name),
+                            "id": stable_tool_call_id(ordinal, name),
                             "type": "function",
                             "function": {"name": name, "arguments": args},
                         })
@@ -405,17 +411,20 @@ class AntigravityProvider(Provider):
             cand = candidates[0]
             content = cand.get("content", {})
             parts = content.get("parts", [])
-            for index, part in enumerate(parts):
+            function_ordinal = 0
+            for part in parts:
                 if "text" in part:
                     text_parts.append(part["text"])
                 fc = part.get("functionCall")
                 if isinstance(fc, dict):
                     name = fc.get("name", "")
+                    ordinal = function_ordinal
+                    function_ordinal += 1
                     args = fc.get("args", {})
                     if not isinstance(args, str):
                         args = json.dumps(args if isinstance(args, dict) else {}, ensure_ascii=False)
                     tool_calls.append({
-                        "id": stable_tool_call_id(index, name),
+                        "id": stable_tool_call_id(ordinal, name),
                         "type": "function",
                         "function": {"name": name, "arguments": args},
                     })
@@ -433,17 +442,20 @@ class AntigravityProvider(Provider):
         else:
             content = inner.get("content", {})
             if isinstance(content, dict):
-                for index, part in enumerate(content.get("parts", [])):
+                function_ordinal = 0
+                for part in content.get("parts", []):
                     if "text" in part:
                         text_parts.append(part["text"])
                     fc = part.get("functionCall")
                     if isinstance(fc, dict):
                         name = fc.get("name", "")
+                        ordinal = function_ordinal
+                        function_ordinal += 1
                         args = fc.get("args", {})
                         if not isinstance(args, str):
                             args = json.dumps(args if isinstance(args, dict) else {}, ensure_ascii=False)
                         tool_calls.append({
-                            "id": stable_tool_call_id(index, name),
+                            "id": stable_tool_call_id(ordinal, name),
                             "type": "function",
                             "function": {"name": name, "arguments": args},
                         })

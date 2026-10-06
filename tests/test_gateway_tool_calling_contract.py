@@ -141,51 +141,113 @@ class _SseResponse:
 @pytest.mark.asyncio
 async def test_streaming_tool_call_id_index_and_arguments_are_stable():
     events = [
-        {"candidates": [{"content": {"parts": [{"functionCall": {
-            "name": "get_weather", "args": '{"city":'
-        }}]}}]},
-        {"candidates": [{"content": {"parts": [{"functionCall": {
-            "name": "get_weather", "args": '{"city":"London"}'
-        }}]}, "finishReason": "STOP"}]},
+        {"candidates": [{"content": {"parts": [
+            {"text": "thinking"},
+            {"functionCall": {"name": "get_weather", "args": '{"city":'}},
+        ]}}]},
+        {"candidates": [{"content": {"parts": [
+            {"functionCall": {"name": "get_weather", "args": '{"city":"London"}'}},
+        ]}}]},
+        {"candidates": [{"content": {"parts": [
+            {"text": "still thinking"},
+            {"functionCall": {"name": "get_weather", "args": '{"city":"London"}'}},
+        ]}, "finishReason": "STOP"}]},
     ]
     chunks = [chunk async for chunk in firebase_stream_chunks(_SseResponse(events), "m")]
-    first, second = chunks
-    assert first.tool_calls[0]["id"] == second.tool_calls[0]["id"]
-    assert first.tool_calls[0]["index"] == second.tool_calls[0]["index"] == 0
+    first, second, third = chunks
+    assert first.tool_calls[0]["id"] == second.tool_calls[0]["id"] == third.tool_calls[0]["id"]
+    assert [chunk.tool_calls[0]["index"] for chunk in chunks] == [0, 0, 0]
     assert first.tool_calls[0]["function"]["arguments"] == '{"city":'
     assert second.tool_calls[0]["function"]["arguments"] == '"London"}'
+    assert third.tool_calls[0]["function"]["arguments"] == ''
     assert first.finish_reason is None
-    assert second.finish_reason == "tool_calls"
+    assert second.finish_reason is None
+    assert third.finish_reason == "tool_calls"
+
+
+@pytest.mark.asyncio
+async def test_firebase_streaming_multi_tool_ordinals_ignore_text_parts():
+    events = [
+        {"candidates": [{"content": {"parts": [
+            {"text": "prefix"},
+            {"functionCall": {"name": "one", "args": '{"a":'}},
+            {"text": "middle"},
+            {"functionCall": {"name": "two", "args": '{"b":'}},
+        ]}}]},
+        {"candidates": [{"content": {"parts": [
+            {"functionCall": {"name": "one", "args": '{"a":1}'}},
+        ]}}]},
+        {"candidates": [{"content": {"parts": [
+            {"functionCall": {"name": "two", "args": '{"b":2}'}},
+        ]}, "finishReason": "STOP"}]},
+    ]
+    chunks = [chunk async for chunk in firebase_stream_chunks(_SseResponse(events), "m")]
+    first, second, third = chunks
+    assert first.tool_calls[0]["index"] == 0
+    assert first.tool_calls[1]["index"] == 1
+    assert second.tool_calls[0]["index"] == 0
+    assert third.tool_calls[0]["index"] == 1
+    assert first.tool_calls[1]["id"] == third.tool_calls[0]["id"]
 
 
 @pytest.mark.asyncio
 async def test_gemini_cli_streaming_uses_same_tool_contract():
+    def event(parts, finish=None):
+        candidate = {"content": {"parts": parts}}
+        if finish is not None:
+            candidate["finishReason"] = finish
+        return {"response": {"candidates": [candidate]}}
+
     events = [
-        {
-            "response": {
-                "candidates": [{
-                    "content": {"parts": [{
-                        "functionCall": {"name": "get_weather", "args": '{"city":'}
-                    }]}
-                }]
-            }
-        },
-        {
-            "response": {
-                "candidates": [{
-                    "content": {"parts": [{
-                        "functionCall": {"name": "get_weather", "args": '{"city":"London"}'}
-                    }]},
-                    "finishReason": "STOP",
-                }]
-            }
-        },
+        event([
+            {"text": "thinking"},
+            {"functionCall": {"name": "get_weather", "args": '{"city":'}},
+        ]),
+        event([
+            {"functionCall": {"name": "get_weather", "args": '{"city":"London"}'}},
+        ]),
+        event([
+            {"text": "done"},
+            {"functionCall": {"name": "get_weather", "args": '{"city":"London"}'}},
+        ], finish="STOP"),
     ]
     chunks = [chunk async for chunk in cli_stream_chunks(_SseResponse(events), "m")]
-    assert chunks[0].tool_calls[0]["id"] == chunks[1].tool_calls[0]["id"]
-    assert [chunk.tool_calls[0]["index"] for chunk in chunks] == [0, 0]
+    assert chunks[0].tool_calls[0]["id"] == chunks[1].tool_calls[0]["id"] == chunks[2].tool_calls[0]["id"]
+    assert [chunk.tool_calls[0]["index"] for chunk in chunks] == [0, 0, 0]
     assert chunks[0].finish_reason is None
-    assert chunks[1].finish_reason == "tool_calls"
+    assert chunks[1].finish_reason is None
+    assert chunks[2].tool_calls[0]["function"]["arguments"] == ''
+    assert chunks[2].finish_reason == "tool_calls"
+
+
+@pytest.mark.asyncio
+async def test_gemini_cli_streaming_multi_tool_ordinals_ignore_text_parts():
+    def event(parts, finish=None):
+        candidate = {"content": {"parts": parts}}
+        if finish is not None:
+            candidate["finishReason"] = finish
+        return {"response": {"candidates": [candidate]}}
+
+    events = [
+        event([
+            {"text": "prefix"},
+            {"functionCall": {"name": "one", "args": '{"a":'}},
+            {"text": "middle"},
+            {"functionCall": {"name": "two", "args": '{"b":'}},
+        ]),
+        event([
+            {"functionCall": {"name": "one", "args": '{"a":1}'}},
+        ]),
+        event([
+            {"functionCall": {"name": "two", "args": '{"b":2}'}},
+        ], finish="STOP"),
+    ]
+    chunks = [chunk async for chunk in cli_stream_chunks(_SseResponse(events), "m")]
+    assert chunks[0].tool_calls[0]["index"] == 0
+    assert chunks[0].tool_calls[1]["index"] == 1
+    assert chunks[1].tool_calls[0]["index"] == 0
+    assert chunks[2].tool_calls[0]["index"] == 1
+    assert chunks[0].tool_calls[1]["id"] == chunks[2].tool_calls[0]["id"]
 
 
 def test_streaming_index_is_stable_when_calls_arrive_in_separate_chunks():
@@ -262,6 +324,74 @@ async def test_antigravity_streaming_tool_call_contract():
     assert chunks[0].tool_calls[0]["function"]["arguments"] == '{"city":'
     assert chunks[1].tool_calls[0]["function"]["arguments"] == '"London"}'
     assert chunks[1].finish_reason == "tool_calls"
+
+
+@pytest.mark.asyncio
+async def test_antigravity_streaming_identity_ignores_text_parts():
+    def event(parts, finish=None):
+        candidate = {"content": {"parts": parts}}
+        if finish is not None:
+            candidate["finishReason"] = finish
+        return {"response": {"candidates": [candidate]}}
+
+    response = _AntigravityStreamResponse([
+        event([
+            {"text": "thinking"},
+            {"functionCall": {"name": "get_weather", "args": '{"city":'}},
+        ]),
+        event([
+            {"functionCall": {"name": "get_weather", "args": '{"city":"London"}'}},
+        ]),
+        event([
+            {"text": "done"},
+            {"functionCall": {"name": "get_weather", "args": '{"city":"London"}'}},
+        ], finish="STOP"),
+    ])
+    provider = AntigravityProvider(backend=_AntigravityStreamBackend(response))
+    request = ChatRequest(model="m", messages=[ChatMessage(role="user", content="weather")])
+    chunks = [chunk async for chunk in provider.stream(
+        request, AntigravityResource(id="r", project_id="p")
+    )]
+    assert chunks[0].tool_calls[0]["id"] == chunks[1].tool_calls[0]["id"] == chunks[2].tool_calls[0]["id"]
+    assert [chunk.tool_calls[0]["index"] for chunk in chunks] == [0, 0, 0]
+    assert chunks[0].tool_calls[0]["function"]["arguments"] == '{"city":'
+    assert chunks[1].tool_calls[0]["function"]["arguments"] == '"London"}'
+    assert chunks[2].tool_calls[0]["function"]["arguments"] == ''
+    assert chunks[2].finish_reason == "tool_calls"
+
+
+@pytest.mark.asyncio
+async def test_antigravity_streaming_multi_tool_ordinals_ignore_text_parts():
+    def event(parts, finish=None):
+        candidate = {"content": {"parts": parts}}
+        if finish is not None:
+            candidate["finishReason"] = finish
+        return {"response": {"candidates": [candidate]}}
+
+    response = _AntigravityStreamResponse([
+        event([
+            {"text": "prefix"},
+            {"functionCall": {"name": "one", "args": '{"a":'}},
+            {"text": "middle"},
+            {"functionCall": {"name": "two", "args": '{"b":'}},
+        ]),
+        event([
+            {"functionCall": {"name": "one", "args": '{"a":1}'}},
+        ]),
+        event([
+            {"functionCall": {"name": "two", "args": '{"b":2}'}},
+        ], finish="STOP"),
+    ])
+    provider = AntigravityProvider(backend=_AntigravityStreamBackend(response))
+    request = ChatRequest(model="m", messages=[ChatMessage(role="user", content="both")])
+    chunks = [chunk async for chunk in provider.stream(
+        request, AntigravityResource(id="r", project_id="p")
+    )]
+    assert chunks[0].tool_calls[0]["index"] == 0
+    assert chunks[0].tool_calls[1]["index"] == 1
+    assert chunks[1].tool_calls[0]["index"] == 0
+    assert chunks[2].tool_calls[0]["index"] == 1
+    assert chunks[0].tool_calls[1]["id"] == chunks[2].tool_calls[0]["id"]
 
 
 def test_round_trip_keeps_tool_call_id_for_tool_result():
