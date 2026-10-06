@@ -40,6 +40,9 @@ Anonymous Vertex / Agent Platform studio (batchGraphql)
 # 1. 创建虚拟环境并安装依赖（按 pyproject.toml 的 dependencies / dev）
 python -m venv .venv
 .venv/Scripts/python -m pip install ".[dev]"
+
+# 可选：anonymous_vertex 节点池使用 socks5 出站时才需要（direct/http/https 无需安装）
+.venv/Scripts/python -m pip install "gemini-gateway[socks]"
 # 以上需要网络访问；若离线，依赖已满足即可直接从项目根目录运行：
 
 # 2. 启动（无 config.yaml 时使用内置 fake 配置）

@@ -108,6 +108,7 @@ providers:
     #       weight: 1                   # 同等负载时的优先级（大者优先）
     #       max_concurrency: 8          # 节点并发上限
     #       proxy: {scheme: socks5, host: PROXY_HOST, port: PROXY_PORT}
+    #       # socks5 出站需要安装 SOCKS 依赖：pip install "gemini-gateway[socks]"
     #     - id: node-b
     #       max_concurrency: 4
     #       enabled: false              # 停用节点不参与调度

@@ -84,8 +84,6 @@ def _request():
 
 
 async def test_mvp_full_chain_real_upstream():
-    from core.errors import ProviderError
-
     # ------------------------------------------------------------------
     # Phase 1: production wiring + REAL admission checkers (per-node
     # egress: direct here).  Whatever Google answers, the gate must
@@ -102,12 +100,24 @@ async def test_mvp_full_chain_real_upstream():
     await _wait_round(provider, 1)()
     snap = provider.admission_projection.snapshot()
     health = await provider.admission_store.health_snapshot()
-    print("\n[mvp] phase1 admission verdicts (REAL checkers):")
+    print("\n[mvp] phase1 REAL-checker first-round FINAL verdicts:")
     for h in health:
         print(f"[mvp]   {h.node_id}: {h.state.value} reason={h.reason!r}")
+    # Honest fail-fast semantics (ANON-010-A): the pipeline runs
+    # Connectivity -> Capability -> Auth and STOPS at the first FAILED.
+    # When connectivity fails, the recorded verdict IS the connectivity
+    # verdict and capability/auth never execute for that node — this
+    # phase therefore does NOT claim "all three checkers verified".
     for node_id, state in snap.items():
         latest = await provider.admission_store.get(node_id)
         assert latest.final_result.state == state
+        assert len(latest.attempts) >= 1  # at least the first checker ran
+        if state != NodeAdmissionState.READY:
+            reason = latest.final_result.reason or ""
+            print(
+                f"[mvp]   node {node_id}: pipeline stopped at this verdict "
+                f"(reason={reason!r}); later checkers skipped by fail-fast"
+            )
     # gate obeys the projection exactly
     if all(s != NodeAdmissionState.READY for s in snap.values()):
         assert await provider.node_pool.acquire() is None
@@ -162,13 +172,22 @@ async def test_mvp_full_chain_real_upstream():
         assert node_a.total_requests >= 1  # outcome recorded on the node
 
         # ---- REAL streaming request ----
+        # Strict acceptance: success OR the ONE documented real-upstream
+        # failure mode for stock httpx (ANON-003 TLS-fingerprint block:
+        # "Failed to verify action" -> AnonymousVertexAuthError).  Any
+        # other ProviderError is a regression and fails this acceptance.
         chunks = []
         try:
             async for chunk in provider.stream(request, None):
                 chunks.append(chunk)
             print(f"[mvp] stream OK: {len(chunks)} chunks")
-        except ProviderError as exc:
-            print(f"[mvp] stream classified failure: {type(exc).__name__}: {exc}")
+        except AnonymousVertexAuthError as exc:
+            assert "Failed to verify action" in str(exc), (
+                f"unexpected auth failure text: {exc}"
+            )
+            print(
+                f"[mvp] stream hit the documented TLS-fingerprint block: {exc}"
+            )
         print(f"[mvp] stream chunk count: {len(chunks)}")
 
         # ---- 429/5xx style node-level cooldown mechanics (no real 429
