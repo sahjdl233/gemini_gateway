@@ -55,7 +55,9 @@ def parse_response(
     content = cand.get("content", {})
     parts = content.get("parts", [])
     text, tool_calls = _parts_to_text_and_tools(parts, streaming=False)
-    fr = _map_finish_reason(cand.get("finishReason"))
+    fr = _map_finish_reason(cand.get("finishReason")) or "stop"
+    if tool_calls:
+        fr = "tool_calls"
     return ChatResponse(
         id=new_id(),
         model=model,
@@ -90,6 +92,8 @@ def parse_chunk(
     parts = content.get("parts", [])
     text, tool_calls = _parts_to_text_and_tools(parts, streaming=True)
     fr = _map_finish_reason(cand.get("finishReason"))
+    if tool_calls and fr is not None:
+        fr = "tool_calls"
     usage = _parse_usage(usage_meta)
 
     if text is None and not tool_calls and fr is None and usage is None:

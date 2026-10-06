@@ -87,6 +87,7 @@ def test_firebase_function_call_has_complete_openai_shape():
     assert call["function"] == {
         "name": "get_weather", "arguments": '{"city": "London"}'
     }
+    assert response.finish_reason == "tool_calls"
 
 
 def test_gemini_cli_function_call_has_complete_openai_shape():
@@ -101,6 +102,7 @@ def test_gemini_cli_function_call_has_complete_openai_shape():
     assert call["type"] == "function"
     assert call["function"]["name"] == "get_weather"
     assert json.loads(call["function"]["arguments"]) == {"city": "London"}
+    assert response.finish_reason == "tool_calls"
 
 
 def test_antigravity_request_and_response_cover_function_calls():
@@ -124,6 +126,7 @@ def test_antigravity_request_and_response_cover_function_calls():
     )
     assert response.tool_calls[0]["type"] == "function"
     assert response.tool_calls[0]["function"]["name"] == "get_weather"
+    assert response.finish_reason == "tool_calls"
 
 
 class _SseResponse:
@@ -151,7 +154,8 @@ async def test_streaming_tool_call_id_index_and_arguments_are_stable():
     assert first.tool_calls[0]["index"] == second.tool_calls[0]["index"] == 0
     assert first.tool_calls[0]["function"]["arguments"] == '{"city":'
     assert second.tool_calls[0]["function"]["arguments"] == '"London"}'
-    assert second.finish_reason == "stop"
+    assert first.finish_reason is None
+    assert second.finish_reason == "tool_calls"
 
 
 @pytest.mark.asyncio
@@ -180,7 +184,8 @@ async def test_gemini_cli_streaming_uses_same_tool_contract():
     chunks = [chunk async for chunk in cli_stream_chunks(_SseResponse(events), "m")]
     assert chunks[0].tool_calls[0]["id"] == chunks[1].tool_calls[0]["id"]
     assert [chunk.tool_calls[0]["index"] for chunk in chunks] == [0, 0]
-    assert chunks[1].finish_reason == "stop"
+    assert chunks[0].finish_reason is None
+    assert chunks[1].finish_reason == "tool_calls"
 
 
 def test_streaming_index_is_stable_when_calls_arrive_in_separate_chunks():
@@ -193,6 +198,70 @@ def test_streaming_index_is_stable_when_calls_arrive_in_separate_chunks():
     ], state)
     assert first[0]["index"] == 0
     assert second[0]["index"] == 1
+
+
+class _AntigravityStreamResponse:
+    status_code = 200
+    headers = {}
+
+    def __init__(self, events: list[dict]):
+        self.events = [f"data: {json.dumps(event)}\n".encode() for event in events]
+
+    async def aiter_bytes(self):
+        for event in self.events:
+            yield event
+
+    async def aclose(self):
+        pass
+
+
+class _AntigravityStreamBackend:
+    def __init__(self, response):
+        self.response = response
+
+    async def execute_stream(self, method, url, **kwargs):
+        return self.response
+
+    async def execute(self, method, url, **kwargs):
+        raise AssertionError("non-stream request was not expected")
+
+    async def close(self):
+        pass
+
+
+@pytest.mark.asyncio
+async def test_antigravity_streaming_tool_call_contract():
+    response = _AntigravityStreamResponse([
+        {
+            "response": {
+                "candidates": [{
+                    "content": {"parts": [{
+                        "functionCall": {"name": "get_weather", "args": '{"city":'}
+                    }]}
+                }]
+            }
+        },
+        {
+            "response": {
+                "candidates": [{
+                    "content": {"parts": [{
+                        "functionCall": {"name": "get_weather", "args": '{"city":"London"}'}
+                    }]},
+                    "finishReason": "STOP",
+                }]
+            }
+        },
+    ])
+    provider = AntigravityProvider(backend=_AntigravityStreamBackend(response))
+    request = ChatRequest(model="m", messages=[ChatMessage(role="user", content="weather")])
+    chunks = [chunk async for chunk in provider.stream(
+        request, AntigravityResource(id="r", project_id="p")
+    )]
+    assert chunks[0].tool_calls[0]["id"] == chunks[1].tool_calls[0]["id"]
+    assert [chunk.tool_calls[0]["index"] for chunk in chunks] == [0, 0]
+    assert chunks[0].tool_calls[0]["function"]["arguments"] == '{"city":'
+    assert chunks[1].tool_calls[0]["function"]["arguments"] == '"London"}'
+    assert chunks[1].finish_reason == "tool_calls"
 
 
 def test_round_trip_keeps_tool_call_id_for_tool_result():

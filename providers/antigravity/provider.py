@@ -355,6 +355,8 @@ class AntigravityProvider(Provider):
                     "RECITATION": "content_filter",
                 }
                 finish_reason = fr_map.get(fr, "stop")
+            if tool_calls:
+                finish_reason = "tool_calls"
         else:
             # Non-candidates response - might be direct content
             content = inner.get("content", {})
@@ -373,6 +375,8 @@ class AntigravityProvider(Provider):
                             "type": "function",
                             "function": {"name": name, "arguments": args},
                         })
+                if tool_calls:
+                    finish_reason = "tool_calls"
 
         return ChatResponse(
             id=new_id(),
@@ -424,6 +428,8 @@ class AntigravityProvider(Provider):
                     "RECITATION": "content_filter",
                 }
                 finish_reason = fr_map.get(fr, "stop")
+            if tool_calls and finish_reason is not None:
+                finish_reason = "tool_calls"
         else:
             content = inner.get("content", {})
             if isinstance(content, dict):
@@ -441,6 +447,8 @@ class AntigravityProvider(Provider):
                             "type": "function",
                             "function": {"name": name, "arguments": args},
                         })
+                if tool_calls and finish_reason is not None:
+                    finish_reason = "tool_calls"
 
         return ChatChunk(
             id=new_id(),
