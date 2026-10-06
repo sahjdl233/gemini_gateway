@@ -9,6 +9,18 @@ server:
   host: 127.0.0.1
   port: 8000
 
+# ---- GATEWAY-002: OpenAI-compatible client authentication --------------
+# Local development remains open by default. Production deployments should
+# explicitly enable this gate and inject keys via an environment variable
+# (or use the example list below with non-secret placeholders).
+# api_auth:
+#   enabled: true
+#   api_keys:
+#     - ${GEMINI_GATEWAY_API_KEY}
+# Multiple keys may also be supplied as a comma-separated
+# GEMINI_GATEWAY_API_KEYS environment variable. These are client keys only;
+# /admin continues to use ADMIN_TOKEN independently.
+
 scheduler:
   max_retries: 2
   cooldown:

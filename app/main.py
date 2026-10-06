@@ -14,9 +14,15 @@ import logging
 from pathlib import Path
 from typing import Any, AsyncIterator, Dict, Optional
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 
 from app.bootstrap import register_builtin_providers
+from app.routes.api_auth import (
+    build_api_auth_settings,
+    client_auth_error_response,
+    require_client_auth,
+    ClientAuthError,
+)
 from app.routes.chat import router as chat_router
 from app.routes.models import router as models_router
 from app.routes.admin import mount_admin_assets
@@ -481,6 +487,14 @@ def create_app(
         version="0.1.0",
         lifespan=lifespan,
     )
+    # GATEWAY-002: the /v1 client-auth seam.  Settings are parsed once at
+    # startup (fail-closed on misconfiguration); the dependency reads the
+    # snapshot per request and rejects unauthenticated calls BEFORE the
+    # route handlers touch the scheduler.  /admin keeps its own
+    # ADMIN_TOKEN boundary — the two are independent.
+    app.state.api_auth = build_api_auth_settings(cfg)
+    app.add_exception_handler(ClientAuthError, client_auth_error_response)
+    v1_dependencies = [Depends(require_client_auth)]
     app.state.scheduler = scheduler
     app.state.config = cfg
     app.state.resource_manager = resource_manager
@@ -494,9 +508,9 @@ def create_app(
     # it is registered *before* the admin router so the SPA catch-all route
     # cannot shadow the hashed asset URLs.
     mount_admin_assets(app)
-    app.include_router(models_router)
-    app.include_router(chat_router)
-    app.include_router(admin_router)
+    app.include_router(models_router, dependencies=v1_dependencies)
+    app.include_router(chat_router, dependencies=v1_dependencies)
+    app.include_router(admin_router)  # /admin: ADMIN_TOKEN, unchanged
 
     @app.get("/", include_in_schema=False)
     async def root():
