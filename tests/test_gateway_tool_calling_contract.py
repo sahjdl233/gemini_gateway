@@ -416,3 +416,122 @@ def test_round_trip_keeps_tool_call_id_for_tool_result():
     })
     payload = firebase_payload(second)
     assert _function_response_names(payload) == ["get_weather"]
+
+
+# GATEWAY-003-FIX-03: same-name multiple tool calls must keep independent identities
+
+@pytest.mark.asyncio
+async def test_same_name_tool_calls_keep_independent_identities():
+    """Two tool calls with the same name must have different ids and indexes."""
+    events = [
+        {
+            "candidates": [{"content": {"parts": [
+                {"functionCall": {"name": "get_weather", "args": '{"city":'}},
+                {"functionCall": {"name": "get_weather", "args": '{"city":"Paris"}'}},
+            ]}}]
+        },
+        {
+            "candidates": [{"content": {"parts": [
+                {"functionCall": {"name": "get_weather", "args": '{"city":"London"}'}},
+            ]}}]
+        },
+        {
+            "candidates": [{
+                "content": {"parts": [
+                    {"functionCall": {"name": "get_weather", "args": '{"city":"Paris"}'}},
+                ]},
+                "finishReason": "STOP",
+            }]
+        },
+    ]
+    chunks = [chunk async for chunk in firebase_stream_chunks(_SseResponse(events), "m")]
+    first, second, third = chunks
+
+    # Chunk 1: two calls with same name but different ids and indexes
+    assert first.tool_calls[0]["id"] != first.tool_calls[1]["id"]
+    assert first.tool_calls[0]["index"] == 0
+    assert first.tool_calls[1]["index"] == 1
+
+    # Chunk 2: first call again, same id and index
+    assert second.tool_calls[0]["id"] == first.tool_calls[0]["id"]
+    assert second.tool_calls[0]["index"] == 0
+
+    # Chunk 3: second call again, same id and index
+    assert third.tool_calls[0]["id"] == first.tool_calls[1]["id"]
+    assert third.tool_calls[0]["index"] == 1
+
+    # Arguments accumulated independently
+    assert first.tool_calls[0]["function"]["arguments"] == '{"city":'
+    assert first.tool_calls[1]["function"]["arguments"] == '{"city":"Paris"}'
+    assert second.tool_calls[0]["function"]["arguments"] == '"London"}'
+    assert third.tool_calls[0]["function"]["arguments"] == ''
+
+
+@pytest.mark.asyncio
+async def test_same_name_tool_calls_gcli():
+    """Gemini CLI: same-name tool calls keep independent identities."""
+    def event(parts, finish=None):
+        candidate = {"content": {"parts": parts}}
+        if finish is not None:
+            candidate["finishReason"] = finish
+        return {"response": {"candidates": [candidate]}}
+
+    events = [
+        event([
+            {"functionCall": {"name": "get_weather", "args": '{"city":'}},
+            {"functionCall": {"name": "get_weather", "args": '{"city":"Paris"}'}},
+        ]),
+        event([
+            {"functionCall": {"name": "get_weather", "args": '{"city":"London"}'}},
+        ]),
+        event([
+            {"functionCall": {"name": "get_weather", "args": '{"city":"Paris"}'}},
+        ], finish="STOP"),
+    ]
+    chunks = [chunk async for chunk in cli_stream_chunks(_SseResponse(events), "m")]
+    first, second, third = chunks
+
+    assert first.tool_calls[0]["id"] != first.tool_calls[1]["id"]
+    assert first.tool_calls[0]["index"] == 0
+    assert first.tool_calls[1]["index"] == 1
+    assert second.tool_calls[0]["id"] == first.tool_calls[0]["id"]
+    assert second.tool_calls[0]["index"] == 0
+    assert third.tool_calls[0]["id"] == first.tool_calls[1]["id"]
+    assert third.tool_calls[0]["index"] == 1
+
+
+@pytest.mark.asyncio
+async def test_same_name_tool_calls_antigravity():
+    """Antigravity: same-name tool calls keep independent identities."""
+    def event(parts, finish=None):
+        candidate = {"content": {"parts": parts}}
+        if finish is not None:
+            candidate["finishReason"] = finish
+        return {"response": {"candidates": [candidate]}}
+
+    response = _AntigravityStreamResponse([
+        event([
+            {"functionCall": {"name": "get_weather", "args": '{"city":'}},
+            {"functionCall": {"name": "get_weather", "args": '{"city":"Paris"}'}},
+        ]),
+        event([
+            {"functionCall": {"name": "get_weather", "args": '{"city":"London"}'}},
+        ]),
+        event([
+            {"functionCall": {"name": "get_weather", "args": '{"city":"Paris"}'}},
+        ], finish="STOP"),
+    ])
+    provider = AntigravityProvider(backend=_AntigravityStreamBackend(response))
+    request = ChatRequest(model="m", messages=[ChatMessage(role="user", content="weather")])
+    chunks = [chunk async for chunk in provider.stream(
+        request, AntigravityResource(id="r", project_id="p")
+    )]
+    first, second, third = chunks
+
+    assert first.tool_calls[0]["id"] != first.tool_calls[1]["id"]
+    assert first.tool_calls[0]["index"] == 0
+    assert first.tool_calls[1]["index"] == 1
+    assert second.tool_calls[0]["id"] == first.tool_calls[0]["id"]
+    assert second.tool_calls[0]["index"] == 0
+    assert third.tool_calls[0]["id"] == first.tool_calls[1]["id"]
+    assert third.tool_calls[0]["index"] == 1
